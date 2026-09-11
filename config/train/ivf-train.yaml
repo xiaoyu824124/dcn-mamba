@@ -1,0 +1,77 @@
+base_config:
+  - config/logging.yaml
+  - config/wandb.yaml
+
+dataset_cfg:
+  train: config/dataset/IVF/VTMOT/vtmot_5-frame.yaml
+  val: 
+    - config/dataset/IVF/VTMOT/vtmot_5-frame_stride150.yaml
+
+augmentation:
+  lr_flip_p: 0  # probability of left-right flipping
+  random_crop_hw: [128, 128] # random crop height and width, null to disable
+
+# ============================================================
+# 模型：DCN 特征级软对齐(保留) + MambaVF 风格 SSM 轻量融合模块
+# 参考论文：MambaVF (arXiv:2602.06017)
+# 实时性要点：
+#   * 主干在 1/4 分辨率工作 (downscale=2)，Y 亮度图最后上采样回原分辨率
+#   * 时间选择性扫描为纯 PyTorch 实现，无 mamba-ssm / CUDA 扩展依赖
+#     (Windows + RTX 3060 可直接跑)
+# 3060(12G) 训练建议：本模块参数仅 ~0.17M，可把 random_crop_hw 提到
+# 192/256、max_train_batch_size 保持 4；推理 fp16 可进一步提速。
+# ============================================================
+model:
+  align_mode: dcn          # 使用 DCN 软对齐（不再用 RAFT optical flow）
+  dim: 32
+  num_blocks: 3            # 每条模态的时间 VSS(SSM) 融合块数 (MambaVF 推荐 3)
+  head: 8                  # 兼容字段 (SSM 融合不再使用)
+  ffn_expansion_factor: 2  # 兼容字段 (SSM 融合不再使用)
+  bias: false
+  LayerNorm_type: WithBias
+  output_mask: false
+  downscale: 2             # 编码器 stride-2 下采样次数, 2 => 1/4 分辨率
+  enc_blocks: 1            # 下采样后每帧轻量残差卷积块数
+  dec_blocks: 2            # decoder 2D 残差块数
+  ssm_d_state: 4           # 时间选择性扫描的状态维数 d_state
+
+dataloader:
+  num_workers: 8 
+  effective_batch_size: 32
+  max_train_batch_size: 4 # for gradient accumulation
+  seed: 2025 # to ensure continuity when resuming from checkpoint
+
+lr: 1.0e-4
+lr_scheduler:
+  kwargs:
+    total_iter: 20000
+    final_ratio: 0.01
+    warmup_steps: 200
+
+mixed_precision: false
+max_epoch: 10000
+max_iter: 20000
+
+trainer:
+  init_seed: 2025 # use null to train w/o seeding
+  save_vis: true
+  save_period: 50
+  backup_period: 500
+  validation_period: 300
+
+loss:
+  name: IVF_MVF_Loss
+  kwargs:
+    coef: [1, 5, 4, 1]  # 将第三个数字 0 改成 5 (与梯度损失齐平)
+    use_occlusion: false
+    occ_threshold: 1.0
+    max_offset_mask: false
+
+eval:
+  eval_metrics:
+    - Metric_VIF
+    - Metric_SSIM
+    - Metric_MI
+    - Metric_Qabf
+    - Metric_BiSWE
+    - Metric_MS2R
