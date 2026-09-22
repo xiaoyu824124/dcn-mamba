@@ -93,7 +93,7 @@ class CorrBlock:
             device = coords.device
             dx = torch.linspace(-r, r, 2*r+1, device=device)
             dy = torch.linspace(-r, r, 2*r+1, device=device)
-            delta = torch.stack(torch.meshgrid(dy, dx), axis=-1)
+            delta = torch.stack(torch.meshgrid(dy, dx, indexing="ij"), axis=-1)
             delta_lvl = delta.view(1, 2*r+1, 2*r+1, 2)
             delta_lvl = delta_lvl * dilation.view(batch * h1 * w1, 1, 1, 1)
             centroid_lvl = coords.reshape(batch*h1*w1, 1, 1, 2) / 2**i
@@ -143,7 +143,7 @@ class CorrBlock:
 #         for i in range(self.num_levels):
 #             dx = torch.linspace(-r, r, 2*r+1, device=device)
 #             dy = torch.linspace(-r, r, 2*r+1, device=device)
-#             delta = torch.stack(torch.meshgrid(dy, dx), axis=-1)
+#             delta = torch.stack(torch.meshgrid(dy, dx, indexing="ij"), axis=-1)
 #             delta_lvl = delta.view(1, n_points, 2)
 #             # delta_lvl: [..., (bhw)]
 #             delta_lvl = torch.cat([torch.zeros([1, n_points, 1], device=device), delta_lvl], dim=-1)

@@ -6,17 +6,14 @@ import os
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 import argparse
 import logging
-import os
-import shutil
-from datetime import datetime, timedelta
-from typing import List
+from datetime import datetime
+from pathlib import Path
 import pytz  # timezone
 import torch
 from omegaconf import OmegaConf
-from torch.utils.data import ConcatDataset, DataLoader
-from tqdm import tqdm
+from torch.utils.data import DataLoader
 from accelerate import Accelerator  # Multi-GPU training and mixed precision
-from src.dataset import get_multi_frame_dataset, BaseTwoModalDataset, DatasetMode
+from src.dataset import get_ir_visible_dataset, BaseTwoModalDataset, DatasetMode
 from src.util.config_util import recursive_load_config
 from src.util.logging_util import (
     config_logging,
@@ -27,17 +24,22 @@ from src.util.logging_util import (
     tb_logger,
     create_code_snapshot,
 )
-from src.model.net import VideoFusion
+from src.model.net import IRVisibleFusion
+from src.trainer.ir_visible_trainer import IRVisibleTrainer
 import warnings
 warnings.filterwarnings("ignore")
 
 if "__main__" == __name__:
 
+    if torch.cuda.is_available():
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        torch.backends.cudnn.benchmark = True
+        torch.set_float32_matmul_precision("high")
+
     # -------------------- Arguments --------------------
-    parser = argparse.ArgumentParser(description="Train your cute model!")
-    parser.add_argument(
-        "--task_name", type=str, default="IVF", help="name of fusion task: MEF, MFF, IVF, MVF"
-    )
+    parser = argparse.ArgumentParser(
+        description="Train VTMOT infrared-visible fusion and registration")
     parser.add_argument(
         "--resume_run",
         action="store",
@@ -48,32 +50,39 @@ if "__main__" == __name__:
         "--output_dir", type=str, default="output", help="directory to save checkpoints"
     )
     parser.add_argument(
-        "--mixed_precision", type=str, default="no", choices=["no", "bf16", "fp16"]
+        "--mixed_precision", type=str, default="fp16", choices=["no", "bf16", "fp16"]
     )
-    parser.add_argument("--no_wandb", action="store_false", help="run without wandb")
+    parser.add_argument("--no_wandb", action="store_true", help="run without wandb")
     parser.add_argument(
-        "--base_data_dir", type=str, default="./data", help="directory of training data"
+        "--base_data_dir", type=str,
+        default=str(Path(__file__).resolve().parent / "data"),
+        help="directory containing VTMOT_misaligned",
     )
     parser.add_argument(
-        "--add_datetime_prefix",
-        action="store_false",
-        help="Add datetime to the output folder name",
+        "--no_datetime_prefix",
+        action="store_true",
+        help="Do not add a datetime prefix to the output folder name",
     )
     parser.add_argument(
         "--split_batch",
         action="store_true",
         help="Accelerator split batch",
     )
+    parser.add_argument(
+        "--run", choices=["pilot", "full"], default="full",
+        help="pilot: 300 registration iterations; full: use configured schedule",
+    )
+    parser.add_argument(
+        "--dry-run", action="store_true",
+        help="validate the resolved VTMOT configuration without writing outputs",
+    )
 
-    # args = parser.parse_args()
     args, unknown_args = parser.parse_known_args()
     resume_run = args.resume_run
     output_dir = args.output_dir
-    base_data_dir = (
-        args.base_data_dir
-        if args.base_data_dir is not None
-        else os.environ["BASE_DATA_DIR"]
-    )
+    base_data_dir = args.base_data_dir
+    if not os.path.isdir(base_data_dir):
+        raise FileNotFoundError(f"VTMOT data root not found: {base_data_dir}")
 
     # -------------------- Accelerator --------------------
     # Default: no mixed precision (uses float32)
@@ -92,24 +101,34 @@ if "__main__" == __name__:
         # Resume config file
         cfg = OmegaConf.load(os.path.join(out_dir_run, "config.yaml"))
     else:
-        # Load config
-        if args.task_name == "MEF":
-            config_path = "config/train/mef-train.yaml"
-        elif args.task_name == "MFF":
-            config_path = "config/train/mff-train.yaml"
-        elif args.task_name == "IVF":
-            config_path = "config/train/ivf-train.yaml"
-        elif args.task_name == "MVF":
-            config_path = "config/train/mvf-train.yaml"
-        else:
-            raise NotImplementedError(f"Unknown task: {args.task_name}")
-        cfg = recursive_load_config(config_path, unknown_args)
+        config_path = "config/train/ir_visible_train.yaml"
+        # The project is deployed on one RTX A4000 (16 GB).  Hardware settings
+        # live in the VTMOT YAML rather than in GPU-specific CLI profiles.
+        # Explicit user overrides still come last and therefore always win.
+        run_overrides = []
+        if args.run == "pilot":
+            run_overrides.extend([
+                "max_iter=300",
+                "trainer.validation_period=100",
+                "trainer.save_period=100",
+            ])
+        cfg = recursive_load_config(
+            config_path, run_overrides + unknown_args)
+        if args.dry_run:
+            print("VTMOT configuration is valid")
+            print("  run:", args.run, "hardware: RTX A4000 (16 GB)")
+            print("  data:", base_data_dir)
+            print("  frames:", OmegaConf.load(cfg.dataset_cfg.train).num_frames)
+            print("  crop:", list(cfg.augmentation.random_crop_hw))
+            print("  batch:", cfg.dataloader.max_train_batch_size)
+            print("  iterations:", cfg.max_iter)
+            raise SystemExit(0)
 
         # Output folder name
-        if args.add_datetime_prefix:
+        if not args.no_datetime_prefix:
             job_name = (
                 f"{t_start.strftime('%y_%m_%d-%H_%M_%S')}"
-                f"-{args.task_name}"
+                f"-VTMOT-A4000-{args.run}"
                 f"-crop{cfg.augmentation.random_crop_hw[0]}"
                 f"-bs{cfg.dataloader.effective_batch_size}_{cfg.dataloader.max_train_batch_size}"  # batch info
                 f"-coef{'_'.join(map(str, cfg.loss.kwargs.coef))}"  # e.g., [1,2,3] -> "1_2_3"
@@ -117,7 +136,7 @@ if "__main__" == __name__:
             )
         else:
             job_name = (
-                f"-{args.task_name}"
+                f"-VTMOT-A4000-{args.run}"
                 f"-crop{cfg.augmentation.random_crop_hw[0]}"
                 f"-bs{cfg.dataloader.effective_batch_size}_{cfg.dataloader.max_train_batch_size}"  # batch info
                 f"-coef{'_'.join(map(str, cfg.loss.kwargs.coef))}"  # e.g., [1,2,3] -> "1_2_3"
@@ -138,17 +157,11 @@ if "__main__" == __name__:
     # Other directories
     out_dir_ckpt = os.path.join(out_dir_run, "checkpoint")
     out_dir_tb = os.path.join(out_dir_run, "tensorboard")
-    out_dir_eval = os.path.join(out_dir_run, "evaluation")
-    out_dir_vis = os.path.join(out_dir_run, "visualization")
     if accelerator.is_main_process:
         if not os.path.exists(out_dir_ckpt):
             os.makedirs(out_dir_ckpt)
         if not os.path.exists(out_dir_tb):
             os.makedirs(out_dir_tb)
-        if not os.path.exists(out_dir_eval):
-            os.makedirs(out_dir_eval)
-        if not os.path.exists(out_dir_vis):
-            os.makedirs(out_dir_vis)
     accelerator.wait_for_everyone()
 
     # -------------------- Logging settings --------------------
@@ -156,6 +169,8 @@ if "__main__" == __name__:
     if accelerator.is_main_process:
         logging.info(f"start at {t_start}")
         logging.debug(f"args: {args}")
+        logging.info("VTMOT run=%s hardware=RTX A4000 (16 GB) data=%s",
+                     args.run, base_data_dir)
         logging.debug(f"config: {cfg}")
         logging.debug(
             f"accelerator: {accelerator.mixed_precision = }, {accelerator.split_batches = }"
@@ -248,7 +263,7 @@ if "__main__" == __name__:
 
     # Training dataset
     cfg_train_data = OmegaConf.load(cfg.dataset_cfg.train)
-    train_dataset: BaseTwoModalDataset = get_multi_frame_dataset(
+    train_dataset: BaseTwoModalDataset = get_ir_visible_dataset(
         cfg_train_data,
         base_data_dir=base_data_dir,
         mode=DatasetMode.TRAIN,
@@ -264,70 +279,53 @@ if "__main__" == __name__:
         shuffle=True,
         generator=loader_generator,
         drop_last=True,
+        pin_memory=torch.cuda.is_available(),
+        persistent_workers=cfg.dataloader.num_workers > 0,
+        prefetch_factor=2 if cfg.dataloader.num_workers > 0 else None,
     )
 
+    # Validation sequences are session-disjoint from VTMOT training sequences.
+    val_loaders = []
+    val_configs = cfg.dataset_cfg.get("val", [])
+    for val_config_path in val_configs:
+        cfg_val_data = OmegaConf.load(val_config_path)
+        val_dataset: BaseTwoModalDataset = get_ir_visible_dataset(
+            cfg_val_data,
+            base_data_dir=base_data_dir,
+            mode=DatasetMode.EVAL,
+            augmentation_args=None,
+            init_seed=init_loader_seed,
+        )
+        val_workers = int(cfg.dataloader.get("val_num_workers", 2))
+        val_loaders.append(DataLoader(
+            dataset=val_dataset,
+            batch_size=int(cfg.dataloader.get("eval_batch_size", 1)),
+            num_workers=val_workers,
+            shuffle=False,
+            drop_last=False,
+            pin_memory=torch.cuda.is_available(),
+            persistent_workers=val_workers > 0,
+            prefetch_factor=2 if val_workers > 0 else None,
+        ))
+    if accelerator.is_main_process:
+        logging.info(
+            "Validation windows: %s",
+            ", ".join(str(len(loader.dataset)) for loader in val_loaders),
+        )
+
     # -------------------- Model --------------------
-    model = VideoFusion(model_config=cfg)
+    model = IRVisibleFusion(model_config=cfg)
 
     # -------------------- Trainer --------------------
-    # For Multi-Exposure Video Fusion
-    if args.task_name == "MEF":
-        from src.trainer.mef_trainer import MEFTrainer
-        trainer = MEFTrainer(
-            cfg=cfg,
-            model=model,
-            train_dataloader=train_loader,
-            accelerator=accelerator,
-            out_dir_ckpt=out_dir_ckpt,
-            out_dir_eval=out_dir_eval,
-            out_dir_vis=out_dir_vis,
-            accumulation_steps=accumulation_steps,
-            n_gpu=n_gpu,
-        )
-    # For Multi-Focus Video Fusion
-    elif args.task_name =="MFF":
-        from src.trainer.mff_trainer import MFFTrainer
-        trainer = MFFTrainer(
-            cfg=cfg,
-            model=model,
-            train_dataloader=train_loader,
-            accelerator=accelerator,
-            out_dir_ckpt=out_dir_ckpt,
-            out_dir_eval=out_dir_eval,
-            out_dir_vis=out_dir_vis,
-            accumulation_steps=accumulation_steps,
-            n_gpu=n_gpu,
-        )
-    # For Infrared-Visible Video Fusion
-    elif args.task_name =="IVF":
-        from src.trainer.ivf_trainer import IVFTrainer
-        trainer = IVFTrainer(
-            cfg=cfg,
-            model=model,
-            train_dataloader=train_loader,
-            accelerator=accelerator,
-            out_dir_ckpt=out_dir_ckpt,
-            out_dir_eval=out_dir_eval,
-            out_dir_vis=out_dir_vis,
-            accumulation_steps=accumulation_steps,
-            n_gpu=n_gpu,        
-        )
-    # For Medical Video Fusion
-    elif args.task_name =="MVF":
-        from src.trainer.mvf_trainer import MVFTrainer
-        trainer = MVFTrainer(
-            cfg=cfg,
-            model=model,
-            train_dataloader=train_loader,
-            accelerator=accelerator,
-            out_dir_ckpt=out_dir_ckpt,
-            out_dir_eval=out_dir_eval,
-            out_dir_vis=out_dir_vis,
-            accumulation_steps=accumulation_steps,
-            n_gpu=n_gpu,
-        )
-    else:
-        raise NotImplementedError(f"Unknown task: {args.task_name}")
+    trainer = IRVisibleTrainer(
+        cfg=cfg,
+        model=model,
+        train_dataloader=train_loader,
+        accelerator=accelerator,
+        out_dir_ckpt=out_dir_ckpt,
+        accumulation_steps=accumulation_steps,
+        val_dataloaders=val_loaders,
+    )
 
     # -------------------- Checkpoint --------------------
     if resume_run is not None and accelerator.is_main_process:
@@ -340,5 +338,6 @@ if "__main__" == __name__:
     try:
         with accelerator.autocast():
             trainer.train()
-    except Exception as e:
-        logging.exception(e)
+    except Exception:
+        logging.exception("Training failed")
+        raise

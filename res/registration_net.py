@@ -1,20 +1,12 @@
-"""Single-frame MIND + global-matching coarse IR--visible registration.
-
-This is the first complete spatial registration chain in ``res``.  It has no
-temporal propagation, keyframes, RAFT or DCN.  The next stage will take its
-coarse-aligned features and add only small local residual refinement.
-"""
+"""Production single-frame MIND + global-affine IR--visible registration."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict
-
 import torch
 import torch.nn as nn
 
 from .encoder import MINDFeatureEncoder
-from .dcn_refiner import DCNRefinementOutput, MultiScaleDCNRefiner
 from .global_matcher import GlobalMatchOutput, GlobalMatcher
 from .mind import MINDDescriptor, paired_mind
 from .warp import upsample_feature_flow, warp
@@ -24,22 +16,13 @@ from .warp import upsample_feature_flow, warp
 class CoarseRegistrationOutput:
     """Intermediate outputs of the MIND/global-matching registration chain.
 
-    ``coarse_flow_1_8`` is feature-grid displacement in `[dy,dx]`; `coarse_flow`
-    is its image-grid conversion in pixel units and is the field used to warp IR.
+    ``coarse_flow`` is the image-grid `[dy,dx]` displacement used to warp IR.
     """
 
     coarse_aligned_ir: torch.Tensor
-    coarse_aligned_ir_feature: torch.Tensor
     coarse_flow: torch.Tensor
-    raw_flow_1_8: torch.Tensor
-    coarse_flow_1_8: torch.Tensor
     confidence_1_8: torch.Tensor
-    mind_ir: torch.Tensor
-    mind_vi: torch.Tensor
-    features_ir: Dict[str, torch.Tensor]
-    features_vi: Dict[str, torch.Tensor]
-    matching_probability: torch.Tensor
-    correlation: torch.Tensor | None
+    affine_yx: torch.Tensor
 
 
 class MINDGlobalRegistration(nn.Module):
@@ -96,48 +79,9 @@ class MINDGlobalRegistration(nn.Module):
         coarse_flow = upsample_feature_flow(
             match.coarse_flow, (height, width), (stride_y, stride_x))
         coarse_aligned_ir = warp(ir, coarse_flow)
-        coarse_aligned_feature = warp(features_ir["1/8"], match.coarse_flow)
-
         return CoarseRegistrationOutput(
             coarse_aligned_ir=coarse_aligned_ir,
-            coarse_aligned_ir_feature=coarse_aligned_feature,
             coarse_flow=coarse_flow,
-            raw_flow_1_8=match.raw_flow,
-            coarse_flow_1_8=match.coarse_flow,
             confidence_1_8=match.confidence,
-            mind_ir=mind_ir,
-            mind_vi=mind_vi,
-            features_ir=features_ir,
-            features_vi=features_vi,
-            matching_probability=match.matching_probability,
-            correlation=match.correlation,
+            affine_yx=match.affine_yx,
         )
-
-
-class MINDDCNRegistration(nn.Module):
-    """Complete single-frame MIND -> global matching -> local DCN model."""
-
-    def __init__(self, coarse_registration: MINDGlobalRegistration,
-                 use_residual_flow_head: bool = False) -> None:
-        super().__init__()
-        self.coarse_registration = coarse_registration
-        encoder = coarse_registration.encoder
-        self.refiner = MultiScaleDCNRefiner(
-            channels_2=encoder.base_channels,
-            channels_4=encoder.base_channels * 2,
-            channels_8=encoder.out_channels,
-            use_residual_flow_head=use_residual_flow_head,
-        )
-
-    def forward(self, ir: torch.Tensor, vi: torch.Tensor):
-        coarse = self.coarse_registration(ir, vi)
-        refined: DCNRefinementOutput = self.refiner(
-            ir=ir,
-            coarse_aligned_ir=coarse.coarse_aligned_ir,
-            coarse_flow=coarse.coarse_flow,
-            coarse_flow_1_8=coarse.coarse_flow_1_8,
-            confidence_1_8=coarse.confidence_1_8,
-            features_ir=coarse.features_ir,
-            features_vi=coarse.features_vi,
-        )
-        return coarse, refined

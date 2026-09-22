@@ -32,11 +32,10 @@ class MINDGlobalRegistrationTest(unittest.TestCase):
         output = model(ir, vi)
         self.assertEqual(tuple(output.coarse_aligned_ir.shape), (2, 1, 64, 80))
         self.assertEqual(tuple(output.coarse_flow.shape), (2, 2, 64, 80))
-        self.assertEqual(tuple(output.coarse_flow_1_8.shape), (2, 2, 8, 10))
         self.assertEqual(tuple(output.confidence_1_8.shape), (2, 1, 8, 10))
-        self.assertEqual(tuple(output.coarse_aligned_ir_feature.shape), (2, 12, 8, 10))
+        self.assertEqual(tuple(output.affine_yx.shape), (2, 3, 2))
         for tensor in (output.coarse_aligned_ir, output.coarse_flow,
-                       output.confidence_1_8, output.coarse_aligned_ir_feature):
+                       output.confidence_1_8, output.affine_yx):
             self.assertTrue(torch.isfinite(tensor).all())
         output.coarse_aligned_ir.mean().backward()
         self.assertIsNotNone(ir.grad)

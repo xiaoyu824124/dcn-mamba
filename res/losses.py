@@ -10,6 +10,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .mind import MINDDescriptor, rgb_to_gray
+from .affine import homography_to_normalised_affine_yx
 
 
 @dataclass
@@ -21,17 +22,20 @@ class RegistrationLossOutput:
     mind: torch.Tensor
     edge: torch.Tensor
     smooth: torch.Tensor
+    affine: torch.Tensor
 
     def as_dict(self) -> Dict[str, torch.Tensor]:
         return {"loss": self.total, "loss_flow": self.flow, "loss_mind": self.mind,
-                "loss_edge": self.edge, "loss_smooth": self.smooth}
+                "loss_edge": self.edge, "loss_smooth": self.smooth,
+                "loss_affine": self.affine}
 
 
 class RegistrationLoss(nn.Module):
     """Supervised flow plus modality-robust structural registration losses.
 
     Args:
-        weights: Mapping with ``flow``, ``mind``, ``edge`` and ``smooth`` keys.
+        weights: Mapping with ``flow``, ``mind``, ``edge``, ``smooth`` and
+            ``affine`` keys.
             Values are intentionally supplied by YAML rather than hard-coded.
         mind_descriptor: The shared MIND implementation used for structural loss.
         charbonnier_eps: Robust L1 epsilon for supervised flow.
@@ -43,7 +47,7 @@ class RegistrationLoss(nn.Module):
     refined reconstruction branch.
     """
 
-    REQUIRED_WEIGHTS = ("flow", "mind", "edge", "smooth")
+    REQUIRED_WEIGHTS = ("flow", "mind", "edge", "smooth", "affine")
 
     def __init__(self, weights: Dict[str, float],
                  mind_descriptor: Optional[MINDDescriptor] = None,
@@ -84,7 +88,9 @@ class RegistrationLoss(nn.Module):
     def forward(self, *, aligned_ir: torch.Tensor, visible: torch.Tensor,
                 coarse_flow: torch.Tensor, final_flow: Optional[torch.Tensor] = None,
                 gt_flow: Optional[torch.Tensor] = None,
-                valid_mask: Optional[torch.Tensor] = None) -> RegistrationLossOutput:
+                valid_mask: Optional[torch.Tensor] = None,
+                predicted_affine_yx: Optional[torch.Tensor] = None,
+                gt_h: Optional[torch.Tensor] = None) -> RegistrationLossOutput:
         if aligned_ir.ndim != 4 or aligned_ir.shape[1] != 1:
             raise ValueError("aligned_ir must be [B,1,H,W]")
         if visible.ndim != 4 or visible.shape[1] != 3:
@@ -114,6 +120,21 @@ class RegistrationLoss(nn.Module):
                 loss_flow = (flow_error * valid_mask).sum() / (
                     valid_mask.sum().clamp_min(1) * active_flow.shape[1])
 
+        if predicted_affine_yx is None and gt_h is None:
+            loss_affine = zero
+        elif predicted_affine_yx is None or gt_h is None:
+            raise ValueError("predicted_affine_yx and gt_h must be supplied together")
+        else:
+            feature_hw = (active_flow.shape[-2] // 8, active_flow.shape[-1] // 8)
+            if predicted_affine_yx.shape != (active_flow.shape[0], 3, 2):
+                raise ValueError("predicted_affine_yx must be [B,3,2]")
+            target_affine_yx = homography_to_normalised_affine_yx(
+                gt_h.float(), active_flow.shape[-2:], feature_hw)
+            # The 3x3 WLS solve is deliberately FP32; retain that precision for
+            # its direct supervision even when the surrounding forward runs AMP.
+            loss_affine = self.charbonnier(predicted_affine_yx.float() - target_affine_yx,
+                                            self.charbonnier_eps)
+
         # MIND compares self-similarity patterns, not raw IR/RGB intensities.
         loss_mind = F.l1_loss(self.mind_descriptor(aligned_ir),
                               self.mind_descriptor(rgb_to_gray(visible)))
@@ -123,5 +144,7 @@ class RegistrationLoss(nn.Module):
         total = (self.weights["flow"] * loss_flow
                  + self.weights["mind"] * loss_mind
                  + self.weights["edge"] * loss_edge
-                 + self.weights["smooth"] * loss_smooth)
-        return RegistrationLossOutput(total, loss_flow, loss_mind, loss_edge, loss_smooth)
+                 + self.weights["smooth"] * loss_smooth
+                 + self.weights["affine"] * loss_affine)
+        return RegistrationLossOutput(total, loss_flow, loss_mind, loss_edge, loss_smooth,
+                                      loss_affine)

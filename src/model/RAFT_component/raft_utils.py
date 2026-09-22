@@ -1,7 +1,6 @@
 import torch
 import torch.nn.functional as F
 import numpy as np
-from scipy import interpolate
 
 def load_ckpt(model, path):
     """ Load checkpoint """
@@ -37,6 +36,8 @@ class InputPadder:
         return x[..., c[0]:c[1], c[2]:c[3]]
 
 def forward_interpolate(flow):
+    from scipy import interpolate
+
     flow = flow.detach().cpu().numpy()
     dx, dy = flow[0], flow[1]
 
@@ -84,7 +85,11 @@ def bilinear_sampler(img, coords, mode='bilinear', mask=False):
     return img
 
 def coords_grid(batch, ht, wd, device):
-    coords = torch.meshgrid(torch.arange(ht, device=device), torch.arange(wd, device=device))
+    coords = torch.meshgrid(
+        torch.arange(ht, device=device),
+        torch.arange(wd, device=device),
+        indexing="ij",
+    )
     coords = torch.stack(coords[::-1], dim=0).float()
     return coords[None].repeat(batch, 1, 1, 1)
 

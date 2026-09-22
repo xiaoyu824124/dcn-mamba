@@ -68,3 +68,8 @@ res/**/bench_out/
 /revert_to_oem_license.ps1
 /revert_to_oem_license.bat
 
+# temporary artifacts from reading reference PDFs / manual wheel installs
+/_acfr_text.txt
+/_tmppip/
+/_pylibs/
+

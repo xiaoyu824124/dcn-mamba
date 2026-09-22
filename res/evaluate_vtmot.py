@@ -12,7 +12,8 @@ from omegaconf import OmegaConf
 from torch.utils.data import DataLoader
 
 from .metrics import endpoint_error
-from .train_registration import build_model
+from .model_factory import build_global_registration
+from .affine import affine_corner_errors
 from .vtmot import VTMOTSingleFrameDataset
 from .warp import warp
 
@@ -45,24 +46,27 @@ def check_gt_direction(loader: DataLoader, device: torch.device, preview_dir: Pa
 
 @torch.no_grad()
 def evaluate(model: torch.nn.Module, loader: DataLoader, device: torch.device) -> Dict[str, float]:
-    total_epe = total_baseline = total_valid = 0.0
+    total_epe = total_baseline = total_valid = total_samples = 0.0
+    total_corner_epe = total_cycle_epe = 0.0
     hit_sums = {f"pck_{threshold}px": 0.0 for threshold in (1, 3, 5)}
     model.eval()
     for batch in loader:
         ir, vi = batch["ir"].to(device), batch["vi"].to(device)
         target, valid = batch["gt_flow"].to(device), batch["valid_mask"].to(device)
         output = model(ir, vi)
-        if isinstance(output, tuple):
-            coarse, refined = output
-            predicted = refined.final_flow if refined.final_flow is not None else coarse.coarse_flow
-        else:
-            predicted = output.coarse_flow
+        predicted = output.coarse_flow
         epe = endpoint_error(predicted, target, valid)
         baseline = endpoint_error(torch.zeros_like(target), target, valid)
         count = float(valid.sum())
         total_epe += float(epe) * count
         total_baseline += float(baseline) * count
         total_valid += count
+        corner_epe, cycle_epe = affine_corner_errors(
+            output.affine_yx, batch["gt_h"].to(device), predicted.shape[-2:],
+            output.confidence_1_8.shape[-2:])
+        total_corner_epe += float(corner_epe.sum())
+        total_cycle_epe += float(cycle_epe.sum())
+        total_samples += float(predicted.shape[0])
         hits = _threshold_hits(predicted, target, valid)
         for name, value in hits.items():
             hit_sums[name] += value * count
@@ -70,6 +74,8 @@ def evaluate(model: torch.nn.Module, loader: DataLoader, device: torch.device) -
               "zero_flow_epe_px": total_baseline / max(total_valid, 1.0),
               "valid_pixels": total_valid}
     report["relative_epe"] = report["epe_px"] / max(report["zero_flow_epe_px"], 1e-8)
+    report["affine_corner_epe_px"] = total_corner_epe / max(total_samples, 1.0)
+    report["affine_gt_inverse_cycle_px"] = total_cycle_epe / max(total_samples, 1.0)
     report.update({name: value / max(total_valid, 1.0) for name, value in hit_sums.items()})
     return report
 
@@ -89,7 +95,6 @@ def main() -> None:
                         help="optional centre crop after 480x640 normalisation; must match training FOV")
     parser.add_argument("--check-gt", action="store_true",
                         help="check gt_h direction using visible_gt; no model required")
-    parser.add_argument("--use-dcn", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--output", type=Path, default=None, help="optional JSON report path")
     args = parser.parse_args()
     if args.batch_size < 1:
@@ -112,7 +117,7 @@ def main() -> None:
             raise SystemExit("--checkpoint is required unless --check-gt is used")
         checkpoint = torch.load(args.checkpoint, map_location=device, weights_only=True)
         config = OmegaConf.create(checkpoint["config"])
-        model = build_model(config, use_dcn=args.use_dcn).to(device)
+        model = build_global_registration(config).to(device)
         model.load_state_dict(checkpoint["model"], strict=True)
         report = evaluate(model, loader, device)
         report["field_of_view_hw"] = list(fov)

@@ -14,7 +14,7 @@ from res.losses import RegistrationLoss
 class RegistrationLossTest(unittest.TestCase):
     def setUp(self):
         self.loss = RegistrationLoss({"flow": 1.0, "mind": 0.5,
-                                      "edge": 0.25, "smooth": 0.05})
+                                      "edge": 0.25, "smooth": 0.05, "affine": 1.0})
 
     def test_all_terms_are_finite_and_differentiable(self):
         aligned = torch.rand(2, 1, 32, 40, requires_grad=True)
@@ -43,6 +43,19 @@ class RegistrationLossTest(unittest.TestCase):
                            coarse_flow=torch.zeros(1, 2, 24, 24))
         self.assertEqual(float(output.flow), 0.0)
         self.assertGreater(float(output.mind + output.edge), 0.0)
+
+    def test_affine_gt_has_small_loss_for_matching_parameters(self):
+        height, width = 32, 40
+        gt_h = torch.tensor([[[1.0, 0.0, 3.0],
+                              [0.0, 1.0, -2.0],
+                              [0.0, 0.0, 1.0]]])
+        from res.affine import homography_to_normalised_affine_yx
+        affine = homography_to_normalised_affine_yx(gt_h, (height, width), (4, 5))
+        output = self.loss(aligned_ir=torch.rand(1, 1, height, width),
+                           visible=torch.rand(1, 3, height, width),
+                           coarse_flow=torch.zeros(1, 2, height, width),
+                           predicted_affine_yx=affine, gt_h=gt_h)
+        self.assertLess(float(output.affine), 1.1e-3)
 
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA is unavailable")
     def test_cuda(self):

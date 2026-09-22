@@ -1,173 +1,192 @@
 # -*- coding: utf-8 -*-
-# Final Master Version: 2026-03-17
-# Features: 5D Tensor Support, Symmetric Padding (No Green Border), Correct Folder Split
+"""Evaluate a VTMOT checkpoint and report registration accuracy.
 
-import os
-import sys
+WHICH SPLIT -- THEY ARE NOT INTERCHANGEABLE
+-------------------------------------------
+  This script always uses the six-sequence held-out ``test`` split.  It loads a
+  checkpoint produced by ``train.py`` and must not be used to tune settings.
+
+EPE is the single shared definition from ``src/util/flow_metric.py``: the mean
+per-pixel L2 norm of ``pred - gt``, i.e. the standard end-point error, not a
+component-wise L1.  It is reported twice:
+
+  full frame   what the dataset stores
+  centre crop  --crop pixels, the same field of view the training crops use
+
+Those two are NOT comparable with each other; a ratio measured on a crop is a
+different number from the same ratio on the full frame.
+
+Examples::
+
+    python test.py --check-data
+    python test.py --exp-path <run> --checkpoint best --crop 288
+"""
+
 import argparse
-import logging
+from collections import OrderedDict
+from pathlib import Path
+
 import torch
-import torch.nn.functional as F
 from omegaconf import OmegaConf
 from torch.utils.data import DataLoader
-from tqdm import tqdm
-import csv
 
-# 自动把当前工作目录加入环境变量，彻底解决 ModuleNotFoundError
-sys.path.append(os.getcwd())
-
+from src.dataset import get_ir_visible_dataset
 from src.dataset.base_two_modal_dataset import DatasetMode
-from src.dataset import get_multi_frame_dataset
-from src.model.net import VideoFusion
-from src.util import metric 
-from src.util.metric import MetricTracker, compute_metrics
-from src.util.io import pred_2_8bit, save_image
-from src.util.logging_util import eval_dic_to_text, setup_logging
+from src.model.net import IRVisibleFusion
+from src.model.registration.common import SpatialTransformer
+from src.util.flow_metric import flow_epe
 
-import warnings
-warnings.filterwarnings("ignore")
+ROOT = Path(__file__).resolve().parent
+DEFAULT_DATASET_CONFIG = "config/dataset/IRVisible/VTMOT/vtmot_5-frame-val.yaml"
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Model evaluation script")
-    parser.add_argument("--exp_path", type=str, required=True)
-    parser.add_argument("--ckpt_path", type=str, default="latest")
-    parser.add_argument("--task_name", type=str, required=True)
-    parser.add_argument("--dataset_name", type=str, required=True)
-    parser.add_argument("--base_data_dir", type=str, default="data")
-    parser.add_argument("--batch_size", type=int, default=4)
-    parser.add_argument("--num_workers", type=int, default=8)
-    parser.add_argument("--device", type=str, default="cuda")
-    parser.add_argument("--no_save_vis", action="store_true")
+    parser = argparse.ArgumentParser(description="Evaluate VTMOT registration")
+    parser.add_argument("--base-data-dir", default=str(ROOT / "data"),
+                        help="parent directory of VTMOT_misaligned "
+                             "(train.py uses the same argument name)")
+    parser.add_argument("--dataset-config", default=DEFAULT_DATASET_CONFIG)
+    parser.add_argument("--exp-path", type=Path,
+                        help="run directory, relative to output/ or absolute")
+    parser.add_argument("--checkpoint", default="best",
+                        help="checkpoint directory name, e.g. latest or best")
+    parser.add_argument("--crop", type=int, default=0,
+                        help="also report EPE on a centre crop of this size, to "
+                             "match the training field of view (0 = off)")
+    parser.add_argument("--batch-size", type=int, default=1)
+    parser.add_argument("--num-workers", type=int, default=2)
+    parser.add_argument("--device", default="cuda")
+    parser.add_argument("--check-data", action="store_true",
+                        help="validate the stored GT flow without loading a model")
     return parser.parse_args()
+
+
+def build_loader(args):
+    config_path = Path(args.dataset_config)
+    if not config_path.is_absolute():
+        config_path = ROOT / config_path
+    cfg = OmegaConf.load(config_path)
+    dataset_dir = Path(args.base_data_dir) / "VTMOT_misaligned"
+    if not dataset_dir.is_dir():
+        raise FileNotFoundError(
+            f"VTMOT dataset not found at {dataset_dir}. The default is "
+            f"<repo>/data/VTMOT_misaligned; otherwise pass --base-data-dir "
+            f"pointing at the PARENT of VTMOT_misaligned. Note that csv_dir in "
+            f"the dataset config is relative to the working directory, so run "
+            f"this from the repository root.")
+    dataset = get_ir_visible_dataset(
+        cfg, base_data_dir=str(args.base_data_dir),
+        mode=DatasetMode.TEST, augmentation_args=None)
+    loader = DataLoader(
+        dataset, batch_size=args.batch_size, shuffle=False,
+        num_workers=args.num_workers, pin_memory=torch.cuda.is_available(),
+        persistent_workers=args.num_workers > 0)
+    return dataset, loader
+
+
+def sequence_of(batch, index):
+    """Sequence name of sample `index`, taken from the first raster column."""
+    paths = batch["data_path_ls_dict"]["ir"][index]
+    return Path(paths[0]).parts[0]
+
+
+@torch.no_grad()
+def check_data(loader, device):
+    """Verify that the stored GT maps the aligned visible frame onto visible_mis."""
+    transformer = SpatialTransformer().to(device)
+    errors, baselines = [], []
+    for batch_index, batch in enumerate(loader):
+        rgb_gt = batch["rgb_gt"].to(device)
+        rgb_mis = batch["rgb"].to(device)
+        flow = batch["gt_flow"].to(device)
+        batch_size, frames, channels, height, width = rgb_gt.shape
+        warped = transformer(
+            rgb_gt.reshape(-1, channels, height, width),
+            flow.reshape(-1, 2, height, width))[0]
+        target = rgb_mis.reshape(-1, channels, height, width)
+        errors.append((warped - target).abs().mean().item())
+        baselines.append((rgb_gt - rgb_mis).abs().mean().item())
+        if batch_index >= 9:
+            break
+    print("GT warp MAE: %.5f (unwarped: %.5f)  -> lower warp MAE means the GT "
+          "flow really aligns the pair" % (
+              sum(errors) / len(errors), sum(baselines) / len(baselines)))
+
+
+@torch.no_grad()
+def evaluate(model, loader, device, crop=0):
+    """Per-sequence and overall registration EPE, using the shared definition."""
+    model.eval()
+    # per sequence -> lists of per-window (epe, baseline)
+    per_seq = OrderedDict()
+    for batch in loader:
+        infrared = batch["ir"].to(device, non_blocking=True)
+        visible = batch["rgb"].to(device, non_blocking=True)
+        gt_flow = batch["gt_flow"].to(device, non_blocking=True)
+        _, registration = model(infrared, visible, stage="registration")
+        predicted = registration["flows"]
+        epe, baseline = flow_epe(predicted, gt_flow, crop=crop, per_sample=True)
+        for index in range(epe.shape[0]):
+            per_seq.setdefault(sequence_of(batch, index), []).append(
+                (float(epe[index]), float(baseline[index])))
+
+    print()
+    print(f"  {'sequence':22s} {'windows':>7s} {'EPE(px)':>9s} "
+          f"{'baseline':>9s} {'ratio':>7s}")
+    all_epe, all_base = [], []
+    for name, values in per_seq.items():
+        epe = sum(v[0] for v in values) / len(values)
+        base = sum(v[1] for v in values) / len(values)
+        all_epe.append(epe)
+        all_base.append(base)
+        print(f"  {name:22s} {len(values):7d} {epe:9.4f} {base:9.4f} "
+              f"{epe / max(base, 1e-6):7.4f}")
+    epe = sum(all_epe) / max(len(all_epe), 1)
+    base = sum(all_base) / max(len(all_base), 1)
+    print(f"  {'OVERALL':22s} {len(all_epe):7d} {epe:9.4f} {base:9.4f} "
+          f"{epe / max(base, 1e-6):7.4f}")
+    print()
+    print("  ratio < 1 means the predicted flow is better than predicting no "
+          "motion at all.")
+    return {"sequences": len(all_epe), "epe_px": epe, "baseline_px": base,
+            "epe_ratio": epe / max(base, 1e-6)}
+
 
 def main():
     args = parse_args()
-    exp_dir = os.path.join("output", args.exp_path)
-    ckpt_dir = os.path.join(exp_dir, "checkpoint")
-    model_path = os.path.join(ckpt_dir, args.ckpt_path if args.ckpt_path else "latest")
-    eval_dir = os.path.join(exp_dir, "test_results", args.ckpt_path if args.ckpt_path else "latest", args.dataset_name)
-    os.makedirs(eval_dir, exist_ok=True)
-    
-    setup_logging(os.path.join(eval_dir, "test.log")) 
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
-    torch.backends.cudnn.benchmark = True  # 开启 4090 硬件加速
-    
-    cfg = OmegaConf.load(os.path.join(exp_dir, "config.yaml"))
+    dataset, loader = build_loader(args)
 
-    model = VideoFusion(model_config={'model': cfg.model}).to(device)
-    model.load_state_dict(torch.load(os.path.join(model_path, "model.pth"), map_location=device))
-    model.eval()
+    print("=" * 74)
+    print(f"held-out TEST split  |  windows: {len(dataset)}  |  "
+          f"sequences: {', '.join(dataset.scene_name_ls)}")
+    print("  ** This is the held-out TEST split. Report it once and do not "
+          "tune on it. **")
+    print("=" * 74)
 
-    # 数据集加载
-    dataset_cfg_path = f"config/dataset/{args.task_name}/{args.dataset_name}/{args.dataset_name.lower()}_5-frame.yaml"
-    dataset = get_multi_frame_dataset(OmegaConf.load(dataset_cfg_path), args.base_data_dir, mode=DatasetMode.TEST)
-    dataloader = DataLoader(dataset, batch_size=args.batch_size, num_workers=args.num_workers, shuffle=False)
+    if args.check_data:
+        check_data(loader, device)
+        return
+    if args.exp_path is None:
+        raise SystemExit("--exp-path is required unless --check-data is used")
 
-    eval_metrics_names = [str(m) for m in cfg.eval.eval_metrics]
-    
-    try:
-        metric_tracker = MetricTracker(*eval_metrics_names)
-    except TypeError:
-        metric_tracker = MetricTracker(eval_metrics_names)
+    run_dir = (args.exp_path if args.exp_path.is_absolute()
+               else ROOT / "output" / args.exp_path)
+    checkpoint = run_dir / "checkpoint" / args.checkpoint / "model.pth"
+    config = run_dir / "config.yaml"
+    if not checkpoint.is_file() or not config.is_file():
+        raise FileNotFoundError(f"missing checkpoint or config under {run_dir}")
+    cfg = OmegaConf.load(config)
+    model = IRVisibleFusion(model_config={"model": cfg.model}).to(device)
+    state = torch.load(checkpoint, map_location=device)
+    model.load_state_dict(state.get("model", state), strict=True)
+    print(f"checkpoint: {checkpoint}")
 
-    metric_funcs = [getattr(metric, m) for m in eval_metrics_names]
-    data_dict = {"UniVF": {}}
+    print("\n--- full frame ---")
+    evaluate(model, loader, device, crop=0)
+    if args.crop > 0:
+        print(f"\n--- centre crop {args.crop} (matches the training FOV) ---")
+        evaluate(model, loader, device, crop=args.crop)
 
-    print(f"🚀 Master Test Started: {args.dataset_name} | Batch Size: {args.batch_size}")
-
-    for i, batch in enumerate(tqdm(dataloader, desc=f"Testing {args.task_name}-{args.dataset_name}")):
-        with torch.no_grad():
-            I_1 = batch["ir"].to(device)  # 原图 [B, 5, C, H, W]
-            I_2 = batch["rgb"].to(device)
-            
-            b, f_in, c, h, w = I_1.shape 
-            pad_factor = 64
-            
-            # === 🚀 修复绿边：计算对称 Padding ===
-            pad_h_total = (pad_factor - h % pad_factor) % pad_factor
-            pad_w_total = (pad_factor - w % pad_factor) % pad_factor
-            
-            pad_top = pad_h_total // 2
-            pad_bottom = pad_h_total - pad_top
-            pad_left = pad_w_total // 2
-            pad_right = pad_w_total - pad_left
-
-            if pad_h_total > 0 or pad_w_total > 0:
-                # 使用 replicate 复制边缘像素，彻底杜绝 DCN 越界产生的黑边/绿边
-                I_1_in = F.pad(I_1.view(-1, c, h, w), (pad_left, pad_right, pad_top, pad_bottom), mode='replicate').view(b, f_in, c, h+pad_h_total, w+pad_w_total)
-                I_2_in = F.pad(I_2.view(-1, c, h, w), (pad_left, pad_right, pad_top, pad_bottom), mode='replicate').view(b, f_in, c, h+pad_h_total, w+pad_w_total)
-            else:
-                I_1_in, I_2_in = I_1, I_2
-
-            # === 模型推理 ===
-            fusion_pred, _ = model(I_1_in, I_2_in)
-            
-            # === 🚀 对称裁剪：切回原图尺寸 ===
-            if pad_h_total > 0 or pad_w_total > 0:
-                fusion_pred = fusion_pred[..., pad_top : pad_top + h, pad_left : pad_left + w]
-
-            # === 循环拆解 Batch，同时保持 5D 骗过底层函数 ===
-            for b_idx in range(b):
-                # 保持 [1, T, C, H, W] 形状
-                f_pred_5d = fusion_pred[b_idx:b_idx+1, ...] 
-                f_i1_5d = I_1[b_idx:b_idx+1, ...]
-                f_i2_5d = I_2[b_idx:b_idx+1, ...]
-
-                # 安全获取文件路径
-                try:
-                    # 尝试取中心帧路径
-                    img_path = batch["data_path_ls_dict"]["ir"][2][b_idx]
-                except Exception:
-                    img_path = batch["data_path_ls_dict"]["ir"][0][0]
-                
-                if isinstance(img_path, (list, tuple)):
-                    img_path = img_path[0]
-
-                # 🚀 修复文件夹全变 infrared 的 Bug (-3 拿序列名)
-                dir_name = img_path.split('/')[-3]
-                file_name = img_path.split('/')[-1]
-
-                # 保存图片 (传入 5D)
-                if not args.no_save_vis:
-                    save_path = os.path.join(eval_dir, "eval_visual", dir_name, file_name)
-                    os.makedirs(os.path.dirname(save_path), exist_ok=True)
-                    # f_i1_5d[..., :h, :w] 确保尺寸一致
-                    img_8bit = pred_2_8bit(f_pred_5d, f_i1_5d[..., :h, :w], f_i2_5d[..., :h, :w])
-                    save_image(img_8bit, save_path)
-
-                # 计算指标 (原封不动传入 5D，让 compute_metrics 内部自己去切)
-                res = compute_metrics(
-                    metric_funcs, 
-                    f_pred_5d, 
-                    f_i1_5d[..., :h, :w], 
-                    f_i2_5d[..., :h, :w]
-                )
-
-                if dir_name not in data_dict["UniVF"]:
-                    data_dict["UniVF"][dir_name] = {k: [] for k in res.keys()}
-
-                # 更新指标 (防撑爆内存)
-                for k, v in res.items():
-                    val = v.item() if isinstance(v, torch.Tensor) else v
-                    metric_tracker.update(k, val, n=1)
-                    data_dict["UniVF"][dir_name][k].append(val)
-
-    # --- 最终打印并保存成绩单 ---
-    final_res = metric_tracker.result()
-    logging.info(f"Final: {final_res}")
-    print("\n" + "="*40)
-    print(f"📊 Final Results for {args.dataset_name}:")
-    for k, v in final_res.items():
-        print(f"  - {k}: {v:.4f}")
-    print("="*40 + "\n")
-
-    with open(os.path.join(eval_dir, f"eval-{args.dataset_name}.txt"), "w") as file_txt:
-        file_txt.write(eval_dic_to_text(final_res, f"Dataset: {args.dataset_name}"))
-    
-    with open(os.path.join(eval_dir, f"eval-{args.dataset_name}.csv"), "w", newline="") as file_csv:
-        writer = csv.writer(file_csv)
-        writer.writerow(final_res.keys())
-        writer.writerow(final_res.values())
 
 if __name__ == "__main__":
     main()

@@ -10,9 +10,6 @@ from .RAFT_component.raft_utils import coords_grid, InputPadder
 from .RAFT_component.extractor import ResNetFPN
 from .RAFT_component.layer import conv1x1, conv3x3
 
-from huggingface_hub import PyTorchModelHubMixin
-
-
 
 class RAFT(nn.Module):
     def __init__(self, args):
@@ -23,7 +20,11 @@ class RAFT(nn.Module):
         self.args.corr_levels = 4
         self.args.corr_radius = args.radius
         self.args.corr_channel = args.corr_levels * (args.radius * 2 + 1) ** 2
-        self.cnet = ResNetFPN(args, input_dim=6, output_dim=2 * self.args.dim, norm_layer=nn.BatchNorm2d, init_weight=True)
+        # The SEA-RAFT checkpoint contains the complete encoders. Avoid an
+        # unrelated ImageNet download while constructing a checkpoint-backed
+        # model; it can still be enabled explicitly for training from scratch.
+        init_weight = bool(getattr(args, "init_weight", False))
+        self.cnet = ResNetFPN(args, input_dim=6, output_dim=2 * self.args.dim, norm_layer=nn.BatchNorm2d, init_weight=init_weight)
 
         # conv for iter 0 results
         self.init_conv = conv3x3(2 * args.dim, 2 * args.dim)
@@ -40,7 +41,7 @@ class RAFT(nn.Module):
             nn.Conv2d(2 * args.dim, 6, 3, padding=1)
         )
         if args.iters > 0:
-            self.fnet = ResNetFPN(args, input_dim=3, output_dim=self.output_dim, norm_layer=nn.BatchNorm2d, init_weight=True)
+            self.fnet = ResNetFPN(args, input_dim=3, output_dim=self.output_dim, norm_layer=nn.BatchNorm2d, init_weight=init_weight)
             self.update_block = BasicUpdateBlock(args, hdim=args.dim, cdim=args.dim)
     
     def initialize_flow(self, img):

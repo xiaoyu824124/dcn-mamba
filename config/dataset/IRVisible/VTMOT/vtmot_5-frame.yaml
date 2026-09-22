@@ -1,0 +1,41 @@
+class_name: infrared_visible_dataset
+disp_name: VTMOT-IRVisible-Misaligned
+dir: VTMOT_misaligned
+csv_dir: data_split/IVF/VTMOT
+
+# 三个模态列（由 data_split/IVF/VTMOT 下的 CSV 提供，路径相对 base_data_dir）：
+#   ir     : infrared     与 visible_gt 已对齐（QC: residual<=3px, drift<=5px），作为 moving
+#   rgb    : visible_mis  被人工注入 H_align 错位，作为 fixed 参考
+#   rgb_gt : visible_gt   对齐基准；单模态热启动时作为 moving
+# 关键性质：(moving=ir, fixed=rgb) 与 (moving=rgb_gt, fixed=rgb) 的
+# 真值光流完全相同，都是 F(p) = H_align @ p - p。
+#
+# `rgb_gt` is deliberately NOT loaded during TRAIN.  The trainer consumes only
+# `ir`, `rgb` and `gt_flow` (the mono-modal warm start this column was prepared
+# for is not implemented), so loading it would cost 9 extra PNG reads per sample
+# -- one third of all image I/O -- for nothing.  It stays declared for eval/test
+# because `test.py --check-data` needs it to verify the GT warp, and those splits
+# are a few dozen windows each, so the cost there is irrelevant.
+column_names:
+  train: [ir, rgb]
+  eval: [ir, rgb, rgb_gt]
+  test: [ir, rgb, rgb_gt]
+
+# 逐帧真值 H_align = inv(H_mis)，位于原始图像栅格：
+#   visible_mis(p) = visible_gt(H_align @ p)
+registration_gt_dir: gt_h
+registration_gt_flow: true
+
+# 源分辨率混合：640x480 (4:3) / 640x512 (5:4) / 1920x1080 (16:9)。
+# 只能靠居中裁剪统一宽高比，绝不能直接拉伸（否则引入各向异性畸变，
+# 而真值 homography 是无畸变的，监督就错了）。
+# 按 4:3 居中裁剪再缩放到 640x480 时：4:3 原样、5:4 裁高 32px、16:9 裁宽 480px。
+resize_hw: [480, 640]
+center_crop_to_aspect: true
+
+# Keep the legacy filename for launch compatibility; 9 frames exercise
+# multiple memory write/verify/evict cycles in every supervised sample.
+num_frames: 9
+frame_gap_ls: [0]
+stride: 1
+frame_padding: true

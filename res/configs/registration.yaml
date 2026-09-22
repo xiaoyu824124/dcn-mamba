@@ -14,20 +14,14 @@ encoder:
 global_matcher:
   temperature: 0.07
   learnable_temperature: true
-  return_correlation: true
+  # Full-frame training does not consume the visualisation matrix; avoid
+  # retaining a second [N,N] tensor in the Python output.
+  return_correlation: false
   max_tokens: 0
   # VTMOT injects only affine geometry.  Project global soft matches to a
   # 6-DoF [y,x,1] -> [y,x] field instead of fitting unconstrained dense flow.
   affine_projection: true
   affine_ridge: 1.0e-3
-
-registration:
-  feature_stride: [8, 8]
-
-dcn:
-  kernel_size: 3
-  use_residual_flow_head: false
-  max_residual_feature_px: 2.0
 
 loss:
   charbonnier_eps: 1.0e-3
@@ -36,35 +30,16 @@ loss:
     mind: 0.5
     edge: 0.25
     smooth: 0.05
-
-synthetic_data:
-  length: 4096
-  height: 128
-  width: 160
-  translation_px: 24.0
-  rotation_deg: 8.0
-  scale_jitter: 0.08
-  seed: 1234
-
-synthetic_train:
-  seed: 1234
-  steps: 1000
-  batch_size: 4
-  num_workers: 0
-  lr: 2.0e-4
-  weight_decay: 1.0e-5
-  grad_clip_norm: 1.0
-  amp: true
-  log_every: 25
-  preview_every: 250
-  checkpoint_every: 250
+    # Directly supervise the 6-DoF WLS affine estimate with VTMOT gt_h.
+    # It is complementary to dense flow EPE and adds no new network branch.
+    affine: 10.0
 
 # Real VTMOT fine-tuning runs only the standalone coarse registration branch.
-# First resize preserves the common 4:3 field of view; then crops keep 3060
-# global all-pairs correlation comfortably small during backward propagation.
+# RTX 3090 (24 GB): full 480x640 FOV and batch one.  This is the evaluation
+# FOV that matters; the older 160x160 3060 crop is only an initialisation run.
 vtmot_data:
   target_hw: [480, 640]
-  crop_hw: [160, 160]
+  crop_hw: [480, 640]
   train_frame_stride: 5
   eval_frame_stride: 50
 
@@ -72,9 +47,9 @@ vtmot_train:
   seed: 2025
   pilot_steps: 300
   full_steps: 3000
-  batch_size: 4
-  eval_batch_size: 4
-  num_workers: 0
+  batch_size: 1
+  eval_batch_size: 1
+  num_workers: 2
   lr: 2.0e-4
   weight_decay: 1.0e-5
   grad_clip_norm: 1.0
@@ -82,11 +57,3 @@ vtmot_train:
   log_every: 25
   validation_every: 100
   checkpoint_every: 100
-
-ablation:
-  use_mind: true
-  use_global_matching: true
-  use_dcn: true
-  use_confidence: true
-  use_multiscale_dcn: true
-  use_residual_flow_head: false

@@ -29,11 +29,7 @@ class Fusion_Net(nn.Module):
         self,
         dim=32,
         num_blocks=3,          # number of temporal VSS (SSM) fusion blocks per stream
-        head=8,                # kept for config compatibility (unused)
-        ffn_expansion_factor=2,  # kept for config compatibility (unused)
         bias=False,
-        LayerNorm_type="WithBias",  # kept for config compatibility (unused)
-        output_mask=False,
         downscale=2,           # number of stride-2 convs in the encoder stem (2 -> 1/4)
         enc_blocks=1,          # extra residual conv blocks after downsampling
         dec_blocks=2,          # 2D residual blocks in the decoder
@@ -42,8 +38,7 @@ class Fusion_Net(nn.Module):
         super(Fusion_Net, self).__init__()
         self.dim = dim
         self.num_blocks = num_blocks
-        self.output_mask = output_mask
-        self.out_ch = 1 if output_mask else 3
+        self.out_ch = 1
 
         # ---- per-source feature embedding (stride-2 stem + light ResBlocks) ----
         self.encoder_1 = self._build_encoder(dim, bias, downscale, enc_blocks)

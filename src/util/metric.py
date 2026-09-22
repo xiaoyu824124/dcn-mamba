@@ -45,13 +45,14 @@ def _input_check(batch, ref1=None, ref2=None):  # Check input
             batch = batch.repeat(1, 3, 1, 1)
         
         assert batch.shape[1] == 3, "channel number error"
-        # For some medical images, the batch can be completely black
-        if torch.max(batch) < 1:
+        # Only guard genuinely empty images. SmoothFusion-style evaluation
+        # tensors are in [0, 1], so ``max < 1`` would inject noise into normal
+        # dark images.
+        if torch.max(batch) <= 1e-12:
             noise = torch.randn_like(batch) * 0.1 + 1  # Add random noise with mean 1
             batch = batch + noise
         return batch
     
-    assert batch.device.type != 'cpu', "input is on CPU"
     batch = _batch_check(batch).to(torch.float64)
     if ref1 is not None:
         ref1 = _batch_check(ref1).to(torch.float64).to(batch.device)
@@ -116,126 +117,222 @@ def Metric_VIF(batch, ref1=None, ref2=None):
         vifp2 = torch.mean(_vifp_batch(ref2, batch), dim=1)  # (B,)
         return (vifp1 + vifp2) / 2.0 
 
-def Metric_MEF_SSIM(batch, ref1=None, ref2=None):
-    def mef_ssim(img, img1, img2, K=0.03, window=None):
-        imgSeq = torch.cat((img1.unsqueeze(-1), img2.unsqueeze(-1)), dim=-1)  #B,C,H,W,2
-
-        if window is None:
-            window= _fspecial_gaussian_torch(11, 1.5).to(img.device)
-
-        wSize = window.shape[2]
-        sWindow = torch.ones((wSize, wSize), device=img.device,dtype=torch.float64) / wSize**2
-        bd = wSize // 2 
-
-        # Calculate mu and ed 
-        imgSeq=torch.cat((imgSeq[:,:,:,:,0], imgSeq[:,:,:,:,1]), dim=1) 
-        mu=F.conv2d(imgSeq, sWindow.repeat(imgSeq.shape[1],1,1,1), padding=0,groups=imgSeq.shape[1]) 
-
-        sigmaSq= F.conv2d(imgSeq**2, sWindow.repeat(imgSeq.shape[1],1,1,1), padding=0,groups=imgSeq.shape[1])-mu** 2 
-        
-        ed=torch.sqrt(torch.relu(wSize*wSize*sigmaSq)) + 0.001 
-        del sigmaSq
-        temp1,temp2=torch.chunk(ed.unsqueeze(-1), 2, dim=1)
-        ed=torch.cat([temp1,temp2],dim=-1) 
-        del temp1,temp2
-        # Consistency map R
-        vecs = imgSeq.unfold(2, 2*bd+1, 1).unfold(3, 2*bd+1, 1) 
-        vecs =vecs.flatten(start_dim=4) 
-        denominator= torch.norm(vecs-mu.unsqueeze(-1), p=2, dim=4) 
-        temp1,temp2=torch.chunk(denominator, 2, dim=1)
-        denominator=temp1+temp2
-
-        temp1,temp2=torch.chunk(vecs.unsqueeze(-1), 2, dim=1)
-        
-        vecs=torch.cat([temp1,temp2],dim=-1) 
-        del temp1,temp2
-        vecs_sum = torch.sum(vecs,dim=-1)
-        del vecs  
-        numerator = torch.norm(vecs_sum - torch.mean(vecs_sum,dim=-1,keepdim=True), p=2, dim=-1)
-        del vecs_sum
-        R=(numerator + torch.finfo(torch.float64).eps) / (denominator + torch.finfo(torch.float64).eps)
-        del numerator, denominator
-
-        R = torch.clamp(R, min=torch.finfo(torch.float64).eps, max=1 - torch.finfo(torch.float64).eps)
-        p = torch.tan(torch.pi / 2 * R)
-        p = torch.clamp(p, min=0, max=10)
-
-        wMap = (ed / wSize) ** (p.unsqueeze(-1)) + torch.finfo(torch.float64).eps 
-        wMap /= torch.sum(wMap, dim=-1,keepdim=True) 
-
-        maxEd = torch.max(ed, dim=-1)[0] 
-        
-        C = (K * 255) ** 2
-        blocks = imgSeq.unfold(2, 2*bd+1, 1).unfold(3, 2*bd+1, 1) 
-        blocks =blocks.flatten(start_dim=4) 
-        temp1,temp2=torch.chunk(blocks.unsqueeze(-1), 2, dim=1)
-        blocks=torch.cat([temp1,temp2],dim=-1) 
-
-        temp1,temp2=torch.chunk(mu.unsqueeze(-1), 2, dim=1)
-        mu=torch.cat([temp1,temp2],dim=-1) 
-
-        rBlock=wMap.unsqueeze(4)*(blocks-mu.unsqueeze(4))/ed.unsqueeze(4)  
-
-        del ed,wMap,blocks,temp1,temp2,mu
-
-        rBlock=rBlock.sum(-1)
-        temp1=torch.norm(rBlock, p=2, dim=4,keepdim=True) 
-        rBlock=(temp1!=0)*rBlock/(temp1+(temp1==0))*maxEd.unsqueeze(-1) 
-        del maxEd,temp1
-        fBlock = img.unfold(2, 2*bd+1, 1).unfold(3, 2*bd+1, 1).flatten(start_dim=4) 
-
-        window=window.flatten().view(1, 1, 1, 1, -1)
-
-        mu1=torch.sum(window*rBlock,4,keepdim=True) 
-        mu2=torch.sum(window*fBlock,4,keepdim=True) 
-        sigma1Sq = torch.sum(window * (rBlock - mu1) ** 2,dim=-1) 
-        sigma2Sq = torch.sum(window * (fBlock - mu2) ** 2,dim=-1) 
-        sigma12=torch.sum(window * (rBlock - mu1) *(fBlock - mu2),dim=-1) 
-        del rBlock,fBlock,mu1,mu2
-        qMap= (2 * sigma12 + C) / (sigma1Sq + sigma2Sq + C)
-        Q=torch.mean(qMap,dim=[2,3])
+def _filter2d_gaussian(img, win):
+    pad = (win.shape[-2] // 2, win.shape[-1] // 2, win.shape[-2] // 2, win.shape[-1] // 2)
+    img = F.pad(img, pad=pad, mode='reflect')
+    return F.conv2d(img, win.repeat(img.shape[1], 1, 1, 1), padding=0, groups=img.shape[1])
 
 
-        return Q
-    
-    with torch.no_grad():
-        batch,ref1,ref2=_input_check(batch,ref1,ref2)
-        batch,ref1,ref2=rgb2gray(batch),rgb2gray(ref1),rgb2gray(ref2)
+def _ssim_pair(img, img_ref):
+    """Per-sample SSIM on the 0-255 scale. Input [N,C,H,W] -> [N]."""
+    K1 = (0.01 * 255) ** 2
+    K2 = (0.03 * 255) ** 2
+    win = _fspecial_gaussian_torch(11, 1.5).to(img.device)
 
-        return torch.mean(mef_ssim(batch,ref1,ref2),dim=1)
+    mu1 = _filter2d_gaussian(img, win)
+    mu2 = _filter2d_gaussian(img_ref, win)
+    mu1_sq = mu1.pow(2)
+    mu2_sq = mu2.pow(2)
+    mu1_mu2 = mu1 * mu2
+
+    sigma1_sq = _filter2d_gaussian(img * img, win) - mu1_sq
+    sigma2_sq = _filter2d_gaussian(img_ref * img_ref, win) - mu2_sq
+    sigma12 = _filter2d_gaussian(img * img_ref, win) - mu1_mu2
+
+    ssim_map = ((2. * mu1_mu2 + K1) * (2. * sigma12 + K2)) / \
+        ((mu1_sq + mu2_sq + K1) * (sigma1_sq + sigma2_sq + K2))
+    return torch.mean(ssim_map, dim=(2, 3))
+
 
 def Metric_SSIM(batch, ref1=None, ref2=None):
-    def filter2D(img,win):
-        img=F.pad(img, pad=(win.shape[-2]//2,win.shape[-1]//2,win.shape[-2]//2,win.shape[-1]//2), mode='reflect')
-        return F.conv2d(img, win.repeat(img.shape[1],1,1,1), padding=0, groups=img.shape[1])
-
-    def ssim(img, img_ref):
-        K1=(0.01*255)**2
-        K2=(0.03*255)**2
-        sigma=1.5
-        window_size=11
-        win = _fspecial_gaussian_torch(window_size, sigma).to(img.device)
-
-        mu1=filter2D(img, win)
-        mu2=filter2D(img_ref, win)
-
-        mu1_sq = mu1.pow(2)
-        mu2_sq = mu2.pow(2)
-        mu1_mu2 = mu1 * mu2
-
-        sigma1_sq = filter2D(img* img, win) - mu1_sq
-        sigma2_sq = filter2D(img_ref * img_ref, win) - mu2_sq
-        sigma12 = filter2D(img * img_ref, win) - mu1_mu2
-
-        ssim_map = ((2. * mu1_mu2 + K1) * (2. * sigma12 + K2)) / \
-        ((mu1_sq + mu2_sq + K1) * (sigma1_sq + sigma2_sq + K2))
-
-        return torch.mean(ssim_map,dim=(2,3))
-    
     with torch.no_grad():
-        batch,ref1,ref2=_input_check(batch,ref1,ref2)
-        output=(ssim(batch,ref1)+ssim(batch,ref2))/2
-        return torch.mean(output,dim=1)
+        batch, ref1, ref2 = _input_check(batch, ref1, ref2)
+        output = (_ssim_pair(batch, ref1) + _ssim_pair(batch, ref2)) / 2
+        return torch.mean(output, dim=1)
+
+
+def _smoothfusion_inputs(batch, ref1, ref2):
+    """Prepare metric inputs using SmoothFusion's [0, 1] convention."""
+    tensors = []
+    for image in (batch, ref1, ref2):
+        if image is None:
+            raise ValueError("SmoothFusion metrics require two reference images")
+        if image.dim() == 2:
+            image = image.unsqueeze(0).unsqueeze(0)
+        elif image.dim() == 3:
+            image = image.unsqueeze(0)
+        if image.dim() != 4:
+            raise ValueError(f"metric inputs expect [B,C,H,W], got {tuple(image.shape)}")
+        image = image.to(dtype=torch.float64)
+        if image.numel() and image.detach().amax() > 1.0:
+            image = image / 255.0
+        tensors.append(image)
+
+    channels = max(image.shape[1] for image in tensors)
+    if channels not in (1, 3):
+        raise ValueError(f"metric inputs must have 1 or 3 channels, got {channels}")
+    if channels == 3:
+        tensors = [image.repeat(1, 3, 1, 1) if image.shape[1] == 1 else image
+                   for image in tensors]
+    return tuple(tensors)
+
+
+def Metric_MSE(batch, ref1, ref2):
+    """SmoothFusion MSE: average source fidelity error on the [0, 1] scale."""
+    with torch.no_grad():
+        batch, ref1, ref2 = _smoothfusion_inputs(batch, ref1, ref2)
+        mse1 = (batch - ref1).pow(2).mean(dim=(1, 2, 3))
+        mse2 = (batch - ref2).pow(2).mean(dim=(1, 2, 3))
+        return 0.5 * (mse1 + mse2)
+
+
+def _smoothfusion_ncc_pair(target, prediction):
+    target = target.reshape(target.shape[0], -1)
+    prediction = prediction.reshape(prediction.shape[0], -1)
+    target_mean = target.mean(dim=1, keepdim=True)
+    prediction_mean = prediction.mean(dim=1, keepdim=True)
+    target_var = ((target - target_mean) ** 2).mean(dim=1)
+    prediction_var = ((prediction - prediction_mean) ** 2).mean(dim=1)
+    covariance = ((target - target_mean) * (prediction - prediction_mean)).mean(dim=1)
+    return covariance / torch.sqrt((target_var + 1e-5) * (prediction_var + 1e-6))
+
+
+def Metric_NCC(batch, ref1, ref2):
+    """SmoothFusion NCC: average Pearson correlation with both sources."""
+    with torch.no_grad():
+        batch, ref1, ref2 = _smoothfusion_inputs(batch, ref1, ref2)
+        ncc1 = _smoothfusion_ncc_pair(ref1, batch)
+        ncc2 = _smoothfusion_ncc_pair(ref2, batch)
+        return 0.5 * (ncc1 + ncc2)
+
+
+def Metric_Redge(batch, ref1, ref2):
+    """Relative edge retention used by the HDO registration report.
+
+    The metric compares the soft Sobel edge strength retained in the result
+    against each source and averages the two retention ratios.  It is exposed
+    under the ``R_edge`` report name; the paper's private evaluator should be
+    used when exact Table 3 reproduction is required.
+    """
+    with torch.no_grad():
+        batch, ref1, ref2 = _input_check(batch, ref1, ref2)
+
+        sobel_x = torch.tensor(
+            [[-1.0, 0.0, 1.0], [-2.0, 0.0, 2.0], [-1.0, 0.0, 1.0]],
+            dtype=torch.float64, device=batch.device).view(1, 1, 3, 3)
+        sobel_y = sobel_x.transpose(-1, -2)
+
+        def edge_strength(image):
+            gray = rgb2gray(image)
+            gx = F.conv2d(gray, sobel_x, padding=1)
+            gy = F.conv2d(gray, sobel_y, padding=1)
+            return torch.sqrt(gx.square() + gy.square() + 1e-12)
+
+        result_edge = edge_strength(batch)
+        source_edges = (edge_strength(ref1), edge_strength(ref2))
+        ratios = []
+        for source_edge in source_edges:
+            retained = torch.minimum(result_edge, source_edge).sum(dim=(1, 2, 3))
+            source_total = source_edge.sum(dim=(1, 2, 3)).clamp_min(1e-12)
+            ratios.append(retained / source_total)
+        return 0.5 * (ratios[0] + ratios[1])
+
+
+# ----------------------------------------------------------------------
+# 时间一致性指标
+#
+# 说明：SmoothFusion/HDO 表 3 报告 ITF 与 T-SSIM，但当前公开仓库
+# （E:\res and fus\SmoothFusion）没有提供它们的原始评测函数。因此下面两个按论文
+# 指标语义实现，用于统一训练/评测口径；若要逐位复现论文数值，仍需要作者原始脚本。
+#
+# 另需注意该论文自己的警告：VideoFusion/ReCoNet 在时间指标上数值更好，但那是
+# 因为严重错位与大范围伪影人为压低了帧间差，属于"假的时间平滑"。所以时间指标
+# 必须与空间保真度指标（VIF/SSIM/MI/Qabf）一起报告，不能单独看。
+# ----------------------------------------------------------------------
+
+def _gray_sequence(seq):
+    """[B,T,C,H,W] -> [B,T,1,H,W] float64（0-255 尺度）。"""
+    if seq.dim() != 5:
+        raise ValueError(f"temporal metrics expect [B,T,C,H,W], got {tuple(seq.shape)}")
+    batch, time, channels, height, width = seq.shape
+    flat = seq.reshape(batch * time, channels, height, width)
+    gray = rgb2gray(flat)
+    return gray.reshape(batch, time, 1, height, width)
+
+
+def Metric_ITF(batch, ref1=None, ref2=None):
+    """ITF: 融合视频相邻帧的平均绝对差（0-255 灰度尺度）。越低越平滑。
+
+    这是对 SmoothFusion "inter-frame time fluctuation" 的本方定义：直接度量
+    输出视频的帧间波动能量。注意它可被模糊/错位人为压低，需与空间指标同看。
+    """
+    with torch.no_grad():
+        seq = _gray_sequence(batch.to(torch.float64))
+        if seq.shape[1] < 2:
+            return torch.zeros(seq.shape[0], device=seq.device, dtype=torch.float64)
+        return (seq[:, 1:] - seq[:, :-1]).abs().mean(dim=(1, 2, 3, 4))
+
+
+def Metric_TSSIM(batch, ref1=None, ref2=None):
+    """T-SSIM: 融合视频相邻帧之间的 SSIM 均值。越高越稳定。
+
+    这是对 SmoothFusion "temporal structure similarity" 的本方定义。
+    输入需要 [B,T,C,H,W] 且 T >= 2（预测序列本身的时间维，走整段而不是中心帧）。
+    """
+    with torch.no_grad():
+        seq = batch.to(torch.float64)
+        if seq.dim() != 5:
+            raise ValueError(f"Metric_TSSIM expects [B,T,C,H,W], got {tuple(seq.shape)}")
+        batch_size, time, channels, height, width = seq.shape
+        if time < 2:
+            return torch.zeros(batch_size, device=seq.device, dtype=torch.float64)
+        left = seq[:, :-1].reshape(batch_size * (time - 1), channels, height, width)
+        right = seq[:, 1:].reshape(batch_size * (time - 1), channels, height, width)
+        values = _ssim_pair(left, right)
+        return values.reshape(batch_size, time - 1).mean(dim=1)
+
+
+def Metric_NMI(batch, ref1, ref2):
+    """NMI: 融合图与两个源图的归一化互信息均值。~1.0 附近为正常量级。"""
+    with torch.no_grad():
+        batch, ref1, ref2 = _input_check(batch, ref1, ref2)
+        nmi1, _ = _torch_normalized_mutual_info_score(batch, ref1)
+        nmi2, _ = _torch_normalized_mutual_info_score(batch, ref2)
+    return 0.5 * (torch.mean(nmi1, dim=1) + torch.mean(nmi2, dim=1))
+
+
+def Metric_LNCC(batch, ref1, ref2, window=17, eps=1e-5):
+    """LNCC: 局部归一化互相关。
+
+    定义逐行对齐 SmoothFusion 官方代码 ``AKRF/utils/util.py`` 的 ``LNCC`` 类：
+    用 ones 滤波器在 window×window 窗口内求局部和，取**平方**相关系数
+    ``cc = cross^2 / (I_var * J_var + eps)``，再对全图取均值。
+    窗口默认 17、eps=1e-5，与官方一致。官方实现在单通道上计算，这里同样先转灰度。
+    """
+    def _lncc(source, target):
+        source = rgb2gray(source)
+        target = rgb2gray(target)
+        filt = torch.ones(1, 1, window, window, dtype=source.dtype,
+                          device=source.device)
+        pad = window // 2
+        win_size = window * window
+
+        i_sum = F.conv2d(source, filt, padding=pad)
+        j_sum = F.conv2d(target, filt, padding=pad)
+        i2_sum = F.conv2d(source * source, filt, padding=pad)
+        j2_sum = F.conv2d(target * target, filt, padding=pad)
+        ij_sum = F.conv2d(source * target, filt, padding=pad)
+
+        u_i = i_sum / win_size
+        u_j = j_sum / win_size
+        cross = ij_sum - u_j * i_sum - u_i * j_sum + u_i * u_j * win_size
+        i_var = i2_sum - 2 * u_i * i_sum + u_i * u_i * win_size
+        j_var = j2_sum - 2 * u_j * j_sum + u_j * u_j * win_size
+        return (cross * cross / (i_var * j_var + eps)).mean()
+
+    with torch.no_grad():
+        batch, ref1, ref2 = _input_check(batch, ref1, ref2)
+        return 0.5 * (_lncc(ref1, batch) + _lncc(ref2, batch))
     
 def Metric_MI(batch, ref1=None, ref2=None):
     with torch.no_grad():
@@ -385,36 +482,57 @@ def rgb2gray(tensor):
         return tensor
     elif tensor.shape[1] == 3:
         r, g, b = tensor[:, 0:1, :, :], tensor[:, 1:2, :, :], tensor[:, 2:3, :, :]
-        gray = torch.round(0.299 * r + 0.587 * g + 0.114 * b)
+        gray = 0.299 * r + 0.587 * g + 0.114 * b
         return gray.to(torch.float64)
     else:
         raise ValueError(f"channel must be 1 or 3, got {tensor.shape[1]}")
     
+SPATIAL_METRIC_NAMES = {"Metric_MSE", "Metric_NCC", "Metric_Redge", "Metric_LNCC",
+                        "Metric_VIF", "Metric_SSIM", "Metric_MI", "Metric_Qabf",
+                        "Metric_NMI"}
+TEMPORAL_METRIC_NAMES = {"Metric_ITF", "Metric_TSSIM"}
+
+
 def compute_metrics(metric_funcs, fusion_pred, I1, I2):
+    """计算指标。
+
+    空间指标作用在预测序列的**中心帧**上（对齐到输入 5 帧窗口的中心）；
+    时间指标作用在**整段**预测序列上，因此要求 fusion_pred 的 T >= 2。
+    时间指标必须与空间指标一起报告：错位与模糊会人为压低 ITF、抬高 T-SSIM，
+    单看时间指标会得到"假的时间平滑"。
+    """
     results = {}
     for met_func in metric_funcs:
         _metric_name = met_func.__name__
-        param_count = len(inspect.signature(met_func).parameters)
 
-        if _metric_name in ["Metric_BiSWE", "Metric_MS2R"]:
-            fusion_clip = torch.round(fusion_pred * 255)
-            ir_clip = torch.round(I1[:, 1:4, :, :, :] * 255)
-            rgb_clip = torch.round(I2[:, 1:4, :, :, :] * 255)
-        elif _metric_name in ["Metric_VIF", "Metric_SSIM", "Metric_MI", "Metric_Qabf", "Metric_MEF_SSIM"]:
-            fusion_clip = torch.round(fusion_pred[:, 1, :, :, :] * 255)
-            ir_clip = torch.round(I1[:, 2, :, :, :] * 255)
-            rgb_clip = torch.round(I2[:, 2, :, :, :] * 255)
+        if _metric_name in TEMPORAL_METRIC_NAMES:
+            _metric = met_func(torch.round(fusion_pred * 255)).item()
+
+        elif _metric_name in SPATIAL_METRIC_NAMES:
+            # MSE/NCC/LNCC/R_edge use the unquantized center frame. Legacy
+            # metrics retain the historical 0-255 evaluation path.
+            if _metric_name in {"Metric_MSE", "Metric_NCC", "Metric_Redge", "Metric_LNCC"}:
+                fusion_clip = fusion_pred[:, 1, :, :, :]
+                ir_clip = I1[:, 2, :, :, :]
+                rgb_clip = I2[:, 2, :, :, :]
+            else:
+                fusion_clip = torch.round(fusion_pred[:, 1, :, :, :] * 255)
+                ir_clip = torch.round(I1[:, 2, :, :, :] * 255)
+                rgb_clip = torch.round(I2[:, 2, :, :, :] * 255)
+
+            required = len([p for p in inspect.signature(met_func).parameters.values()
+                            if p.default is inspect.Parameter.empty])
+            if required == 1:
+                _metric = met_func(fusion_clip).item()
+            elif required == 3:
+                _metric = met_func(fusion_clip, ir_clip, rgb_clip).item()
+            else:
+                raise ValueError(
+                    f"Metric function {_metric_name} has unsupported number of "
+                    f"required parameters: {required}")
         else:
             raise ValueError(f"Unsupported metric function: {_metric_name}")
 
-        if param_count == 1:
-            _metric = met_func(fusion_clip).item()
-        elif param_count == 3:
-            _metric = met_func(fusion_clip, ir_clip, rgb_clip).item()
-        else:
-            raise ValueError(
-                f"Metric function {_metric_name} has unsupported number of parameters: {param_count}"
-            )
         results[_metric_name] = _metric
     return results
 
@@ -422,165 +540,3 @@ def _ignore_nan(tensor):
     not_nan_channel = ~torch.isnan(tensor)  # B,C
     tensor_without_nan = torch.nan_to_num(tensor, nan=0.0)
     return torch.sum(tensor_without_nan, dim=1).unsqueeze(1) / torch.sum(not_nan_channel, dim=1)
-
-# Bi-Directional Self-Warping Error (BiSWE)
-class BiSWE_Evaluator:
-    def __init__(
-        self,
-        use_occlusion=True,
-        occ_threshold=1.0,
-        device="cuda",
-        raft_config_path="config/module/spring-S.json",
-    ):
-        from src.model.raft import RAFT
-        from src.model.RAFT_component.raft_utils import load_ckpt
-        from src.model.utils import load_args_from_json, flow_warp
-        
-        self.raft_args = load_args_from_json(raft_config_path)
-        self.flow_net = RAFT(self.raft_args).to(device).eval()
-        load_ckpt(self.flow_net, self.raft_args.path)
-        self.use_occlusion = use_occlusion
-        self.occ_threshold = occ_threshold
-        self.flow_warp = flow_warp
-
-    @torch.no_grad()
-    def occlusion_mask(self, img1, img2, flow_ab): 
-        flow_ba = self.flow_net(img2, img1)["final"] 
-        flow_ba_warped = self.flow_warp(flow_ba, flow_ab)
-        fb_diff = flow_ab + flow_ba_warped
-        fb_consistency = fb_diff.norm(p=2, dim=1)  
-        mask = (fb_consistency < self.occ_threshold).float() 
-        return mask
-
-    @torch.no_grad()
-    def evaluate(self, video_clip, R1_clip, R2_clip):
-        B, _, _, H, W = video_clip.shape
-        device = video_clip.device
-
-        cur = video_clip[:, 1]  
-        prev = video_clip[:, 0]  
-        nxt = video_clip[:, 2]  
-
-        if self.use_occlusion:
-            flow_R1_cur2prev = self.flow_net(R1_clip[:,1], R1_clip[:,0])["final"]
-            flow_R1_cur2next = self.flow_net(R1_clip[:,1], R1_clip[:,2])["final"]
-
-            flow_R2_cur2prev = self.flow_net(R2_clip[:,1], R2_clip[:,0])["final"]
-            flow_R2_cur2next = self.flow_net(R2_clip[:,1], R2_clip[:,2])["final"]
-
-            mask_R1_prev = self.occlusion_mask(R1_clip[:,1], R1_clip[:,0], flow_R1_cur2prev)
-            mask_R1_next = self.occlusion_mask(R1_clip[:,1], R1_clip[:,2], flow_R1_cur2next)
-
-            mask_R2_prev = self.occlusion_mask(R2_clip[:,1], R2_clip[:,0], flow_R2_cur2prev)
-            mask_R2_next = self.occlusion_mask(R2_clip[:,1], R2_clip[:,2], flow_R2_cur2next)
-
-            mask_prev = mask_R1_prev*mask_R2_prev
-            mask_next = mask_R1_next*mask_R2_next
-        else:
-            mask_prev = torch.ones((B, H, W), device=device)
-            mask_next = torch.ones((B, H, W), device=device)
-
-        flow_cur2prev = self.flow_net(cur,prev)["final"]
-        flow_cur2next = self.flow_net(cur,nxt)["final"]        
-
-        recon_prev = self.flow_warp(prev, flow_cur2prev)
-        recon_next = self.flow_warp(nxt, flow_cur2next)
-
-        diff_prev = (torch.abs(cur - recon_prev) ).mean(1)
-        diff_next = (torch.abs(cur - recon_next) ).mean(1)
-
-        err_prev = (mask_prev * diff_prev).sum(dim=(1, 2)) / (
-            mask_prev.sum(dim=(1, 2)) + 1e-10
-        )
-        err_next = (mask_next * diff_next).sum(dim=(1, 2)) / (
-            mask_next.sum(dim=(1, 2)) + 1e-10
-        )
-
-        total_error = err_prev + err_next 
-
-        return total_error
-
-# Motion Smoothness with Dual Reference Videos (MS2R)
-class MS2R_Evaluator:
-    def __init__(
-        self,
-        device="cuda",
-        raft_config_path="config/module/spring-S.json",
-        bin_range=(0.0, 10.0),
-        bin_width=1.0,
-    ):
-        from src.model.raft import RAFT
-        from src.model.RAFT_component.raft_utils import load_ckpt
-        from src.model.utils import load_args_from_json
-
-        self.device = device
-        self.bin_range = bin_range
-        self.bin_width = bin_width
-
-        raft_args = load_args_from_json(raft_config_path)
-        self.flow_net = RAFT(raft_args).to(device).eval()
-        load_ckpt(self.flow_net, raft_args.path)
-
-    @torch.no_grad()
-    def compute_flow(self, img1, img2):
-        return self.flow_net(img1, img2)["final"]
-
-    @torch.no_grad()
-    def compute_differential_flow(self, G0, G1, G2, R0, R1, R2):
-        d_gen = self.compute_flow(G1, G2) - self.compute_flow(G0, G1)
-        d_ref = self.compute_flow(R1, R2) - self.compute_flow(R0, R1)
-        return d_gen - d_ref  
-
-    def compute_sample_smoothness(self, d_merged):
-        D_l2 = torch.norm(d_merged, dim=1).view(-1)  
-
-        hist = torch.histc(
-            D_l2,
-            bins=int((self.bin_range[1] - self.bin_range[0]) / self.bin_width),
-            min=self.bin_range[0],
-            max=self.bin_range[1],
-        )
-        total = hist.sum() + 1e-10
-        metric = (torch.log(hist + 1e-10) - torch.log(total)).sum()  
-        return metric
-
-    def compute_ms2r_metric(self, G_clip, R1_clip, R2_clip):
-        B = G_clip.shape[0]
-        all_metrics = []
-
-        for k in range(B):
-            G0, G1, G2 = G_clip[k]
-            R10, R11, R12 = R1_clip[k]
-            R20, R21, R22 = R2_clip[k]
-
-            D1 = self.compute_differential_flow(
-                G0.unsqueeze(0),
-                G1.unsqueeze(0),
-                G2.unsqueeze(0),
-                R10.unsqueeze(0),
-                R11.unsqueeze(0),
-                R12.unsqueeze(0),
-            )
-            D2 = self.compute_differential_flow(
-                G0.unsqueeze(0),
-                G1.unsqueeze(0),
-                G2.unsqueeze(0),
-                R20.unsqueeze(0),
-                R21.unsqueeze(0),
-                R22.unsqueeze(0),
-            )
-
-            metric_val=0.5*(torch.mean(torch.abs(D1))+torch.mean(torch.abs(D2)))
-            all_metrics.append(metric_val)
-
-        return torch.stack(all_metrics)  
-
-
-
-def Metric_BiSWE(fusion_clip: torch.Tensor, source_clip_1: torch.Tensor, source_clip_2: torch.Tensor):
-    evaluator = BiSWE_Evaluator(use_occlusion=True)
-    return evaluator.evaluate(fusion_clip, source_clip_1, source_clip_2)
-
-def Metric_MS2R(fusion_clip: torch.Tensor, source_clip_1: torch.Tensor, source_clip_2: torch.Tensor):
-    evaluator = MS2R_Evaluator()
-    return evaluator.compute_ms2r_metric(fusion_clip, source_clip_1, source_clip_2)

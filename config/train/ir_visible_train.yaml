@@ -1,0 +1,248 @@
+base_config:
+  - config/logging.yaml
+  - config/wandb.yaml
+
+dataset_cfg:
+  train: config/dataset/IRVisible/VTMOT/vtmot_5-frame.yaml
+  val:
+    - config/dataset/IRVisible/VTMOT/vtmot_5-frame-val.yaml
+
+augmentation:
+  lr_flip_p: 0.5
+  # Fixed deployment target: a single RTX A4000 with 16 GB VRAM.  Batch one
+  # keeps a margin for SEA-RAFT, DCN and the 9-frame trusted-memory window.
+  random_crop_hw: [288, 288]
+  synthetic_misalignment:
+    # VTMOT already supplies an augmentation-aware dense registration target.
+    # The dataset raises if this is non-zero while a GT is configured.
+    p: 0.0
+    max_translation: 32
+    max_rotation: 2.0
+    max_drift: 8
+
+# ============================================================
+# 模型：VF-Bench 预训练 SEA-RAFT 关键帧重估 → Farneback 输运 + 轻量残差
+#       → 可选 DCN 局部细化 → SSM 时序融合
+# ============================================================
+model:
+  dim: 48
+  num_blocks: 3
+  bias: false
+  downscale: 2
+  enc_blocks: 2
+  dec_blocks: 3
+  ssm_d_state: 6
+  registration:
+    enabled: true
+    channels: 16
+    # 关键帧由 SEA-RAFT 重估；非关键帧从受限的可信历史场读取。
+    wst: true
+    keyframe:
+      # Calibrated on 36 real VTMOT frames with tools/calibrate_keyframe.py.
+      # Observed per-frame distributions:
+      #   Farneback temporal fb   p50=0.81  p75=2.22  p90=3.03  p95=5.23  max=15.4
+      #   temporal confidence     p10=0.11  p50=0.49  p90=0.73
+      #   quality (lower better)  p50=0.67  p95=0.93
+      #   quality at GT flow      p50=0.73  vs model flow 0.67
+      #   fb_error (mixed)        p50=1.99  p90=45.7  <- DO NOT calibrate on this
+      # Three consequences:
+      #  1. confidence = exp(-SEA-RAFT_fb / fb_tau). With the old fb_tau=1.5 and
+      #     keyframe fb errors of tens of px this collapsed to ~0, so
+      #     `confidence < confidence_threshold` fired on EVERY frame and
+      #     keyframe_ratio was 1.0 (transport/memory bypassed). fb_tau must match
+      #     the SEA-RAFT error scale.
+      #  2. `emergency` compares fb_threshold against the *Farneback temporal*
+      #     error, not against fb_error. The output `fb_error` mixes the two
+      #     quantities (Farneback ~1 px vs SEA-RAFT ~20 px), so calibrating
+      #     fb_threshold on it silently disables the emergency branch. It is set
+      #     from the Farneback p90 instead.
+      #  3. quality is anti-correlated with correctness on cross-modal data (the
+      #     GT flow scores worse than an arbitrary flow), so quality_threshold is
+      #     placed above the observed range: the quality triggers stay quiet and
+      #     the interval schedule plus emergency do the work.
+      min_interval: 2
+      max_interval: 4            # <= window length: a 9-frame clip then contains
+                                 # keyframes at 0/4/8, giving the memory module
+                                 # real write -> verify -> admit/evict cycles.
+      quality_threshold: 0.96
+      quality_patience: 2
+      confidence_threshold: 0.08
+      fb_threshold: 3.0          # Farneback temporal fb p90
+      fb_tau: 20.0               # SEA-RAFT keyframe fb scale
+      gaussian_kernel: 5
+      gaussian_sigma: 0.8
+      # 三帧动态过渡；严重失配由 emergency 分支立即切换。
+      wst_alpha: [0.259, 0.741, 1.0]
+    alignment_threshold: 0.35
+    # 非关键帧：以 VIS 当前→上一帧与 IR 上一帧→当前帧组成双域输运，
+    # 再用 1/4 分辨率、局部相关半径 4 的轻量头校正 ±8 像素残差。
+    motion:
+      levels: 3              # OpenCV 不可用时的 LK 回退金字塔
+      window: 7
+      iterations: 2
+      max_flow: 32.0
+      # The transport *geometry* is NOT differentiable when OpenCV is used
+      # (cv2 Farneback on numpy), and roughly 1 - keyframe_ratio of frames take
+      # their flow from this path.  grad_through only affects the pure-torch
+      # Lucas-Kanade fallback used when OpenCV is missing; False keeps the
+      # behaviour identical to before.  Set true only as a deliberate ablation.
+      grad_through: false
+    # 可信运动记忆：只保留少量关键帧跨模态场；新场必须经过下一帧的
+    # 几何复核才会写入。可靠性由梯度方向一致性、候选分歧和记忆年龄共同决定。
+    memory:
+      enabled: true
+      capacity: 3
+      age_decay: 0.98
+      promotion_threshold: 0.55
+      channels: 16
+    # 全局相关粗配准（GLU-Net 的"全局阶段"，本 pipeline 此前缺失的一环）
+    # 低分辨率跨模态结构特征(梯度能量) → 1/16 网格上的 all-pairs 全局相关
+    # → 互匹配 + soft-argmax → 闭式加权最小二乘拟合 6 自由度仿射。
+    #
+    # 存在理由（实测，见 src/model/registration/sea_raft.py 末尾）：
+    #   同模态 visible_gt→visible_mis : SEA-RAFT EPE 0.045 px（几乎完美）
+    #   跨模态 infrared  →visible_mis : SEA-RAFT EPE 63.1 px vs 零流基线 11.6 px
+    #                                   = 5.4 倍，比"什么都不做"还差
+    # RAFT 家族只有 ±r 的局部相关查表、需要良好初值；全局匹配没有这个前提。
+    # 又因为 VTMOT 的真值是纯仿射（生成时 persp_amp=0.0），把上千个带噪匹配点
+    # 约化成 6 个数是"与问题匹配的模型复杂度"，也是能在几十步内收敛的关键。
+    global_align:
+      enabled: true
+      # true = 每帧都跑全局匹配，作为所有帧的粗场；输运/记忆/DCN 退化为残差
+      # 精化与可靠性校验。实测必需：只在关键帧跑时，WST 的 alpha[0]=0.259 只让
+      # 26% 的新估计进入，导致第 4 帧 ratio 0.91、第 6 帧 4.98，而帧 0 是 0.03。
+      # false = 旧的关键帧+输运模式（A/B 用）。成本可忽略：26K 参数 + 1/16 相关。
+      per_frame: true
+      # true = WST 在参数空间对 3x3 变换做时序平滑（而不是混合像素场）。
+      # 场空间混合在粗场准确后会退化（candidate == propagated，alpha 失去意义），
+      # 而 6 个数可以真正被平滑，且全局变换的时序平滑正是 ITF/T-SSIM 奖励的。
+      # 同时这会让可信记忆回到梯度路径上：它现在以可靠性加权的方式提供残差修正。
+      wst_in_matrix_space: true
+      mode: affine           # affine(6 DoF) | translation(2 DoF, 消融用)
+      channels: 32
+      temperature: 0.07      # 余弦相似度上的 softmax 温度（可学）
+      mutual: true           # 互匹配，抑制多义匹配
+      ridge: 1.0e-3          # 加权最小二乘的岭项，保证可解
+      learned_encoder: true  # false = 直接用梯度能量特征（纯几何基线）
+    raft:
+      # SEA-RAFT 降级为可选对照。设 true 可复现旧行为做 A/B：
+      # 零样本跨模态它比零流差 5.4 倍，可学残差预算(±8/±3 px)无法纠正 50–150 px 的粗场误差。
+      enabled: false
+      # VF-Bench 官方 SEA-RAFT-S；需先下载官方 checkpoint 到下面路径。
+      backend: sea_raft
+      config_path: config/module/spring-S.json
+      weights_path: checkpoint/Tartan-C-T-TSKH-spring540x960-S.pth
+      num_flow_updates: 4
+      trainable: true          # 在 VTMOT 的真值 flow 监督下继续微调
+      max_flow: null
+      allow_missing_weights: false
+      # SEA-RAFT is pretrained for MONO-modal optical flow and must adapt to the
+      # IR/VIS domain, while the lite/DCN heads start from scratch and are what
+      # a 1e-4 is sized for.  One shared lr made the backbone effectively frozen
+      # (initial held-out epe_ratio ~0.89, and training only degraded it), so the
+      # backbone gets its own group. lr_scale: 1.0 restores the old behaviour.
+      lr_scale: 5.0
+    lite_refinement:
+      channels: 16
+      radius: 4
+      max_residual: 8.0
+    local_refinement:        # DCN 局部精细配准：offsets 即显式残差 flow
+      enabled: true
+      channels: 16           # 全分辨率分支是主要显存开销，需要时可再调小
+      coarse_kernel: 3       # 1/4 分辨率：3x3 可变形核（可表达局部尺度/剪切）
+      fine_kernel: 1         # 全分辨率：1x1 可变形采样（纯亚像素位移，省显存）
+      max_flow: 3.0          # 1/4 分辨率级残差上限（像素）
+      fine_max_flow: 1.0     # 全分辨率级亚像素残差上限（像素）
+
+dataloader:
+  num_workers: 8
+  val_num_workers: 2
+  eval_batch_size: 1
+  # Fixed RTX A4000 (16 GB) setting: nine-frame samples with crop 288 and batch
+  # one. Eight accumulation steps give an effective batch size of eight.
+  effective_batch_size: 8
+  max_train_batch_size: 1
+  seed: 2025 # to ensure continuity when resuming from checkpoint
+
+lr: 1.0e-4
+lr_scheduler:
+  kwargs:
+    total_iter: 20000
+    final_ratio: 0.01
+    warmup_steps: 200
+
+max_epoch: 10000
+max_iter: 20000
+
+trainer:
+  init_seed: 2025 # use null to train w/o seeding
+  stages:
+    registration_steps: 3000 # 只训练关键帧 RAFT + 传播 + DCN 局部细化
+    fusion_steps: 12000      # 冻结全部对齐模块，以固定对齐结果训练融合
+                              # 剩余 5000 步同时更新，但两类损失梯度保持隔离
+  save_period: 500
+  backup_period: 2000
+  validation_period: 500
+  fused_optimizer: true
+  max_grad_norm: 1.0
+  # ---- hardware guard (a hard black-screen shutdown is not an exception) ----
+  # A sustained 100% GPU+CPU load trips laptop power/thermal protection; this
+  # machine already has unexpected-shutdown events (Kernel-Power 41) in its
+  # System log from before this project. The trainer polls nvidia-smi every
+  # gpu_temp_check_every steps, pauses above gpu_temp_limit, and stops (saving
+  # "latest") above gpu_temp_abort. A desktop will never reach 84 C, so the
+  # guard is inert there. Set gpu_temp_check_every: 0 to disable entirely.
+  gpu_temp_check_every: 50
+  gpu_temp_limit: 84.0      # pause and wait until it drops below gpu_temp_resume
+  gpu_temp_resume: 76.0
+  gpu_temp_abort: 90.0      # stop and checkpoint
+  # Idle seconds inserted after every optimiser step. The single cheapest way to
+  # keep a laptop out of its power limit: 0.25 cut the measured temperature from
+  # 64 C to 60 C and cost ~20% throughput. 0.0 on a desktop.
+  step_sleep: 0.0
+
+loss:
+  name: IRVisibleFusionLoss
+  kwargs:
+    coef: [1, 5, 4, 1]       # 强度、梯度、SSIM、融合时序
+    registration_coef:
+      # ZERO for supervised VTMOT training, and this is not a tuning choice.
+      # Measured on held-out windows, the cross-modal normalised-gradient loss is
+      #   identity (no warp)  0.9017
+      #   oracle (GT flow)    0.9059
+      # so the metric scores the CORRECT alignment WORSE than not moving at all:
+      # warping costs more gradient coherence through interpolation than the
+      # ~13 px misalignment it removes. With weight 1.0 this term (~0.81) actively
+      # pulled the flow toward zero and fought the GT supervision (~1.47); a
+      # 127-step run degraded the held-out epe_ratio from 0.887 to 0.983 and
+      # never beat step 0.
+      # RESTORE alignment: 1.0 for HDO runs, where there is no gt_flow and this
+      # is the only registration signal available.
+      alignment: 0.0
+      smooth: 0.05           # 局部形变场空间平滑
+      # NOTE (consequence of the total/local flow separation): this penalty now
+      # acts ONLY on the learned local residual (lite head + DCN delta), because
+      # `local_flows` no longer aliases the total field.  That is the intended
+      # semantics, but it means the COARSE field (transport / SEA-RAFT, observed
+      # up to ~30 px) is currently not spatially regularised at all.  Temporal
+      # smoothness still applies to the total field via `temporal` below.
+      temporal: 0.10         # 复合形变场二阶时序平滑
+      propagation: 0.01      # 非关键帧残差幅度约束
+      fb_consistency: 0.05   # 关键帧 RAFT 前后向一致性
+      memory_reliability: 0.02 # 记忆置信度与跨候选一致性校准
+      # VTMOT 的 gt_flow 稠密场监督；HDO 自动为零。
+      # It is now the dominant registration objective, by design: mixing it with
+      # an anti-correlated term was exactly the failure mode above.
+      flow_supervision: 0.25
+
+eval:
+  # 与 SmoothFusion/HDO 表 3 保持一致：
+  # NMI↑、Q_F^AB↑、R_edge↑、LNCC↑、ITF↓、T-SSIM↑。
+  # Metric_Qabf 对应 Q_F^AB；MSE/NCC 仅保留为可选辅助指标。
+  eval_metrics:
+    - Metric_NMI
+    - Metric_Qabf
+    - Metric_Redge
+    - Metric_LNCC
+    - Metric_ITF
+    - Metric_TSSIM

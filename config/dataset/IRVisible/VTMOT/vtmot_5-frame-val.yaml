@@ -1,0 +1,21 @@
+class_name: infrared_visible_dataset
+disp_name: VTMOT-IRVisible-Misaligned-val
+dir: VTMOT_misaligned
+csv_dir: data_split/IVF/VTMOT
+
+column_names:
+  train: [ir, rgb, rgb_gt]
+  eval: [ir, rgb, rgb_gt]
+  test: [ir, rgb, rgb_gt]
+
+registration_gt_dir: gt_h
+registration_gt_flow: true
+
+# 与训练保持同一视场归一化；stride 30 让验证跑得快一些。
+resize_hw: [480, 640]
+center_crop_to_aspect: true
+# Match the training memory horizon.
+num_frames: 9
+frame_gap_ls: [0]
+stride: 30
+frame_padding: false

@@ -3,7 +3,6 @@
 import logging
 import os
 import sys
-import wandb
 from tabulate import tabulate
 
 import tarfile
@@ -147,11 +146,29 @@ def create_code_snapshot(output_file: str, source_dir: str = ".") -> bool:
 
 # -------------- wandb tools --------------
 def init_wandb(enable: bool, **kwargs):
-    if enable:
-        run = wandb.init(sync_tensorboard=True, **kwargs)
-    else:
-        run = wandb.init(mode="disabled")
-    return run
+    """Start a wandb run, or do nothing at all when disabled.
+
+    Two separate problems are avoided here:
+
+    * ``enable=False`` must NOT call ``wandb.init(mode="disabled")``.  That still
+      initialises the library and, on Windows, leaves ``wandb-media`` /
+      ``wandb-artifacts`` temp directories behind with atexit handlers that fail
+      to clean up -- printing a PermissionError traceback at the end of every
+      ``--no_wandb`` run and drowning the real output.
+    * ``wandb`` is imported LAZILY.  Importing it alone is enough to register
+      those temp directories, so an eager top-level import reintroduced the same
+      noise even with ``--no_wandb``.  This also makes the trainer runnable on a
+      machine where wandb is not installed at all.
+    """
+    if not enable:
+        return None
+    try:
+        import wandb
+    except ImportError as exc:
+        raise ImportError(
+            "wandb is not installed but tracing was requested. Either install "
+            "wandb or pass --no_wandb.") from exc
+    return wandb.init(sync_tensorboard=True, **kwargs)
 
 
 def log_slurm_job_id(step):
