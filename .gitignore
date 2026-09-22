@@ -48,3 +48,23 @@ Video-Depth-Anything/
 .venv/
 /.venv/
 
+# locally unpacked python deps / cached wheels (see tools/fetch_torch_cuda.py)
+/.probe_deps/
+/.probe_wheels/
+/.probe_tmp/
+/.probe_cache/
+/.torch_deps/
+/.torch_wheels/
+/shortcuts/
+
+# registration experiment run outputs (checkpoints, metrics.jsonl, previews)
+/res_runs/
+/bench_out/
+res/**/bench_out/
+
+# machine-local Windows helper scripts: not part of the research project
+/upgrade_home_to_pro.ps1
+/upgrade_home_to_pro.bat
+/revert_to_oem_license.ps1
+/revert_to_oem_license.bat
+
