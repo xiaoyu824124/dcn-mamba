@@ -22,10 +22,23 @@ global_matcher:
   # 6-DoF [y,x,1] -> [y,x] field instead of fitting unconstrained dense flow.
   affine_projection: true
   affine_ridge: 1.0e-3
+  # Normalise both softmax directions, which suppresses "hub" keys that are
+  # similar to every query.  Measured on a 500-step full-FOV pilot from the
+  # same checkpoint: best relative EPE 1.1044 (no matching loss) -> 1.0150
+  # (matching loss) -> 0.9955 (matching loss + dual softmax), with train EPE
+  # 7.5 -> 5.6 -> 5.2.  No new parameters, so existing checkpoints still load.
+  dual_softmax: true
 
 loss:
   charbonnier_eps: 1.0e-3
+  # >0 turns the dual-softmax NLL into a focal variant; 0 is the plain NLL.
+  match_focal_gamma: 0.0
   weights:
+    # Dense flow error has a degenerate optimum (a constant field already
+    # reaches the mean-displacement error), so the dense term alone never asks
+    # the encoder to put mass on the correct key.  ``match`` supervises the
+    # correspondence distribution directly and is what makes the matcher learn.
+    match: 1.0
     flow: 1.0
     mind: 0.5
     edge: 0.25
@@ -35,7 +48,7 @@ loss:
     affine: 10.0
 
 # Real VTMOT fine-tuning runs only the standalone coarse registration branch.
-# RTX 3090 (24 GB): full 480x640 FOV and batch one.  This is the evaluation
+# RTX A4000 (16 GB): full 480x640 FOV and batch one.  This is the evaluation
 # FOV that matters; the older 160x160 3060 crop is only an initialisation run.
 vtmot_data:
   target_hw: [480, 640]

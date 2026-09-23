@@ -18,15 +18,17 @@ from torch.utils.data import DataLoader
 
 from .evaluate_vtmot import evaluate
 from .losses import RegistrationLoss
+from .matching import matching_diagnostics
 from .metrics import endpoint_error
 from .model_factory import build_global_registration
 from .vtmot import VTMOTSingleFrameDataset
 
 
 def _save(path: Path, step: int, model: torch.nn.Module,
-          optimizer: torch.optim.Optimizer, config) -> None:
+          optimizer: torch.optim.Optimizer, config, best_ratio: float) -> None:
     torch.save({"step": step, "model": model.state_dict(),
                 "optimizer": optimizer.state_dict(),
+                "best_ratio": best_ratio,
                 "config": OmegaConf.to_container(config, resolve=True)}, path)
 
 
@@ -40,9 +42,11 @@ def main() -> None:
     parser.add_argument("--steps", type=int, default=None)
     parser.add_argument("--device", choices=("cuda", "cpu"), default="cuda")
     parser.add_argument("--crop-hw", type=int, nargs=2, metavar=("HEIGHT", "WIDTH"), default=None,
-                        help="override the configured common crop; default is the 3090 full-frame setting")
+                        help="override the configured common crop; default is the A4000 full-frame setting")
     parser.add_argument("--batch-size", type=int, default=None,
                         help="override batch size; full-frame all-pairs matching normally uses 1")
+    parser.add_argument("--lr", type=float, default=None,
+                        help="override the configured learning rate")
     parser.add_argument("--num-workers", type=int, default=None,
                         help="override data-loader workers; use 0 for Windows debugging")
     parser.add_argument("--init", type=Path, default=None,
@@ -58,7 +62,9 @@ def main() -> None:
                 (train_config.pilot_steps if args.run == "pilot" else train_config.full_steps))
     if steps < 1:
         raise ValueError("steps must be positive")
-    device = torch.device(args.device if args.device != "cuda" or torch.cuda.is_available() else "cpu")
+    if args.device == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError("CUDA was requested but is unavailable; check the A4000 environment")
+    device = torch.device(args.device)
     random.seed(int(train_config.seed))
     torch.manual_seed(int(train_config.seed))
     if device.type == "cuda":
@@ -85,8 +91,12 @@ def main() -> None:
     eval_loader = DataLoader(eval_dataset, batch_size=int(train_config.eval_batch_size), shuffle=False,
                              num_workers=0, pin_memory=device.type == "cuda")
     model = build_global_registration(config).to(device)
-    loss_fn = RegistrationLoss(config.loss.weights, charbonnier_eps=float(config.loss.charbonnier_eps)).to(device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=float(train_config.lr),
+    loss_fn = RegistrationLoss(config.loss.weights,
+                               charbonnier_eps=float(config.loss.charbonnier_eps),
+                               match_focal_gamma=float(config.loss.get("match_focal_gamma", 0.0))
+                               ).to(device)
+    learning_rate = float(args.lr if args.lr is not None else train_config.lr)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate,
                                   weight_decay=float(train_config.weight_decay))
     amp = bool(train_config.amp and device.type == "cuda")
     scaler = torch.amp.GradScaler(device.type, enabled=amp)
@@ -98,14 +108,58 @@ def main() -> None:
         start_step = int(checkpoint["step"])
     elif args.init is not None:
         checkpoint = torch.load(args.init, map_location=device, weights_only=True)
-        model.load_state_dict(checkpoint["model"], strict=True)
+        # Warm start: architecture knobs (width, key scale, ...) may add or
+        # resize tensors, so keep every tensor whose shape still matches and
+        # report the rest instead of refusing to start.  ``--resume`` stays
+        # strict because it must match exactly.
+        current = model.state_dict()
+        compatible = {name: value for name, value in checkpoint["model"].items()
+                      if name in current and current[name].shape == value.shape}
+        skipped = sorted(name for name in checkpoint["model"] if name not in compatible)
+        report = model.load_state_dict(compatible, strict=False)
+        fresh = sorted(report.missing_keys) + sorted(report.unexpected_keys)
+        if skipped or fresh:
+            print(f"init: warm start from {args.init} | kept={len(compatible)} "
+                  f"skipped={len(skipped)} fresh={len(fresh)}")
+            for name in skipped[:8]:
+                print(f"  skipped {name}")
+            for name in fresh[:8]:
+                print(f"  fresh   {name}")
 
     output_dir = Path(args.output_dir)
+    if args.resume is not None and output_dir.resolve() != args.resume.parent.resolve():
+        raise ValueError("--resume requires --output-dir to be the checkpoint directory; "
+                         "use --init for a new run")
+    if args.resume is None and any((output_dir / name).exists()
+                                   for name in ("metrics.jsonl", "best.pt", "last.pt")):
+        raise ValueError(f"output directory already contains a run: {output_dir}; "
+                         "choose a new directory or use --resume")
     output_dir.mkdir(parents=True, exist_ok=True)
     OmegaConf.save(config, output_dir / "config.yaml")
     metrics_file = output_dir / "metrics.jsonl"
-    print(f"device={device} run={args.run} steps={steps} train={len(train_dataset)} eval={len(eval_dataset)} crop={crop_hw} batch={batch_size} workers={num_workers}")
-    iterator, best_ratio = iter(train_loader), float("inf")
+    device_name = torch.cuda.get_device_name(device) if device.type == "cuda" else "CPU"
+    print(f"device={device} ({device_name}) run={args.run} steps={steps} train={len(train_dataset)} "
+          f"eval={len(eval_dataset)} crop={crop_hw} batch={batch_size} workers={num_workers} "
+          f"lr={learning_rate:g}")
+    best_ratio = float("inf")
+    if args.resume is not None:
+        best_ratio = float(checkpoint.get("best_ratio", float("inf")))
+        # Old checkpoints lack best_ratio.  Recover it from the existing log so
+        # a worse first validation after resume cannot replace best.pt.
+        history_path = args.resume.parent / "metrics.jsonl"
+        if best_ratio == float("inf") and history_path.is_file():
+            for line in history_path.read_text(encoding="utf-8").splitlines():
+                try:
+                    previous = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if (int(previous.get("step", 0)) <= start_step
+                        and "val_relative_epe" in previous):
+                    best_ratio = min(best_ratio, float(previous["val_relative_epe"]))
+        if best_ratio == float("inf"):
+            best_ratio = float(evaluate(model, eval_loader, device)["relative_epe"])
+        print(f"resume: step={start_step} prior best relative EPE={best_ratio:.4f}")
+    iterator = iter(train_loader)
     model.train()
     for step in range(start_step + 1, steps + 1):
         try:
@@ -121,7 +175,8 @@ def main() -> None:
             output = model(ir, vi)
             losses = loss_fn(aligned_ir=output.coarse_aligned_ir, visible=vi,
                              coarse_flow=output.coarse_flow, gt_flow=target, valid_mask=valid,
-                             predicted_affine_yx=output.affine_yx, gt_h=gt_h)
+                             predicted_affine_yx=output.affine_yx, gt_h=gt_h,
+                             match=output.match)
         scaler.scale(losses.total).backward()
         scaler.unscale_(optimizer)
         torch.nn.utils.clip_grad_norm_(model.parameters(), float(train_config.grad_clip_norm))
@@ -131,22 +186,36 @@ def main() -> None:
             train_epe = endpoint_error(output.coarse_flow, target, valid)
         record = {"step": step, "train_loss": float(losses.total.detach()),
                   "train_epe": float(train_epe), "flow": float(losses.flow.detach()),
+                  "match": float(losses.match.detach()),
+                  "temperature": float(model.matcher.temperature.detach()),
+                  "peak_mem_mib": (torch.cuda.max_memory_allocated() / 2 ** 20
+                                   if device.type == "cuda" else 0.0),
                   "affine": float(losses.affine.detach())}
         if step == 1 or step % int(train_config.log_every) == 0:
-            print("step={step:5d} loss={train_loss:.5f} train_epe={train_epe:.3f} affine={affine:.4f}".format(**record))
+            print("step={step:5d} loss={train_loss:.5f} train_epe={train_epe:.3f} "
+                  "match={match:.4f} affine={affine:.4f}".format(**record))
+            # Localisation view of the same batch: does the correct key rank first?
+            record.update(matching_diagnostics(output.match.matching_probability,
+                                               tuple(output.match.coarse_flow.shape[-2:]),
+                                               target, valid))
         if step % int(train_config.validation_every) == 0 or step == steps:
             validation = evaluate(model, eval_loader, device)
             record.update({f"val_{name}": value for name, value in validation.items()})
             print("  eval epe={epe_px:.3f} zero={zero_flow_epe_px:.3f} ratio={relative_epe:.3f} "
-                  "corners={affine_corner_epe_px:.2f}px cycle={affine_gt_inverse_cycle_px:.2f}px".format(**validation))
+                  "gt_rank_frac={match_frac_keys_beating_gt:.3f} "
+                  "argmax_epe={match_epe_argmax_px:.1f}px".format(**validation))
             if validation["relative_epe"] < best_ratio:
                 best_ratio = validation["relative_epe"]
-                _save(output_dir / "best.pt", step, model, optimizer, config)
+                _save(output_dir / "best.pt", step, model, optimizer, config,
+                      best_ratio)
             model.train()
         with metrics_file.open("a", encoding="utf-8") as file:
             file.write(json.dumps(record) + "\n")
         if step % int(train_config.checkpoint_every) == 0 or step == steps:
-            _save(output_dir / "last.pt", step, model, optimizer, config)
+            _save(output_dir / "last.pt", step, model, optimizer, config,
+                  best_ratio)
+        if device.type == "cuda":
+            torch.cuda.reset_peak_memory_stats()
     print(f"completed: best relative EPE={best_ratio:.4f}; output={output_dir.resolve()}")
 
 

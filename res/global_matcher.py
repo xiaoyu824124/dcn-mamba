@@ -62,7 +62,8 @@ class GlobalMatcher(nn.Module):
                  learnable_temperature: bool = False,
                  return_correlation: bool = True,
                  max_tokens: int = 0, affine_projection: bool = True,
-                 affine_ridge: float = 1e-3) -> None:
+                 affine_ridge: float = 1e-3, dual_softmax: bool = False,
+                 key_log_scale: bool = False) -> None:
         super().__init__()
         if temperature <= 0:
             raise ValueError("temperature must be positive")
@@ -75,6 +76,13 @@ class GlobalMatcher(nn.Module):
         self.max_tokens = int(max_tokens)
         self.affine_projection = bool(affine_projection)
         self.affine_ridge = float(affine_ridge)
+        self.dual_softmax = bool(dual_softmax)
+        # LoFTR-style per-key learnable scale.  Only created when requested, so
+        # disabling it leaves the state dict (and older checkpoints) unchanged;
+        # warm-starting from such a checkpoint leaves exp(0)=1, i.e. neutral.
+        self.key_log_scale = bool(key_log_scale)
+        if self.key_log_scale:
+            self.log_scale = nn.Parameter(torch.zeros(()))
         log_temperature = torch.tensor(float(temperature)).log()
         if self.learnable_temperature:
             self.log_temperature = nn.Parameter(log_temperature)
@@ -113,8 +121,19 @@ class GlobalMatcher(nn.Module):
         query_vi = F.normalize(feature_vi.float().flatten(2).transpose(1, 2),
                                p=2, dim=-1)
         key_ir = F.normalize(feature_ir.float().flatten(2), p=2, dim=1)
+        if self.key_log_scale:
+            key_ir = key_ir * self.log_scale.exp()
         correlation = torch.bmm(query_vi, key_ir)  # [B, N_vi, N_ir]
-        probability = torch.softmax(correlation / self.temperature.float(), dim=-1)
+        scaled = correlation / self.temperature.float()
+        if self.dual_softmax:
+            # Normalising both directions suppresses "hub" keys that are similar
+            # to every query -- the dominant failure mode of a single softmax
+            # over thousands of cross-modal keys.  Renormalising rows keeps the
+            # soft-argmax expectation a convex combination.
+            probability = torch.softmax(scaled, dim=-1) * torch.softmax(scaled, dim=-2)
+            probability = probability / probability.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+        else:
+            probability = torch.softmax(scaled, dim=-1)
 
         coordinates = self._coordinates(height, width, feature_ir)
         # q_hat(p) = sum_q P(p,q) q.  This soft-argmax is differentiable.

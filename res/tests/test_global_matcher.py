@@ -60,6 +60,27 @@ class GlobalMatcherTest(unittest.TestCase):
         self.assertTrue(torch.isfinite(ir.grad).all())
         self.assertTrue(torch.isfinite(vi.grad).all())
 
+    def test_dual_softmax_keeps_rows_normalised_and_gradients_finite(self):
+        ir = torch.randn(2, 12, 8, 10, requires_grad=True)
+        vi = torch.randn(2, 12, 8, 10, requires_grad=True)
+        output = GlobalMatcher(temperature=0.1, dual_softmax=True)(ir, vi)
+        self.assertTrue(torch.allclose(
+            output.matching_probability.sum(dim=-1), torch.ones(2, 80), atol=2e-5))
+        output.coarse_flow.square().mean().backward()
+        self.assertTrue(torch.isfinite(ir.grad).all())
+        self.assertTrue(torch.isfinite(vi.grad).all())
+
+    def test_key_log_scale_is_neutral_at_zero_and_learnable(self):
+        ir = torch.randn(1, 12, 8, 10)
+        vi = torch.randn(1, 12, 8, 10)
+        plain = GlobalMatcher(temperature=0.1)
+        scaled = GlobalMatcher(temperature=0.1, key_log_scale=True)
+        self.assertNotIn("log_scale", dict(plain.named_parameters()))
+        self.assertIn("log_scale", dict(scaled.named_parameters()))
+        # exp(0) = 1, so a fresh key scale must reproduce the plain matcher.
+        self.assertTrue(torch.allclose(plain(ir, vi).matching_probability,
+                                       scaled(ir, vi).matching_probability, atol=1e-6))
+
     def test_token_guard(self):
         matcher = GlobalMatcher(max_tokens=15)
         with self.assertRaisesRegex(ValueError, "max_tokens"):

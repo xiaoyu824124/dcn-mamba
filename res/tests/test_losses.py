@@ -13,7 +13,7 @@ from res.losses import RegistrationLoss
 
 class RegistrationLossTest(unittest.TestCase):
     def setUp(self):
-        self.loss = RegistrationLoss({"flow": 1.0, "mind": 0.5,
+        self.loss = RegistrationLoss({"flow": 1.0, "match": 1.0, "mind": 0.5,
                                       "edge": 0.25, "smooth": 0.05, "affine": 1.0})
 
     def test_all_terms_are_finite_and_differentiable(self):
@@ -42,7 +42,13 @@ class RegistrationLossTest(unittest.TestCase):
                            visible=torch.rand(1, 3, 24, 24),
                            coarse_flow=torch.zeros(1, 2, 24, 24))
         self.assertEqual(float(output.flow), 0.0)
+        self.assertEqual(float(output.match), 0.0)
         self.assertGreater(float(output.mind + output.edge), 0.0)
+
+    def test_missing_match_weight_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "match"):
+            RegistrationLoss({"flow": 1.0, "mind": 0.5, "edge": 0.25,
+                              "smooth": 0.05, "affine": 1.0})
 
     def test_affine_gt_has_small_loss_for_matching_parameters(self):
         height, width = 32, 40

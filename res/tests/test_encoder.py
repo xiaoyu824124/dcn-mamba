@@ -39,6 +39,19 @@ class MINDFeatureEncoderTest(unittest.TestCase):
         parameter_ids = {id(parameter) for parameter in self.encoder.parameters()}
         self.assertEqual(len(parameter_ids), len(list(self.encoder.parameters())))
 
+    def test_disabling_normalisation_keeps_feature_magnitude(self):
+        descriptor = torch.rand(1, 8, 32, 40)
+        encoder = MINDFeatureEncoder(in_channels=8, base_channels=8, out_channels=12,
+                                     blocks_per_scale=1, normalise=False)
+        raw = encoder(descriptor)["1/8"]
+        norms = raw.flatten(2).norm(dim=1)
+        self.assertTrue(torch.isfinite(norms).all())
+        self.assertGreater(float(norms.std()), 1e-3)
+        normalised = MINDFeatureEncoder(in_channels=8, base_channels=8, out_channels=12,
+                                        blocks_per_scale=1)(descriptor)["1/8"]
+        self.assertTrue(torch.allclose(normalised.norm(dim=1),
+                                       torch.ones_like(normalised[:, 0]), atol=2e-5))
+
     def test_invalid_spatial_size_is_rejected(self):
         with self.assertRaisesRegex(ValueError, "divisible by 8"):
             self.encoder(torch.rand(1, 8, 63, 64))

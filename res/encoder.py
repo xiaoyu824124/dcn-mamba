@@ -76,7 +76,7 @@ class MINDFeatureEncoder(nn.Module):
 
     def __init__(self, in_channels: int = 8, base_channels: int = 24,
                  out_channels: int = 64, blocks_per_scale: int = 2,
-                 eps: float = 1e-6):
+                 eps: float = 1e-6, normalise: bool = True):
         super().__init__()
         if in_channels < 1 or base_channels < 1 or out_channels < 1:
             raise ValueError("channel counts must be positive")
@@ -86,6 +86,12 @@ class MINDFeatureEncoder(nn.Module):
         self.base_channels = int(base_channels)
         self.out_channels = int(out_channels)
         self.eps = float(eps)
+        # L2-normalising every scale discards feature magnitude and pushes all
+        # spatial positions into one narrow cone (measured mean pairwise cosine
+        # 0.78 at 1/8), which caps how well a cosine matcher can separate keys.
+        # Disabling it lets magnitude travel through the hierarchy; the matcher
+        # still normalises before correlating.
+        self.normalise = bool(normalise)
 
         channels_4 = base_channels * 2
         self.stage_2 = self._stage(in_channels, base_channels, blocks_per_scale)
@@ -100,6 +106,8 @@ class MINDFeatureEncoder(nn.Module):
         return nn.Sequential(*layers)
 
     def _normalise(self, feature: torch.Tensor) -> torch.Tensor:
+        if not self.normalise:
+            return feature
         return F.normalize(feature, p=2, dim=1, eps=self.eps)
 
     def forward(self, descriptor: torch.Tensor) -> Dict[str, torch.Tensor]:

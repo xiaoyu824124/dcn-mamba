@@ -7,6 +7,8 @@ before it is connected to video fusion.
 
 from .encoder import MINDFeatureEncoder
 from .global_matcher import GlobalMatcher
+from .matching import (coarse_matching_loss, matching_diagnostics,
+                       windowed_diagnostics)
 from .mind import MINDDescriptor, rgb_to_gray
 from .losses import RegistrationLoss
 from .metrics import endpoint_error
@@ -16,4 +18,6 @@ from .warp import resize_flow, warp
 
 __all__ = ["MINDDescriptor", "MINDFeatureEncoder", "GlobalMatcher", "warp",
            "resize_flow", "MINDGlobalRegistration", "RegistrationLoss",
-           "VTMOTSingleFrameDataset", "endpoint_error", "rgb_to_gray"]
+           "VTMOTSingleFrameDataset", "endpoint_error", "rgb_to_gray",
+           "coarse_matching_loss", "matching_diagnostics",
+           "windowed_diagnostics"]

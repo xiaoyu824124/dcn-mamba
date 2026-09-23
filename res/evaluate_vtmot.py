@@ -14,6 +14,7 @@ from torch.utils.data import DataLoader
 from .metrics import endpoint_error
 from .model_factory import build_global_registration
 from .affine import affine_corner_errors
+from .matching import matching_diagnostics, windowed_diagnostics
 from .vtmot import VTMOTSingleFrameDataset
 from .warp import warp
 
@@ -49,6 +50,7 @@ def evaluate(model: torch.nn.Module, loader: DataLoader, device: torch.device) -
     total_epe = total_baseline = total_valid = total_samples = 0.0
     total_corner_epe = total_cycle_epe = 0.0
     hit_sums = {f"pck_{threshold}px": 0.0 for threshold in (1, 3, 5)}
+    diagnostic_sums: Dict[str, float] = {}
     model.eval()
     for batch in loader:
         ir, vi = batch["ir"].to(device), batch["vi"].to(device)
@@ -67,6 +69,17 @@ def evaluate(model: torch.nn.Module, loader: DataLoader, device: torch.device) -
         total_corner_epe += float(corner_epe.sum())
         total_cycle_epe += float(cycle_epe.sum())
         total_samples += float(predicted.shape[0])
+        if output.match is not None:
+            diagnostics = matching_diagnostics(
+                output.match.matching_probability,
+                tuple(output.match.coarse_flow.shape[-2:]), target, valid)
+            for radius in (2, 4):
+                diagnostics.update(windowed_diagnostics(
+                    output.match.matching_probability,
+                    tuple(output.match.coarse_flow.shape[-2:]),
+                    output.match.coarse_flow, target, valid, radius=radius))
+            for name, value in diagnostics.items():
+                diagnostic_sums[name] = diagnostic_sums.get(name, 0.0) + value * float(predicted.shape[0])
         hits = _threshold_hits(predicted, target, valid)
         for name, value in hits.items():
             hit_sums[name] += value * count
@@ -76,6 +89,9 @@ def evaluate(model: torch.nn.Module, loader: DataLoader, device: torch.device) -
     report["relative_epe"] = report["epe_px"] / max(report["zero_flow_epe_px"], 1e-8)
     report["affine_corner_epe_px"] = total_corner_epe / max(total_samples, 1.0)
     report["affine_gt_inverse_cycle_px"] = total_cycle_epe / max(total_samples, 1.0)
+    if diagnostic_sums:
+        report.update({name: value / max(total_samples, 1.0)
+                       for name, value in diagnostic_sums.items()})
     report.update({name: value / max(total_valid, 1.0) for name, value in hit_sums.items()})
     return report
 
@@ -121,9 +137,20 @@ def main() -> None:
         model.load_state_dict(checkpoint["model"], strict=True)
         report = evaluate(model, loader, device)
         report["field_of_view_hw"] = list(fov)
+        # Beating zero flow only means "not worse than doing nothing".  A field
+        # this coarse still ghosts under fusion, so report readiness explicitly
+        # instead of letting a ratio just below 1 look like success.
+        report["beats_zero_flow"] = bool(report["relative_epe"] < 1.0)
+        report["fusion_ready"] = bool(report["epe_px"] <= 2.0 and report["pck_3px"] >= 0.90)
         print(json.dumps(report, indent=2))
-        print("PASS: relative_epe < 1 means the model beats zero flow." if report["relative_epe"] < 1
-              else "NOT READY: relative_epe >= 1, so do not connect this model to fusion.")
+        if report["fusion_ready"]:
+            print("FUSION READY: sub-2px EPE and at least 90% of pixels within 3px.")
+        elif report["beats_zero_flow"]:
+            print(f"COARSE ONLY: beats zero flow (ratio={report['relative_epe']:.3f}) but "
+                  f"EPE={report['epe_px']:.2f}px and pck@3px={report['pck_3px']:.3f}. "
+                  "Usable as a coarse prior for a fine stage, not as the final field.")
+        else:
+            print("NOT READY: relative_epe >= 1, so do not connect this model to fusion.")
     if args.output is not None:
         args.output.parent.mkdir(parents=True, exist_ok=True)
         args.output.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")

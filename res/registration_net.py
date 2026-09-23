@@ -17,12 +17,16 @@ class CoarseRegistrationOutput:
     """Intermediate outputs of the MIND/global-matching registration chain.
 
     ``coarse_flow`` is the image-grid `[dy,dx]` displacement used to warp IR.
+    ``match`` exposes the raw matcher output so callers can supervise the
+    correspondence distribution (see :mod:`res.matching`) without recomputing
+    the ``N x N`` correlation.
     """
 
     coarse_aligned_ir: torch.Tensor
     coarse_flow: torch.Tensor
     confidence_1_8: torch.Tensor
     affine_yx: torch.Tensor
+    match: GlobalMatchOutput | None = None
 
 
 class MINDGlobalRegistration(nn.Module):
@@ -84,4 +88,5 @@ class MINDGlobalRegistration(nn.Module):
             coarse_flow=coarse_flow,
             confidence_1_8=match.confidence,
             affine_yx=match.affine_yx,
+            match=match,
         )
