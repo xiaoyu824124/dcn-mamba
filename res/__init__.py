@@ -6,6 +6,7 @@ before it is connected to video fusion.
 """
 
 from .encoder import MINDFeatureEncoder
+from .coarse_transformer import CoarseSACATransformer
 from .global_matcher import GlobalMatcher
 from .local_matcher import LocalMatcher
 from .matching import (coarse_matching_loss, matching_diagnostics,
@@ -17,7 +18,8 @@ from .registration_net import MINDGlobalRegistration
 from .vtmot import VTMOTSingleFrameDataset
 from .warp import resize_flow, warp
 
-__all__ = ["MINDDescriptor", "MINDFeatureEncoder", "GlobalMatcher", "LocalMatcher", "warp",
+__all__ = ["MINDDescriptor", "MINDFeatureEncoder", "GlobalMatcher", "LocalMatcher",
+           "CoarseSACATransformer", "warp",
            "resize_flow", "MINDGlobalRegistration", "RegistrationLoss",
            "VTMOTSingleFrameDataset", "endpoint_error", "rgb_to_gray",
            "coarse_matching_loss", "matching_diagnostics",

@@ -33,6 +33,8 @@ def _save(path: Path, step: int, model: torch.nn.Module,
 def main() -> None:
     parser = argparse.ArgumentParser(description="Real VTMOT single-frame coarse-to-fine registration")
     parser.add_argument("--config", default="res/configs/registration.yaml")
+    parser.add_argument("--overlay", type=Path, action="append", default=[],
+                        help="optional YAML overlay; repeat to add stage-specific settings")
     parser.add_argument("--data-root", default="data/VTMOT_misaligned")
     parser.add_argument("--split-file", default="data_split/IVF/VTMOT/split.json")
     parser.add_argument("--output-dir", default="res_runs/vtmot_global")
@@ -54,7 +56,8 @@ def main() -> None:
     args = parser.parse_args()
     if args.init is not None and args.resume is not None:
         raise ValueError("choose at most one of --init and --resume")
-    config = OmegaConf.load(args.config)
+    config = OmegaConf.merge(OmegaConf.load(args.config),
+                             *(OmegaConf.load(path) for path in args.overlay))
     data_config, train_config = config.vtmot_data, config.vtmot_train
     steps = int(args.steps if args.steps is not None else
                 (train_config.pilot_steps if args.run == "pilot" else train_config.full_steps))

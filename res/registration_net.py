@@ -8,6 +8,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .encoder import MINDFeatureEncoder
+from .coarse_transformer import CoarseSACATransformer
 from .global_matcher import GlobalMatchOutput, GlobalMatcher
 from .local_matcher import LocalMatchOutput, LocalMatcher
 from .mind import MINDDescriptor, paired_mind
@@ -49,13 +50,15 @@ class MINDGlobalRegistration(nn.Module):
     def __init__(self, mind: MINDDescriptor | None = None,
                  encoder: MINDFeatureEncoder | None = None,
                  matcher: GlobalMatcher | None = None,
-                 local_matcher: LocalMatcher | None = None) -> None:
+                 local_matcher: LocalMatcher | None = None,
+                 coarse_transformer: CoarseSACATransformer | None = None) -> None:
         super().__init__()
         self.mind = mind if mind is not None else MINDDescriptor()
         self.encoder = (encoder if encoder is not None else
                         MINDFeatureEncoder(in_channels=self.mind.channels))
         self.matcher = matcher if matcher is not None else GlobalMatcher()
         self.local_matcher = local_matcher
+        self.coarse_transformer = coarse_transformer
         if self.encoder.in_channels != self.mind.channels:
             raise ValueError(
                 "encoder input channels must equal MIND channels: "
@@ -79,6 +82,8 @@ class MINDGlobalRegistration(nn.Module):
         mind_ir, mind_vi = paired_mind(ir, vi, self.mind)
         features_ir, features_vi = self.encoder.encode_pair(mind_ir, mind_vi)
         coarse_ir, coarse_vi = features_ir["1/8"], features_vi["1/8"]
+        if self.coarse_transformer is not None:
+            coarse_ir, coarse_vi = self.coarse_transformer(coarse_ir, coarse_vi)
         match: GlobalMatchOutput = self.matcher(coarse_ir, coarse_vi)
 
         height, width = ir.shape[-2:]

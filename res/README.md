@@ -1,5 +1,32 @@
 # IR–VI 单帧配准：先粗后细
 
+## CRFT 分步改造：阶段 1
+
+已加入可选的 1/8 线性 SA-CA，插在 Encoder 与 GlobalMatcher 之间。
+它沿用 CRFT 的 self/cross 顺序及 ELU+1 线性注意力思路；残差增益从零开始，
+因此旧粗场权重加载后，改造前后的首个预测相同。此阶段保留本项目的
+dual-softmax、软 argmax 和 6-DoF WLS；独立配置关闭 1/4 局部头，避免
+两个结构同时变化。参考 [CRFT 论文](https://arxiv.org/html/2604.05689v1)
+及[官方实现](https://github.com/NEU-Liuxuecong/CRFT)。
+
+在 A4000 上先运行阶段 1：
+
+```powershell
+python -B -m res.train_vtmot --device cuda --steps 1 --num-workers 0 --overlay res/configs/stage1_saca.yaml --init res_runs/vtmot_affine_stable_3060/best.pt --output-dir res_runs/saca_smoke
+python -B -m res.train_vtmot --device cuda --run pilot --num-workers 0 --overlay res/configs/stage1_saca.yaml --init res_runs/vtmot_affine_stable_3060/best.pt --output-dir res_runs/saca_pilot
+python -B -m res.evaluate_vtmot --device cuda --split eval --frame-stride 10 --checkpoint res_runs/saca_pilot/best.pt --output res_runs/saca_pilot/eval_stride10.json
+```
+
+如服务器没有旧权重，先单独传输该文件；仅拉取 Git 代码不会同步 `res_runs/`。
+请保留 `metrics.jsonl`、`eval_stride10.json`、一步试跑的显存峰值，以及
+相同 eval 划分上旧模型的报告。先比较 `coarse_epe_px`、
+`match_frac_keys_beating_gt`、`match_epe_argmax_px` 和峰值显存；若注意力
+改善匹配但 WLS 粗场仍不改善，再检查置信度权重和仿射拟合。
+
+后续阶段依次为：1/4 的粗场中心局部窗口与轻量 FSFT、1/2 小范围残差修正，
+最后才评估 DCN 亚像素修正。CRFT 的 `fine_process` 使用窗口展开后的注意力，
+在 480×640 上需改为逐窗口或分块计算；不能直接复制全序列实现。
+
 当前 `res` 分支实现如下：
 
 ```text

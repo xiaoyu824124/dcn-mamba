@@ -1,0 +1,13 @@
+# First ablation: add CRFT-style 1/8 linear SA-CA while isolating coarse matching.
+coarse_transformer:
+  enabled: true
+  num_layers: 2
+  num_heads: 4
+  ffn_ratio: 2
+
+local_matcher:
+  enabled: false
+
+loss:
+  weights:
+    local: 0.0
