@@ -15,6 +15,7 @@ from .metrics import endpoint_error
 from .model_factory import build_global_registration
 from .affine import affine_corner_errors
 from .matching import matching_diagnostics, windowed_diagnostics
+from .local_matcher import local_matching_diagnostics
 from .vtmot import VTMOTSingleFrameDataset
 from .warp import warp
 
@@ -47,7 +48,7 @@ def check_gt_direction(loader: DataLoader, device: torch.device, preview_dir: Pa
 
 @torch.no_grad()
 def evaluate(model: torch.nn.Module, loader: DataLoader, device: torch.device) -> Dict[str, float]:
-    total_epe = total_baseline = total_valid = total_samples = 0.0
+    total_epe = total_coarse_epe = total_baseline = total_valid = total_samples = 0.0
     total_corner_epe = total_cycle_epe = 0.0
     hit_sums = {f"pck_{threshold}px": 0.0 for threshold in (1, 3, 5)}
     diagnostic_sums: Dict[str, float] = {}
@@ -56,11 +57,13 @@ def evaluate(model: torch.nn.Module, loader: DataLoader, device: torch.device) -
         ir, vi = batch["ir"].to(device), batch["vi"].to(device)
         target, valid = batch["gt_flow"].to(device), batch["valid_mask"].to(device)
         output = model(ir, vi)
-        predicted = output.coarse_flow
+        predicted = output.final_flow if output.final_flow is not None else output.coarse_flow
         epe = endpoint_error(predicted, target, valid)
+        coarse_epe = endpoint_error(output.coarse_flow, target, valid)
         baseline = endpoint_error(torch.zeros_like(target), target, valid)
         count = float(valid.sum())
         total_epe += float(epe) * count
+        total_coarse_epe += float(coarse_epe) * count
         total_baseline += float(baseline) * count
         total_valid += count
         corner_epe, cycle_epe = affine_corner_errors(
@@ -80,10 +83,14 @@ def evaluate(model: torch.nn.Module, loader: DataLoader, device: torch.device) -
                     output.match.coarse_flow, target, valid, radius=radius))
             for name, value in diagnostics.items():
                 diagnostic_sums[name] = diagnostic_sums.get(name, 0.0) + value * float(predicted.shape[0])
+        if output.local_match is not None:
+            for name, value in local_matching_diagnostics(output.local_match, target, valid).items():
+                diagnostic_sums[name] = diagnostic_sums.get(name, 0.0) + value * float(predicted.shape[0])
         hits = _threshold_hits(predicted, target, valid)
         for name, value in hits.items():
             hit_sums[name] += value * count
     report = {"epe_px": total_epe / max(total_valid, 1.0),
+              "coarse_epe_px": total_coarse_epe / max(total_valid, 1.0),
               "zero_flow_epe_px": total_baseline / max(total_valid, 1.0),
               "valid_pixels": total_valid}
     report["relative_epe"] = report["epe_px"] / max(report["zero_flow_epe_px"], 1e-8)
@@ -146,9 +153,9 @@ def main() -> None:
         if report["fusion_ready"]:
             print("FUSION READY: sub-2px EPE and at least 90% of pixels within 3px.")
         elif report["beats_zero_flow"]:
-            print(f"COARSE ONLY: beats zero flow (ratio={report['relative_epe']:.3f}) but "
+            print(f"NEEDS REFINEMENT: beats zero flow (ratio={report['relative_epe']:.3f}) but "
                   f"EPE={report['epe_px']:.2f}px and pck@3px={report['pck_3px']:.3f}. "
-                  "Usable as a coarse prior for a fine stage, not as the final field.")
+                  "Continue single-frame training before connecting to fusion.")
         else:
             print("NOT READY: relative_epe >= 1, so do not connect this model to fusion.")
     if args.output is not None:

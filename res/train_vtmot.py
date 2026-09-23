@@ -1,8 +1,6 @@
-"""Fine-tune the standalone coarse registration model on real VTMOT frames.
+"""Fine-tune single-frame coarse-to-fine registration on real VTMOT frames.
 
-This is intentionally separate from ``train.py``: it trains only MIND, the
-shared feature encoder and the global matcher, with VTMOT dense GT flow.  It
-does not load the fusion model, RAFT, temporal memory or DCN reconstruction.
+This is separate from ``train.py`` and does not load the fusion model.
 """
 
 from __future__ import annotations
@@ -33,7 +31,7 @@ def _save(path: Path, step: int, model: torch.nn.Module,
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Real VTMOT single-frame global-registration fine-tuning")
+    parser = argparse.ArgumentParser(description="Real VTMOT single-frame coarse-to-fine registration")
     parser.add_argument("--config", default="res/configs/registration.yaml")
     parser.add_argument("--data-root", default="data/VTMOT_misaligned")
     parser.add_argument("--split-file", default="data_split/IVF/VTMOT/split.json")
@@ -173,27 +171,31 @@ def main() -> None:
         optimizer.zero_grad(set_to_none=True)
         with torch.autocast(device_type=device.type, enabled=amp):
             output = model(ir, vi)
-            losses = loss_fn(aligned_ir=output.coarse_aligned_ir, visible=vi,
-                             coarse_flow=output.coarse_flow, gt_flow=target, valid_mask=valid,
+            losses = loss_fn(aligned_ir=(output.final_aligned_ir if output.final_aligned_ir is not None
+                                         else output.coarse_aligned_ir), visible=vi,
+                             coarse_flow=output.coarse_flow, final_flow=output.final_flow,
+                             gt_flow=target, valid_mask=valid,
                              predicted_affine_yx=output.affine_yx, gt_h=gt_h,
-                             match=output.match)
+                             match=output.match, local_match=output.local_match)
         scaler.scale(losses.total).backward()
         scaler.unscale_(optimizer)
         torch.nn.utils.clip_grad_norm_(model.parameters(), float(train_config.grad_clip_norm))
         scaler.step(optimizer)
         scaler.update()
         with torch.no_grad():
-            train_epe = endpoint_error(output.coarse_flow, target, valid)
+            train_epe = endpoint_error(output.final_flow if output.final_flow is not None
+                                       else output.coarse_flow, target, valid)
         record = {"step": step, "train_loss": float(losses.total.detach()),
                   "train_epe": float(train_epe), "flow": float(losses.flow.detach()),
                   "match": float(losses.match.detach()),
+                  "local": float(losses.local.detach()),
                   "temperature": float(model.matcher.temperature.detach()),
                   "peak_mem_mib": (torch.cuda.max_memory_allocated() / 2 ** 20
                                    if device.type == "cuda" else 0.0),
                   "affine": float(losses.affine.detach())}
         if step == 1 or step % int(train_config.log_every) == 0:
             print("step={step:5d} loss={train_loss:.5f} train_epe={train_epe:.3f} "
-                  "match={match:.4f} affine={affine:.4f}".format(**record))
+                  "match={match:.4f} local={local:.4f} affine={affine:.4f}".format(**record))
             # Localisation view of the same batch: does the correct key rank first?
             record.update(matching_diagnostics(output.match.matching_probability,
                                                tuple(output.match.coarse_flow.shape[-2:]),
@@ -201,7 +203,8 @@ def main() -> None:
         if step % int(train_config.validation_every) == 0 or step == steps:
             validation = evaluate(model, eval_loader, device)
             record.update({f"val_{name}": value for name, value in validation.items()})
-            print("  eval epe={epe_px:.3f} zero={zero_flow_epe_px:.3f} ratio={relative_epe:.3f} "
+            print("  eval epe={epe_px:.3f} coarse={coarse_epe_px:.3f} "
+                  "zero={zero_flow_epe_px:.3f} ratio={relative_epe:.3f} "
                   "gt_rank_frac={match_frac_keys_beating_gt:.3f} "
                   "argmax_epe={match_epe_argmax_px:.1f}px".format(**validation))
             if validation["relative_epe"] < best_ratio:

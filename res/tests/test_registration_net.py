@@ -11,6 +11,7 @@ import torch
 from res.encoder import MINDFeatureEncoder
 from res.global_matcher import GlobalMatcher
 from res.mind import MINDDescriptor
+from res.local_matcher import LocalMatcher
 from res.registration_net import MINDGlobalRegistration
 
 
@@ -20,6 +21,7 @@ def small_model() -> MINDGlobalRegistration:
         encoder=MINDFeatureEncoder(
             in_channels=8, base_channels=8, out_channels=12, blocks_per_scale=1),
         matcher=GlobalMatcher(temperature=0.1),
+        local_matcher=LocalMatcher(radius=2, candidate_chunk=5),
     )
 
 
@@ -32,12 +34,15 @@ class MINDGlobalRegistrationTest(unittest.TestCase):
         output = model(ir, vi)
         self.assertEqual(tuple(output.coarse_aligned_ir.shape), (2, 1, 64, 80))
         self.assertEqual(tuple(output.coarse_flow.shape), (2, 2, 64, 80))
+        self.assertEqual(tuple(output.final_flow.shape), (2, 2, 64, 80))
+        self.assertEqual(tuple(output.final_aligned_ir.shape), (2, 1, 64, 80))
+        self.assertEqual(tuple(output.local_match.probability.shape), (2, 25, 16, 20))
         self.assertEqual(tuple(output.confidence_1_8.shape), (2, 1, 8, 10))
         self.assertEqual(tuple(output.affine_yx.shape), (2, 3, 2))
         for tensor in (output.coarse_aligned_ir, output.coarse_flow,
                        output.confidence_1_8, output.affine_yx):
             self.assertTrue(torch.isfinite(tensor).all())
-        output.coarse_aligned_ir.mean().backward()
+        output.final_aligned_ir.mean().backward()
         self.assertIsNotNone(ir.grad)
         self.assertIsNotNone(vi.grad)
         self.assertTrue(torch.isfinite(ir.grad).all())

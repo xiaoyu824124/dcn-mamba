@@ -13,6 +13,7 @@ from .mind import MINDDescriptor, rgb_to_gray
 from .affine import homography_to_normalised_affine_yx
 from .global_matcher import GlobalMatchOutput
 from .matching import coarse_matching_loss
+from .local_matcher import LocalMatchOutput, local_matching_loss
 
 
 @dataclass
@@ -26,33 +27,35 @@ class RegistrationLossOutput:
     smooth: torch.Tensor
     affine: torch.Tensor
     match: torch.Tensor
+    local: torch.Tensor
 
     def as_dict(self) -> Dict[str, torch.Tensor]:
         return {"loss": self.total, "loss_flow": self.flow, "loss_mind": self.mind,
                 "loss_edge": self.edge, "loss_smooth": self.smooth,
-                "loss_affine": self.affine, "loss_match": self.match}
+                "loss_affine": self.affine, "loss_match": self.match,
+                "loss_local": self.local}
 
 
 class RegistrationLoss(nn.Module):
     """Supervised flow plus modality-robust structural registration losses.
 
     Args:
-        weights: Mapping with ``flow``, ``mind``, ``edge``, ``smooth`` and
-            ``affine`` keys.
+        weights: Mapping with ``flow``, ``match``, ``mind``, ``edge``,
+            ``smooth`` and ``affine`` keys. ``local`` is optional for old
+            coarse-only checkpoints.
             Values are intentionally supplied by YAML rather than hard-coded.
         mind_descriptor: The shared MIND implementation used for structural loss.
         charbonnier_eps: Robust L1 epsilon for supervised flow.
 
     ``forward`` expects an aligned IR image, a fixed visible RGB image, the
-    coarse flow, optional final flow and optional GT flow.  When a DCN run uses
-    feature reconstruction only, it has no final explicit field: flow loss then
-    supervises the coarse global field while structural losses supervise the
-    refined reconstruction branch.
+    coarse flow, optional final flow and optional GT flow. The final field is
+    supervised when available; otherwise the coarse field is supervised.
 
     ``match`` carries the matcher output so the coarse correspondence can be
     supervised directly.  Without it the dense flow term has a degenerate
     optimum (a constant field already reaches the mean-displacement error) and
     the encoder is never asked to make the ground-truth key the argmax.
+    ``local_match`` similarly supervises the 1/4 candidate distribution.
     """
 
     REQUIRED_WEIGHTS = ("flow", "match", "mind", "edge", "smooth", "affine")
@@ -66,6 +69,7 @@ class RegistrationLoss(nn.Module):
         if missing:
             raise ValueError(f"registration loss weights missing: {sorted(missing)}")
         self.weights = {key: float(weights[key]) for key in self.REQUIRED_WEIGHTS}
+        self.weights["local"] = float(weights.get("local", 0.0))
         if float(match_focal_gamma) < 0:
             raise ValueError("match_focal_gamma must be non-negative")
         self.match_focal_gamma = float(match_focal_gamma)
@@ -103,7 +107,8 @@ class RegistrationLoss(nn.Module):
                 valid_mask: Optional[torch.Tensor] = None,
                 predicted_affine_yx: Optional[torch.Tensor] = None,
                 gt_h: Optional[torch.Tensor] = None,
-                match: Optional[GlobalMatchOutput] = None) -> RegistrationLossOutput:
+                match: Optional[GlobalMatchOutput] = None,
+                local_match: Optional[LocalMatchOutput] = None) -> RegistrationLossOutput:
         if aligned_ir.ndim != 4 or aligned_ir.shape[1] != 1:
             raise ValueError("aligned_ir must be [B,1,H,W]")
         if visible.ndim != 4 or visible.shape[1] != 3:
@@ -158,6 +163,8 @@ class RegistrationLoss(nn.Module):
             loss_match = coarse_matching_loss(
                 match.matching_probability, match_hw, gt_flow, valid_mask,
                 focal_gamma=self.match_focal_gamma)
+        loss_local = (local_matching_loss(local_match, gt_flow, valid_mask)
+                      if local_match is not None and gt_flow is not None else zero)
 
         # MIND compares self-similarity patterns, not raw IR/RGB intensities.
         loss_mind = F.l1_loss(self.mind_descriptor(aligned_ir),
@@ -167,9 +174,10 @@ class RegistrationLoss(nn.Module):
         loss_smooth = self.edge_aware_smoothness(active_flow, visible)
         total = (self.weights["flow"] * loss_flow
                  + self.weights["match"] * loss_match
+                 + self.weights["local"] * loss_local
                  + self.weights["mind"] * loss_mind
                  + self.weights["edge"] * loss_edge
                  + self.weights["smooth"] * loss_smooth
                  + self.weights["affine"] * loss_affine)
         return RegistrationLossOutput(total, loss_flow, loss_mind, loss_edge, loss_smooth,
-                                      loss_affine, loss_match)
+                                      loss_affine, loss_match, loss_local)

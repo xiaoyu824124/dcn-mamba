@@ -1,161 +1,61 @@
-# VTMOT single-frame IR-visible registration
+# IR–VI 单帧配准：先粗后细
 
-This is the complete runnable branch. It contains only:
-
-```text
-IR + visible_mis
-  -> MIND structural descriptors
-  -> shared multi-scale encoder (1/2, 1/4, 1/8)
-  -> 1/8 all-pairs global matching (dual softmax)
-  -> soft-argmax expectation -> raw correspondence field
-  -> confidence-weighted 6-DoF affine projection -> coarse flow
-  -> [dy, dx] flow and backward-warped IR
-```
-
-Only the 1/8 level is consumed today; the 1/4 and 1/2 encoder outputs are
-computed and currently discarded. There is no fine/local stage yet, which is the
-known accuracy ceiling (see "Current status").
-
-The flow convention is fixed throughout:
+当前 `res` 分支实现如下：
 
 ```text
-aligned_ir(y, x) = ir(y + flow_y, x + flow_x)
-flow = [dy, dx] pixels on the visible_mis grid
+IR、VI
+  → MIND 自相似描述子（固定计算，无可训练参数）
+  → 共享 Encoder（学习跨模态结构特征）
+  → 1/8 全局 all-pairs 匹配，置信度加权仿射拟合，得到粗场
+  → 用粗场预对齐 IR 图像，并定位每个 1/4 特征的搜索中心
+  → 1/4 局部相关匹配，轻量修正头预测残差，得到最终流场与配准图
 ```
 
-## Required VTMOT layout
+流场在 VI 网格上定义，通道顺序为 `[dy, dx]`。`aligned_ir(y,x) =
+ir(y + dy, x + dx)`。局部匹配直接在 IR 原特征中采样
+`p + coarse(p) + offset`，因此搜索窗口始终围绕当前像素的粗预测。
+默认半径 6 个 1/4 特征格，对应图像上的约 ±24 像素；候选分块计算，
+避免一次保留所有采样特征。修正头的末层零初始化，训练开始时最终流场等于
+粗场；它需要根据局部相关分布和流场监督学会修正。最终图像只用最终流场做一次
+backward warp。
 
-```text
-data/VTMOT_misaligned/
-data_split/IVF/VTMOT/split.json
-```
+训练使用 VTMOT 的仿射 GT：1/8 对应分布、仿射参数、最终流场、
+1/4 局部对应分布，以及 MIND、边缘和光滑项共同监督。局部对应损失只对
+GT 落在搜索窗口内的像素计算。`res/configs/registration.yaml` 是默认配置。
+`--init` 从旧粗配准权重加载兼容张量；`--resume` 严格恢复同一次训练。
 
-`gt_h` maps fixed `visible_mis` coordinates to moving IR coordinates. The
-loader applies the same aspect-preserving resize to images and homography, then
-materialises dense GT flow. VTMOT files are read-only.
+## A4000 上逐步验证
 
-## Supervision
+数据位置：`data/VTMOT_misaligned/`，划分文件：
+`data_split/IVF/VTMOT/split.json`。在仓库根目录执行：
 
-`RegistrationLoss` combines five terms:
+1. 在服务器执行 `git pull origin main` 拉取本次提交，然后在服务器的 Python 环境运行
+   `python -B -m unittest discover -s res/tests -t .`。应全部通过。
+2. 核对 GT 方向：
+   `python -B -m res.evaluate_vtmot --device cuda --split eval --frame-stride 50 --check-gt`。
+   `gt_warp_mae` 应小于 `unwarped_mae`。
+3. 做一步完整分辨率试跑，检查数据、梯度和显存：
+   `python -B -m res.train_vtmot --device cuda --steps 1 --num-workers 0 --init res_runs/vtmot_affine_stable_3060/best.pt --output-dir res_runs/a4000_local_smoke`。
+   应出现有限的 `loss`、`train_epe`、`local` 和 `peak_mem_mib`。`res_runs/` 不随 Git 同步；
+   若服务器没有该旧权重，去掉 `--init`，或者先单独把权重复制到服务器。
+4. 用新的目录训练 3000 步：
+   `python -B -m res.train_vtmot --device cuda --run full --num-workers 0 --init res_runs/vtmot_affine_stable_3060/best.pt --output-dir res_runs/a4000_local_full`。
+   每 100 步看 `val_epe_px`、`val_coarse_epe_px`、`val_local_window_coverage`、
+   `val_pck_3px`。局部细化应使最终 EPE 低于粗场 EPE；若持续变差，先保留
+   `best.pt`，再调整局部温度、半径或局部损失权重。
+5. 在较密的开发集上确认 `best.pt`：
+   `python -B -m res.evaluate_vtmot --device cuda --split eval --frame-stride 10 --checkpoint res_runs/a4000_local_full/best.pt --output res_runs/a4000_local_full/eval_stride10.json`。
+   报告同时列出最终 `epe_px`、`coarse_epe_px`、零场 EPE、PCK 和局部覆盖率。
+   达到 `EPE ≤ 2 px` 且 `PCK@3px ≥ 0.90` 后，再在 `test` 划分做一次最终评估。
 
-| weight | term | purpose |
-|---|---|---|
-| `match` | dual-softmax NLL at the sub-pixel GT cell | the only term that rewards putting mass on the correct key |
-| `flow` | Charbonnier on the 6-DoF projected flow | dense sub-pixel shaping |
-| `affine` | Charbonnier on the matcher's `[B,3,2]` parameters | direct 6-DoF supervision |
-| `mind`, `edge` | descriptor / gradient magnitude after warping | structural agreement |
-| `smooth` | edge-aware flow regularity | regularisation |
+输出目录已有 `metrics.jsonl`、`best.pt` 或 `last.pt` 时，新训练会拒绝覆盖。
+续训用同一目录和 `--resume .../last.pt --steps <新的总步数>`。
+这些是验证门槛，并非当前已经达到的结果；A4000 训练结果需以实际日志为准。
 
-The dense `flow` term alone has a degenerate optimum (a constant field already
-reaches the mean-displacement error), so `match` is what makes the matcher
-learn. `match_focal_gamma > 0` switches the NLL to a focal variant.
+## 后续关键帧与时序
 
-## Diagnostics
-
-`res.matching` reports how the ground-truth match ranks against competing keys.
-Every `evaluate_vtmot` report includes them:
-
-| field | reading |
-|---|---|
-| `match_frac_keys_beating_gt` | fraction of all 4800 keys that outrank the truth; 0 is perfect, ~0.5 is useless |
-| `match_epe_argmax_px` | where the global argmax lands; ~200 px means random |
-| `match_effective_keys_ratio` | exp(entropy)/N; 1.0 means a uniform distribution |
-| `coarse_error_median_px`, `coarse_error_p90_px` | how far the produced coarse field is from the truth |
-| `window{2,4}_coverage` | share of ground-truth keys inside a (2r+1)^2 window around the *predicted* key |
-| `window{2,4}_argmax_correct` | share where the truth wins inside that window -- the fine stage's headroom |
-| `affine_corner_epe_px` | predicted vs GT affine at the four image corners |
-
-## RTX A4000 training
-
-The default config uses the full 480x640 field of view and batch one on a
-16 GB RTX A4000. First check one step on the target machine, then start a
-fresh 3000-step run from the retained real-VTMOT affine checkpoint:
-
-```powershell
-python -B -m res.train_vtmot --device cuda --steps 1 --num-workers 0 --init res_runs\vtmot_affine_stable_3060\best.pt --output-dir res_runs\_a4000_smoke
-python -B -m res.train_vtmot --device cuda --run full --num-workers 0 --init res_runs\vtmot_affine_stable_3060\best.pt --output-dir res_runs\vtmot_match_dual_a4000
-```
-
-`--init` is a warm start: tensors whose shape still matches are kept and the
-rest are reported, so width or architecture knobs can be changed without
-throwing the checkpoint away. `--resume` stays strict. `--lr` and
-`--batch-size` override the config.
-
-Every validation print includes `ratio` and `match_frac_keys_beating_gt`; judge
-progress by the latter (it aggregates ~4800 keys per query over every eval
-image, whereas a 16-image `ratio` is noisy).
-
-For a Windows run where worker processes cannot be created, append
-`--num-workers 0`; otherwise retain the configured two workers. Check the
-printed peak memory after the one-step run before starting the full run.
-
-To continue an interrupted run, use `--resume` with `last.pt`, the same config
-and output directory, and a larger **total** `--steps` value. The checkpoint
-retains the best validation ratio, so restarting does not replace `best.pt`
-with a worse model. For example, after completing 3000 steps:
-
-```powershell
-python -B -m res.train_vtmot --device cuda --run full --steps 6000 --num-workers 0 --resume res_runs\vtmot_match_dual_a4000\last.pt --output-dir res_runs\vtmot_match_dual_a4000
-```
-
-`relative EPE = predicted EPE / zero-flow EPE`; values below one beat no
-registration. The held-out `test` split is not used during training.
-
-## Evaluation
-
-First verify GT direction without a model:
-
-```powershell
-python -B -m res.evaluate_vtmot --device cuda --split eval --frame-stride 50 --check-gt
-```
-
-Then evaluate a checkpoint on the development split:
-
-```powershell
-python -B -m res.evaluate_vtmot --device cuda --split eval --frame-stride 10 --checkpoint res_runs\vtmot_match_dual_a4000\best.pt --output res_runs\vtmot_match_dual_a4000\eval_stride10.json
-```
-
-After choosing settings, replace `--split eval` with `--split test` once for
-the final held-out report.
-
-The verdict line is deliberately strict:
-
-```text
-FUSION READY   EPE <= 2 px and pck@3px >= 0.90
-COARSE ONLY    beats zero flow but far from fusion-ready
-NOT READY      relative EPE >= 1
-```
-
-## Current status
-
-| metric | value | source |
-|---|---|---|
-| `relative_epe` (best) | 0.754 at step 2700 | 3000-step full-FOV run |
-| `match_frac_keys_beating_gt` | 0.065 | same |
-| `match_epe_argmax_px` | ~150 (random is ~200) | same |
-| `coarse_error_median_px` / `p90` | 8.8 / 12.0 | 500-step local run |
-| `window2_coverage` | 0.996 | corrected 500-step wide-128 checkpoint, 16 eval frames |
-| 1/4 radius-4 coverage | 0.986 | same checkpoint, independent GT-centred measurement |
-
-The windowed rows come from a weaker 500-step checkpoint. The 3000-step
-checkpoint underlying the reported 0.754/0.065 results is not present in this
-checkout, so those values need re-evaluation on the new A4000 run. Earlier
-`window2_coverage=1.00` reports were inflated by a denominator bug; do not
-compare those historical coverage values to the corrected reports.
-
-So the coarse field is good enough to centre a local search but not good enough
-to be the answer: the global 1/8 matcher cannot localise, and the usable field
-comes from projecting a diffuse correspondence field onto 6 DoF. At 1/8
-resolution even 25 neighbouring cells keep beating the truth, and widening the
-window makes it worse -- the fine stage therefore has to search on the 1/4
-features with a radius of at least 16 px.
-
-Two further known gaps: the confidence-weighted WLS affine fit is fragile on
-individual images (occasional eval spikes with an unchanged ranking), and no
-robust/outlier-rejecting fit is implemented.
-
-## Tests
-
-```powershell
-python -B -m unittest discover -s res/tests -t .
-```
+当前 VTMOT 入口按独立帧训练和评估；它没有连续帧、关键帧选择或时序 GT。
+先验证单帧最终流场稳定，再接入序列数据：保存可靠关键帧的 VI/IR 特征与
+最终流场，在后续帧做运动传播，以当前帧的局部匹配修正，并按置信度更新
+关键帧。验证时分开报告关键帧与非关键帧的 EPE/PCK、相邻帧流场一致性和
+遮挡区域表现。不要把单帧结果当作时序结果。

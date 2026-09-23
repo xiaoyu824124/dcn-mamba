@@ -1,5 +1,4 @@
-# Independent single-frame IR--visible registration experiment.
-# Stages 1--8 use this configuration; real VTMOT integration remains separate.
+# Single-frame IR--visible registration: MIND -> 1/8 global -> 1/4 local.
 mind:
   patch_size: 3
   radius: 1
@@ -29,6 +28,15 @@ global_matcher:
   # 7.5 -> 5.6 -> 5.2.  No new parameters, so existing checkpoints still load.
   dual_softmax: true
 
+local_matcher:
+  enabled: true
+  # +/-6 feature cells = +/-24 image pixels around the 1/8 coarse prediction.
+  # The old affine checkpoint covers only ~94% of valid queries at radius 4.
+  radius: 6
+  temperature: 0.07
+  candidate_chunk: 9
+  refinement_channels: 32
+
 loss:
   charbonnier_eps: 1.0e-3
   # >0 turns the dual-softmax NLL into a focal variant; 0 is the plain NLL.
@@ -39,6 +47,8 @@ loss:
     # the encoder to put mass on the correct key.  ``match`` supervises the
     # correspondence distribution directly and is what makes the matcher learn.
     match: 1.0
+    # Supervise the 1/4 candidate distribution only where GT lies in its window.
+    local: 1.0
     flow: 1.0
     mind: 0.5
     edge: 0.25
@@ -47,7 +57,7 @@ loss:
     # It is complementary to dense flow EPE and adds no new network branch.
     affine: 10.0
 
-# Real VTMOT fine-tuning runs only the standalone coarse registration branch.
+# Real VTMOT fine-tuning runs the standalone coarse-to-fine registration branch.
 # RTX A4000 (16 GB): full 480x640 FOV and batch one.  This is the evaluation
 # FOV that matters; the older 160x160 3060 crop is only an initialisation run.
 vtmot_data:
