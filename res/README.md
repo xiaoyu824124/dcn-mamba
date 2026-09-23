@@ -1,18 +1,19 @@
 # IR–VI 单帧配准：先粗后细
 
-## Linux A4000 服务器准备
+## Windows A4000 服务器准备
 
-在 VS Code 远程终端、仓库根目录执行。建议 Python 3.10；本地验证环境为
-Python 3.10、PyTorch 2.4.0 CUDA 12.1。先用 `nvidia-smi` 检查显卡与驱动。
+在 VS Code 的 PowerShell 远程终端、仓库根目录执行。建议 Python 3.10；
+本地验证环境为 Python 3.10、PyTorch 2.4.0 CUDA 12.1。先用
+`nvidia-smi` 检查显卡与驱动。
 
-```bash
+```powershell
 git pull origin main
 conda create -n res-reg python=3.10 -y
 conda activate res-reg
 python -m pip install torch==2.4.0 --index-url https://download.pytorch.org/whl/cu121
-python -m pip install -r res/requirements.txt
+python -m pip install -r res\requirements.txt
 python -c "import torch; print(torch.__version__, torch.version.cuda, torch.cuda.is_available(), torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'NO CUDA')"
-python -B -m unittest discover -s res/tests -t .
+python -B -m unittest discover -s res\tests -t .
 ```
 
 `res` 单帧训练只用 `torch`、NumPy、Pillow 和 OmegaConf；不需要安装 CRFT
@@ -24,8 +25,11 @@ Git 包含 `res/` 与 `data_split/IVF/VTMOT/split.json`。数据集
 单独放置。数据目录中每个序列至少有 `infrared/*.jpg`、
 `visible_mis/*.png` 和 `gt_h/*.npy`；运行 `--check-gt` 时还需
 `visible_gt/*.png`。数据不在默认位置时给训练和评估命令加
-`--data-root /你的/VTMOT_misaligned`。旧粗场权重只用于 `--init` 热启动，
-建议另行放到 `res_runs/vtmot_affine_stable_3060/best.pt`。
+`--data-root "D:\你的路径\VTMOT_misaligned"`。旧粗场权重仅是可选的
+`--init` 热启动。本地 `res_runs/vtmot_affine_stable_3060/best.pt` 来自早期
+160×160 裁剪实验，checkpoint 记录为第 400 步；它没有上传到 Git，也不是
+服务器从零训练的前置条件。要公平比较 SA-CA，从零分别训练
+`stage0_coarse.yaml` 和 `stage1_saca.yaml` 即可。
 
 ## CRFT 分步改造：阶段 1
 
@@ -36,17 +40,18 @@ dual-softmax、软 argmax 和 6-DoF WLS；独立配置关闭 1/4 局部头，避
 两个结构同时变化。参考 [CRFT 论文](https://arxiv.org/html/2604.05689v1)
 及[官方实现](https://github.com/NEU-Liuxuecong/CRFT)。
 
-在 A4000 上先运行阶段 1：
+在 A4000 上用相同数据、步数与随机种子分别运行粗场基线和阶段 1：
 
 ```powershell
-python -B -m res.train_vtmot --device cuda --steps 1 --num-workers 0 --overlay res/configs/stage1_saca.yaml --init res_runs/vtmot_affine_stable_3060/best.pt --output-dir res_runs/saca_smoke
-python -B -m res.train_vtmot --device cuda --run pilot --num-workers 0 --overlay res/configs/stage1_saca.yaml --init res_runs/vtmot_affine_stable_3060/best.pt --output-dir res_runs/saca_pilot
-python -B -m res.evaluate_vtmot --device cuda --split eval --frame-stride 10 --checkpoint res_runs/saca_pilot/best.pt --output res_runs/saca_pilot/eval_stride10.json
+python -B -m res.train_vtmot --device cuda --steps 1 --num-workers 0 --overlay res\configs\stage1_saca.yaml --output-dir res_runs\saca_smoke
+python -B -m res.train_vtmot --device cuda --run pilot --num-workers 0 --overlay res\configs\stage0_coarse.yaml --output-dir res_runs\coarse_pilot
+python -B -m res.train_vtmot --device cuda --run pilot --num-workers 0 --overlay res\configs\stage1_saca.yaml --output-dir res_runs\saca_pilot
+python -B -m res.evaluate_vtmot --device cuda --split eval --frame-stride 10 --checkpoint res_runs\coarse_pilot\best.pt --output res_runs\coarse_pilot\eval_stride10.json
+python -B -m res.evaluate_vtmot --device cuda --split eval --frame-stride 10 --checkpoint res_runs\saca_pilot\best.pt --output res_runs\saca_pilot\eval_stride10.json
 ```
 
-如服务器没有旧权重，先单独传输该文件；仅拉取 Git 代码不会同步 `res_runs/`。
-请保留 `metrics.jsonl`、`eval_stride10.json`、一步试跑的显存峰值，以及
-相同 eval 划分上旧模型的报告。先比较 `coarse_epe_px`、
+请保留两组 `metrics.jsonl`、`eval_stride10.json` 和一步试跑的显存峰值。
+先比较 `coarse_epe_px`、
 `match_frac_keys_beating_gt`、`match_epe_argmax_px` 和峰值显存；若注意力
 改善匹配但 WLS 粗场仍不改善，再检查置信度权重和仿射拟合。
 
@@ -84,16 +89,15 @@ GT 落在搜索窗口内的像素计算。`res/configs/registration.yaml` 是默
 `data_split/IVF/VTMOT/split.json`。在仓库根目录执行：
 
 1. 在服务器执行 `git pull origin main` 拉取本次提交，然后在服务器的 Python 环境运行
-   `python -B -m unittest discover -s res/tests -t .`。应全部通过。
+   `python -B -m unittest discover -s res\tests -t .`。应全部通过。
 2. 核对 GT 方向：
    `python -B -m res.evaluate_vtmot --device cuda --split eval --frame-stride 50 --check-gt`。
    `gt_warp_mae` 应小于 `unwarped_mae`。
 3. 做一步完整分辨率试跑，检查数据、梯度和显存：
-   `python -B -m res.train_vtmot --device cuda --steps 1 --num-workers 0 --init res_runs/vtmot_affine_stable_3060/best.pt --output-dir res_runs/a4000_local_smoke`。
-   应出现有限的 `loss`、`train_epe`、`local` 和 `peak_mem_mib`。`res_runs/` 不随 Git 同步；
-   若服务器没有该旧权重，去掉 `--init`，或者先单独把权重复制到服务器。
+   `python -B -m res.train_vtmot --device cuda --steps 1 --num-workers 0 --output-dir res_runs\a4000_local_smoke`。
+   应出现有限的 `loss`、`train_epe`、`local` 和 `peak_mem_mib`。
 4. 用新的目录训练 3000 步：
-   `python -B -m res.train_vtmot --device cuda --run full --num-workers 0 --init res_runs/vtmot_affine_stable_3060/best.pt --output-dir res_runs/a4000_local_full`。
+   `python -B -m res.train_vtmot --device cuda --run full --num-workers 0 --output-dir res_runs\a4000_local_full`。
    每 100 步看 `val_epe_px`、`val_coarse_epe_px`、`val_local_window_coverage`、
    `val_pck_3px`。局部细化应使最终 EPE 低于粗场 EPE；若持续变差，先保留
    `best.pt`，再调整局部温度、半径或局部损失权重。

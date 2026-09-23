@@ -86,9 +86,12 @@ def main() -> None:
     eval_dataset = VTMOTSingleFrameDataset(
         args.data_root, split="eval", split_file=args.split_file, target_hw=target_hw,
         crop_hw=crop_hw, random_crop=False, frame_stride=int(data_config.eval_frame_stride))
+    # Keep sample order independent of the model's parameter count, so the
+    # coarse-only and SA-CA runs see the same images in a controlled ablation.
+    train_generator = torch.Generator().manual_seed(int(train_config.seed))
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True,
                               num_workers=num_workers, drop_last=True,
-                              pin_memory=device.type == "cuda")
+                              pin_memory=device.type == "cuda", generator=train_generator)
     eval_loader = DataLoader(eval_dataset, batch_size=int(train_config.eval_batch_size), shuffle=False,
                              num_workers=0, pin_memory=device.type == "cuda")
     model = build_global_registration(config).to(device)
@@ -160,6 +163,9 @@ def main() -> None:
         if best_ratio == float("inf"):
             best_ratio = float(evaluate(model, eval_loader, device)["relative_epe"])
         print(f"resume: step={start_step} prior best relative EPE={best_ratio:.4f}")
+    # num_workers=0 draws random crops on the main process. Restore its RNG
+    # after model construction, which otherwise differs across architectures.
+    torch.manual_seed(int(train_config.seed))
     iterator = iter(train_loader)
     model.train()
     for step in range(start_step + 1, steps + 1):

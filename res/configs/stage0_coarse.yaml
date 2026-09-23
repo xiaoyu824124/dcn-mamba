@@ -1,0 +1,10 @@
+# Coarse-only baseline for a fair from-scratch comparison with stage1_saca.yaml.
+coarse_transformer:
+  enabled: false
+
+local_matcher:
+  enabled: false
+
+loss:
+  weights:
+    local: 0.0

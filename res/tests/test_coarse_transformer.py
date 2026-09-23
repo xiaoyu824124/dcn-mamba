@@ -41,6 +41,15 @@ class CoarseTransformerTest(unittest.TestCase):
         self.assertIsNone(output.final_flow)
         self.assertTrue(torch.isfinite(output.coarse_flow).all())
 
+    def test_stage0_is_coarse_only(self):
+        config = OmegaConf.merge(
+            OmegaConf.load("res/configs/registration.yaml"),
+            OmegaConf.load("res/configs/stage0_coarse.yaml"))
+        model = build_global_registration(config)
+        self.assertIsNone(model.coarse_transformer)
+        self.assertIsNone(model.local_matcher)
+        self.assertEqual(float(config.loss.weights.local), 0.0)
+
     def test_invalid_channels(self):
         with self.assertRaisesRegex(ValueError, "divisible by four"):
             CoarseSACATransformer(channels=10, num_heads=2)
