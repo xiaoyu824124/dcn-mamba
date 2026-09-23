@@ -1,5 +1,32 @@
 # IR–VI 单帧配准：先粗后细
 
+## Linux A4000 服务器准备
+
+在 VS Code 远程终端、仓库根目录执行。建议 Python 3.10；本地验证环境为
+Python 3.10、PyTorch 2.4.0 CUDA 12.1。先用 `nvidia-smi` 检查显卡与驱动。
+
+```bash
+git pull origin main
+conda create -n res-reg python=3.10 -y
+conda activate res-reg
+python -m pip install torch==2.4.0 --index-url https://download.pytorch.org/whl/cu121
+python -m pip install -r res/requirements.txt
+python -c "import torch; print(torch.__version__, torch.version.cuda, torch.cuda.is_available(), torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'NO CUDA')"
+python -B -m unittest discover -s res/tests -t .
+```
+
+`res` 单帧训练只用 `torch`、NumPy、Pillow 和 OmegaConf；不需要安装 CRFT
+仓库，也无需安装根目录完整 `requirements.txt`。如已有可用的 PyTorch CUDA
+环境，先做上面的 CUDA 检查和测试即可，不必重复安装。
+
+Git 包含 `res/` 与 `data_split/IVF/VTMOT/split.json`。数据集
+`data/VTMOT_misaligned/` 和权重目录 `res_runs/` 被 Git 忽略，必须在服务器上
+单独放置。数据目录中每个序列至少有 `infrared/*.jpg`、
+`visible_mis/*.png` 和 `gt_h/*.npy`；运行 `--check-gt` 时还需
+`visible_gt/*.png`。数据不在默认位置时给训练和评估命令加
+`--data-root /你的/VTMOT_misaligned`。旧粗场权重只用于 `--init` 热启动，
+建议另行放到 `res_runs/vtmot_affine_stable_3060/best.pt`。
+
 ## CRFT 分步改造：阶段 1
 
 已加入可选的 1/8 线性 SA-CA，插在 Encoder 与 GlobalMatcher 之间。

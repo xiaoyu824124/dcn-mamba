@@ -1,0 +1,5 @@
+# Standalone res registration dependencies besides CUDA-enabled PyTorch.
+# Install torch separately using the official wheel index for the server driver.
+numpy==1.26.4
+Pillow==12.3.0
+omegaconf==2.3.1
