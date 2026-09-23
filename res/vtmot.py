@@ -8,6 +8,7 @@ fusion dataset classes, so geometry validation is independent of that stack.
 
 from __future__ import annotations
 
+import csv
 import json
 from pathlib import Path
 from typing import Dict, List, Tuple
@@ -91,7 +92,7 @@ class VTMOTSingleFrameDataset(Dataset):
     Args:
         root: ``VTMOT_misaligned`` directory itself.
         split: ``train``, ``eval`` or held-out ``test`` from ``split.json``.
-        split_file: repository split file, never inferred from directory order.
+        split_file: repository split file; paired frames come from its per-sequence CSVs.
         target_hw: normalised spatial resolution, divisible by eight by default.
         frame_stride: retain every Nth frame in each sequence for fast checks.
         include_rgb_gt: load aligned visible RGB only for GT-direction checking.
@@ -132,10 +133,30 @@ class VTMOTSingleFrameDataset(Dataset):
             h_dir = self.root / sequence / "gt_h"
             if not infrared_dir.is_dir() or not visible_dir.is_dir() or not h_dir.is_dir():
                 raise FileNotFoundError(f"incomplete VTMOT sequence: {sequence}")
-            stems = sorted(path.stem for path in infrared_dir.iterdir() if path.is_file())
+            # The dataset directory may also contain raw frames with hashed
+            # suffixes. Only the curated CSV rows have matching visible/GT files.
+            manifest = self.split_file.parent / f"{sequence}.csv"
+            if not manifest.is_file():
+                raise FileNotFoundError(f"VTMOT sequence manifest not found: {manifest}")
+            with manifest.open(newline="", encoding="utf-8-sig") as handle:
+                reader = csv.DictReader(handle)
+                if reader.fieldnames is None or not {"ir", "rgb"}.issubset(reader.fieldnames):
+                    raise ValueError(f"VTMOT sequence manifest needs ir,rgb columns: {manifest}")
+                stems = []
+                for row in reader:
+                    ir = Path(row["ir"])
+                    rgb = Path(row["rgb"])
+                    if (ir.parent != Path("infrared") or ir.suffix.lower() != ".jpg"
+                            or rgb != Path("visible_mis") / f"{ir.stem}.png"):
+                        raise ValueError(f"unsupported VTMOT pair in {manifest}: {row}")
+                    stems.append(ir.stem)
             for stem in stems[::frame_stride]:
-                if not (visible_dir / f"{stem}.png").is_file() or not (h_dir / f"{stem}.npy").is_file():
-                    raise FileNotFoundError(f"missing paired VTMOT raster or GT for {sequence}/{stem}")
+                required = (infrared_dir / f"{stem}.jpg", visible_dir / f"{stem}.png",
+                            h_dir / f"{stem}.npy")
+                missing = [str(path) for path in required if not path.is_file()]
+                if missing:
+                    raise FileNotFoundError(f"VTMOT manifest {manifest} references missing files "
+                                            f"for {sequence}/{stem}: {', '.join(missing)}")
                 if self.include_rgb_gt and not (self.root / sequence / "visible_gt" / f"{stem}.png").is_file():
                     raise FileNotFoundError(f"missing visible_gt for {sequence}/{stem}")
                 self.samples.append((sequence, stem))

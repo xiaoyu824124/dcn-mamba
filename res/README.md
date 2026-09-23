@@ -1,31 +1,38 @@
 # IR–VI 单帧配准：先粗后细
 
-## Linux A4000 服务器准备
+## A4000 服务器准备（当前为 Windows 环境）
 
-在 SSH 连接的 VS Code Linux 终端、仓库根目录执行。建议 Python 3.10；
+你贴出的 `G:\cxj\VF-Bench-main` 和 `C:\Users\cxj\.conda` 表明当前 SSH 终端连接的是
+Windows 服务器。在服务器的 VS Code 终端、仓库根目录执行。建议 Python 3.10；
 本地验证环境为 Python 3.10、PyTorch 2.4.0 CUDA 12.1。先用
 `nvidia-smi` 检查显卡与驱动。
 
-```bash
+```bat
 git pull origin main
 conda create -n res-reg python=3.10 -y
 conda activate res-reg
 python -m pip install torch==2.4.0 --index-url https://download.pytorch.org/whl/cu121
-python -m pip install -r res/requirements.txt
+python -m pip install -r res/requirements.txt -i https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple
 python -c "import torch; print(torch.__version__, torch.version.cuda, torch.cuda.is_available(), torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'NO CUDA')"
 python -B -m unittest discover -s res/tests -t .
 ```
 
-`res` 单帧训练只用 `torch`、NumPy、Pillow 和 OmegaConf；不需要安装 CRFT
-仓库，也无需安装根目录完整 `requirements.txt`。如已有可用的 PyTorch CUDA
-环境，先做上面的 CUDA 检查和测试即可，不必重复安装。
+普通 Python 依赖使用[清华 PyPI 镜像](https://mirrors.tuna.tsinghua.edu.cn/help/pypi/)；
+PyTorch CUDA 12.1 包仍从[官方 cu121 源](https://docs.pytorch.org/get-started/previous-versions/)安装，
+以固定 CUDA 包版本。如果 `vfbench-a4000` 环境已有可用的 PyTorch CUDA 和上述依赖，
+可直接复用，不必新建环境。
 
-Git 包含 `res/` 与 `data_split/IVF/VTMOT/split.json`。数据集
+`res` 单帧训练只用 `torch`、NumPy、Pillow 和 OmegaConf；不需要安装 CRFT
+仓库，也无需安装根目录完整 `requirements.txt`。
+
+Git 包含 `res/` 与 `data_split/IVF/VTMOT/` 下的划分文件及序列 CSV。数据集
 `data/VTMOT_misaligned/` 和权重目录 `res_runs/` 被 Git 忽略，必须在服务器上
 单独放置。数据目录中每个序列至少有 `infrared/*.jpg`、
 `visible_mis/*.png` 和 `gt_h/*.npy`；运行 `--check-gt` 时还需
-`visible_gt/*.png`。数据不在默认位置时给训练和评估命令加
-`--data-root /你的路径/VTMOT_misaligned`。旧粗场权重仅是可选的
+`visible_gt/*.png`。读取器以 `data_split/IVF/VTMOT/<序列>.csv` 中列出的帧为准，
+忽略 `infrared` 中未列出的带哈希后缀原始文件。如果清单中的帧缺失，错误会指出
+具体路径；此时需把本地已处理的 `data/VTMOT_misaligned/` 同步到服务器，或用
+`--data-root G:/你的路径/VTMOT_misaligned` 指向已有的完整数据。旧粗场权重仅是可选的
 `--init` 热启动。本地 `res_runs/vtmot_affine_stable_3060/best.pt` 来自早期
 160×160 裁剪实验，checkpoint 记录为第 400 步；它没有上传到 Git，也不是
 服务器从零训练的前置条件。要公平比较 SA-CA，从零分别训练

@@ -1,11 +1,15 @@
-"""Pure geometry tests for VTMOT homography-to-flow conversion."""
+"""VTMOT geometry and curated split loading tests."""
 
+import io
+import json
 import unittest
+from pathlib import Path
+from unittest.mock import patch
 
 import numpy as np
 import torch
 
-from res.vtmot import aspect_resize_affine, homography_to_flow
+from res.vtmot import VTMOTSingleFrameDataset, aspect_resize_affine, homography_to_flow
 from res.warp import warp
 
 
@@ -31,6 +35,27 @@ class VTMOTGeometryTest(unittest.TestCase):
     def test_aspect_resize_is_identity_for_equal_resolution(self):
         matrix = aspect_resize_affine((480, 640), (480, 640))
         self.assertTrue(np.allclose(matrix, np.eye(3)))
+
+
+class VTMOTSplitTest(unittest.TestCase):
+    def test_ignores_unlisted_raw_frames_but_checks_listed_pairs(self):
+        split_file = Path("lists/split.json")
+        manifest = "ir,rgb,rgb_gt\ninfrared/000002.jpg,visible_mis/000002.png,visible_gt/000002.png\n"
+        missing = set()
+        with (patch.object(Path, "is_dir", return_value=True),
+              patch.object(Path, "is_file", autospec=True,
+                           side_effect=lambda path: str(path) not in missing),
+              patch.object(Path, "read_text", return_value=json.dumps({"train": ["photo-0310-28"]})),
+              patch.object(Path, "open", side_effect=lambda *args, **kwargs: io.StringIO(manifest)),
+              patch.object(Path, "iterdir", side_effect=AssertionError("must use the CSV manifest"))):
+            dataset = VTMOTSingleFrameDataset("data/VTMOT_misaligned", split="train",
+                                               split_file=split_file)
+            self.assertEqual(dataset.samples, [("photo-0310-28", "000002")])
+
+            missing.add(str(Path("data/VTMOT_misaligned/photo-0310-28/gt_h/000002.npy")))
+            with self.assertRaisesRegex(FileNotFoundError, r"gt_h.*000002\.npy"):
+                VTMOTSingleFrameDataset("data/VTMOT_misaligned", split="train",
+                                         split_file=split_file)
 
 
 if __name__ == "__main__":
