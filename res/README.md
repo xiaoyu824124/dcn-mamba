@@ -1,19 +1,19 @@
 # IR–VI 单帧配准：先粗后细
 
-## Windows A4000 服务器准备
+## Linux A4000 服务器准备
 
-在 VS Code 的 PowerShell 远程终端、仓库根目录执行。建议 Python 3.10；
+在 SSH 连接的 VS Code Linux 终端、仓库根目录执行。建议 Python 3.10；
 本地验证环境为 Python 3.10、PyTorch 2.4.0 CUDA 12.1。先用
 `nvidia-smi` 检查显卡与驱动。
 
-```powershell
+```bash
 git pull origin main
 conda create -n res-reg python=3.10 -y
 conda activate res-reg
 python -m pip install torch==2.4.0 --index-url https://download.pytorch.org/whl/cu121
-python -m pip install -r res\requirements.txt
+python -m pip install -r res/requirements.txt
 python -c "import torch; print(torch.__version__, torch.version.cuda, torch.cuda.is_available(), torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'NO CUDA')"
-python -B -m unittest discover -s res\tests -t .
+python -B -m unittest discover -s res/tests -t .
 ```
 
 `res` 单帧训练只用 `torch`、NumPy、Pillow 和 OmegaConf；不需要安装 CRFT
@@ -25,7 +25,7 @@ Git 包含 `res/` 与 `data_split/IVF/VTMOT/split.json`。数据集
 单独放置。数据目录中每个序列至少有 `infrared/*.jpg`、
 `visible_mis/*.png` 和 `gt_h/*.npy`；运行 `--check-gt` 时还需
 `visible_gt/*.png`。数据不在默认位置时给训练和评估命令加
-`--data-root "D:\你的路径\VTMOT_misaligned"`。旧粗场权重仅是可选的
+`--data-root /你的路径/VTMOT_misaligned`。旧粗场权重仅是可选的
 `--init` 热启动。本地 `res_runs/vtmot_affine_stable_3060/best.pt` 来自早期
 160×160 裁剪实验，checkpoint 记录为第 400 步；它没有上传到 Git，也不是
 服务器从零训练的前置条件。要公平比较 SA-CA，从零分别训练
@@ -42,12 +42,12 @@ dual-softmax、软 argmax 和 6-DoF WLS；独立配置关闭 1/4 局部头，避
 
 在 A4000 上用相同数据、步数与随机种子分别运行粗场基线和阶段 1：
 
-```powershell
-python -B -m res.train_vtmot --device cuda --steps 1 --num-workers 0 --overlay res\configs\stage1_saca.yaml --output-dir res_runs\saca_smoke
-python -B -m res.train_vtmot --device cuda --run pilot --num-workers 0 --overlay res\configs\stage0_coarse.yaml --output-dir res_runs\coarse_pilot
-python -B -m res.train_vtmot --device cuda --run pilot --num-workers 0 --overlay res\configs\stage1_saca.yaml --output-dir res_runs\saca_pilot
-python -B -m res.evaluate_vtmot --device cuda --split eval --frame-stride 10 --checkpoint res_runs\coarse_pilot\best.pt --output res_runs\coarse_pilot\eval_stride10.json
-python -B -m res.evaluate_vtmot --device cuda --split eval --frame-stride 10 --checkpoint res_runs\saca_pilot\best.pt --output res_runs\saca_pilot\eval_stride10.json
+```bash
+python -B -m res.train_vtmot --device cuda --steps 1 --num-workers 0 --overlay res/configs/stage1_saca.yaml --output-dir res_runs/saca_smoke
+python -B -m res.train_vtmot --device cuda --run pilot --num-workers 0 --overlay res/configs/stage0_coarse.yaml --output-dir res_runs/coarse_pilot
+python -B -m res.train_vtmot --device cuda --run pilot --num-workers 0 --overlay res/configs/stage1_saca.yaml --output-dir res_runs/saca_pilot
+python -B -m res.evaluate_vtmot --device cuda --split eval --frame-stride 10 --checkpoint res_runs/coarse_pilot/best.pt --output res_runs/coarse_pilot/eval_stride10.json
+python -B -m res.evaluate_vtmot --device cuda --split eval --frame-stride 10 --checkpoint res_runs/saca_pilot/best.pt --output res_runs/saca_pilot/eval_stride10.json
 ```
 
 请保留两组 `metrics.jsonl`、`eval_stride10.json` 和一步试跑的显存峰值。
@@ -89,15 +89,15 @@ GT 落在搜索窗口内的像素计算。`res/configs/registration.yaml` 是默
 `data_split/IVF/VTMOT/split.json`。在仓库根目录执行：
 
 1. 在服务器执行 `git pull origin main` 拉取本次提交，然后在服务器的 Python 环境运行
-   `python -B -m unittest discover -s res\tests -t .`。应全部通过。
+   `python -B -m unittest discover -s res/tests -t .`。应全部通过。
 2. 核对 GT 方向：
    `python -B -m res.evaluate_vtmot --device cuda --split eval --frame-stride 50 --check-gt`。
    `gt_warp_mae` 应小于 `unwarped_mae`。
 3. 做一步完整分辨率试跑，检查数据、梯度和显存：
-   `python -B -m res.train_vtmot --device cuda --steps 1 --num-workers 0 --output-dir res_runs\a4000_local_smoke`。
+   `python -B -m res.train_vtmot --device cuda --steps 1 --num-workers 0 --output-dir res_runs/a4000_local_smoke`。
    应出现有限的 `loss`、`train_epe`、`local` 和 `peak_mem_mib`。
 4. 用新的目录训练 3000 步：
-   `python -B -m res.train_vtmot --device cuda --run full --num-workers 0 --output-dir res_runs\a4000_local_full`。
+   `python -B -m res.train_vtmot --device cuda --run full --num-workers 0 --output-dir res_runs/a4000_local_full`。
    每 100 步看 `val_epe_px`、`val_coarse_epe_px`、`val_local_window_coverage`、
    `val_pck_3px`。局部细化应使最终 EPE 低于粗场 EPE；若持续变差，先保留
    `best.pt`，再调整局部温度、半径或局部损失权重。
