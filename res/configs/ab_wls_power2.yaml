@@ -1,0 +1,3 @@
+# Same checkpoint ablation: moderate confidence weighting instead of power four.
+global_matcher:
+  affine_confidence_power: 2.0

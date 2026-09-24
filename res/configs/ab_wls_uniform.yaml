@@ -1,0 +1,3 @@
+# Same checkpoint ablation: all 1/8 matches have equal weight in affine WLS.
+global_matcher:
+  affine_confidence_power: 0.0

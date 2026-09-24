@@ -116,6 +116,27 @@ class GlobalMatcherTest(unittest.TestCase):
         self.assertTrue(torch.isfinite(ir.grad).all())
         self.assertTrue(torch.isfinite(vi.grad).all())
 
+    def test_wls_confidence_power_changes_only_affine_projection(self):
+        torch.manual_seed(8)
+        ir = torch.randn(1, 12, 8, 10)
+        vi = torch.randn_like(ir)
+        uniform = GlobalMatcher(temperature=0.12, dual_softmax=True,
+                                affine_confidence_power=0.0)
+        default = GlobalMatcher(temperature=0.12, dual_softmax=True)
+        explicit = GlobalMatcher(temperature=0.12, dual_softmax=True,
+                                 affine_confidence_power=4.0)
+        self.assertEqual(set(uniform.state_dict()), set(default.state_dict()))
+        unweighted, weighted, same = (matcher(ir, vi)
+                                      for matcher in (uniform, default, explicit))
+        self.assertTrue(torch.equal(weighted.coarse_flow, same.coarse_flow))
+        self.assertTrue(torch.equal(unweighted.matching_probability,
+                                    weighted.matching_probability))
+        self.assertTrue(torch.equal(unweighted.raw_flow, weighted.raw_flow))
+        self.assertGreater(float((unweighted.coarse_flow - weighted.coarse_flow).abs().max()),
+                           0.1)
+        with self.assertRaisesRegex(ValueError, "affine_confidence_power"):
+            GlobalMatcher(affine_confidence_power=-1.0)
+
     def test_token_guard(self):
         matcher = GlobalMatcher(max_tokens=15)
         with self.assertRaisesRegex(ValueError, "max_tokens"):

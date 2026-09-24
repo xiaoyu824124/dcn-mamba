@@ -166,6 +166,30 @@ python -B -m res.train_vtmot --device cuda --run pilot --num-workers 0 --lr 0.00
 若它漂移，先停下检查冻结开关。之后分别对两组 `best.pt` 做相同的 80 帧
 评估，只有跨尺度组的最终 EPE 和 PCK 均优于冻结控制组，才保留该模块。
 
+## 检查匹配概率到 WLS 粗场的转换
+
+冻结粗场后的 80 帧结果：跨尺度模块将局部 argmax EPE 从 19.33 px 降到
+17.35 px，但最终 EPE 仅从 6.839 px 到 6.826 px，几乎等于原权重的
+6.827 px。随后加入 1/8 原始外观窗口损失继续训练 300 步，80 帧粗场
+EPE 为 7.347 px；同学习率控制组为 7.215 px，均差于原权重的 6.843 px。
+外观窗口的排名改善也很小，因此暂不叠加更多特征模块或延长训练。
+
+全局匹配器当前用每个查询的最大匹配概率的四次方作为仿射 WLS 权重。
+新增 `affine_confidence_power` 只改变这一步的权重，不改变 Encoder、
+匹配概率或 checkpoint 参数。用同一 `control_warm_pilot/best.pt` 分别
+评估四次方（原设置）、二次方和均匀权重：
+
+```bat
+python -B -m res.evaluate_vtmot --device cuda --split eval --frame-stride 10 --checkpoint res_runs/control_warm_pilot/best.pt --output res_runs/control_warm_pilot/eval_wls_power4.json
+python -B -m res.evaluate_vtmot --device cuda --split eval --frame-stride 10 --checkpoint res_runs/control_warm_pilot/best.pt --overlay res/configs/ab_wls_power2.yaml --output res_runs/control_warm_pilot/eval_wls_power2.json
+python -B -m res.evaluate_vtmot --device cuda --split eval --frame-stride 10 --checkpoint res_runs/control_warm_pilot/best.pt --overlay res/configs/ab_wls_uniform.yaml --output res_runs/control_warm_pilot/eval_wls_uniform.json
+```
+
+先看 `affine_weight_effective_queries_ratio`：数值接近零说明拟合主要依赖
+少数点。再比较 `coarse_epe_px`、`affine_corner_epe_px` 和最终 `epe_px`。
+只有粗场与最终 EPE 都改善，才考虑更改默认权重；否则继续检查原始
+1/8 特征与 GT 对应关系。
+
 当前 `res` 分支实现如下：
 
 ```text

@@ -54,6 +54,9 @@ class GlobalMatcher(nn.Module):
             never run it on the input-resolution grid.
         spatial_prior_sigma: Optional Gaussian displacement prior in feature
             cells, applied after appearance matching. Zero disables it.
+        affine_confidence_power: Exponent on detached match confidence used by
+            affine WLS. Four reproduces the established weighting exactly;
+            zero gives an unweighted fit for a same-checkpoint ablation.
 
     Inputs:
         feature_ir: moving feature tensor ``[B,C,H8,W8]``.
@@ -66,7 +69,8 @@ class GlobalMatcher(nn.Module):
                  max_tokens: int = 0, affine_projection: bool = True,
                  affine_ridge: float = 1e-3, dual_softmax: bool = False,
                  key_log_scale: bool = False,
-                 spatial_prior_sigma: float = 0.0) -> None:
+                 spatial_prior_sigma: float = 0.0,
+                 affine_confidence_power: float = 4.0) -> None:
         super().__init__()
         if temperature <= 0:
             raise ValueError("temperature must be positive")
@@ -76,11 +80,14 @@ class GlobalMatcher(nn.Module):
             raise ValueError("affine_ridge must be non-negative")
         if spatial_prior_sigma < 0:
             raise ValueError("spatial_prior_sigma must be non-negative")
+        if affine_confidence_power < 0:
+            raise ValueError("affine_confidence_power must be non-negative")
         self.learnable_temperature = bool(learnable_temperature)
         self.return_correlation = bool(return_correlation)
         self.max_tokens = int(max_tokens)
         self.affine_projection = bool(affine_projection)
         self.affine_ridge = float(affine_ridge)
+        self.affine_confidence_power = float(affine_confidence_power)
         self.dual_softmax = bool(dual_softmax)
         # Standard deviation in 1/8 feature cells. Zero preserves all prior
         # checkpoints and the unrestricted all-pairs baseline exactly.
@@ -174,15 +181,16 @@ class GlobalMatcher(nn.Module):
             # fully differentiable back to the MIND encoder and correlation.
             # Scale weights to mean one: this leaves WLS unchanged but keeps a
             # fixed ridge numerically meaningful at diffuse initial matching.
-            # A fourth power suppresses unmatched locations (whose softmax is
+            # The default fourth power suppresses unmatched locations (whose softmax is
             # almost uniform) while retaining uniform weights when all matches
             # are initially diffuse. This prevents border-only unmatched tokens
             # from biasing an otherwise exact global translation fit.
             # Confidence chooses robust correspondences but does not receive
             # gradients through the matrix inverse. Differentiating those
-            # fourth-power weights made an almost rank-one normal matrix blow
+            # confidence weights made an almost rank-one normal matrix blow
             # up under AMP after a few hundred real VTMOT updates.
-            weights = confidence.detach().flatten(1).clamp_min(1e-8).pow(4)
+            weights = confidence.detach().flatten(1).clamp_min(1e-8).pow(
+                self.affine_confidence_power)
             weights = weights / weights.mean(dim=1, keepdim=True).clamp_min(1e-8)
             # Solve in a [-1,1] coordinate system. Pixel coordinates make the
             # affine normal matrix unnecessarily ill-conditioned on large grids.
