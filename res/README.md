@@ -148,6 +148,24 @@ python -B -m res.train_vtmot --device cuda --run pilot --num-workers 0 --lr 0.00
 先确认一步试跑的损失、梯度和显存正常，再比较两组 80 帧评估中的
 `coarse_epe_px`、`epe_px`、`local_argmax_epe_px` 与 `pck_3px`。
 
+第一次从 `control_warm_pilot/best.pt` 继续训练 1/4 模块时，两组 300 步在
+16 帧上的最佳最终 EPE 分别为 7.641 px（原局部头）和 7.645 px（跨尺度），
+几乎相同，而且均高于热启动时的 6.946 px。两组的粗场也发生明显漂移，
+因此这轮不能单独判断 1/4 模块的效果。下一轮用 `ab_freeze_coarse.yaml`
+冻结共享 Encoder、SA-CA（若启用）及全局匹配器，只更新原局部头和可选
+跨尺度模块。`--init` 现在会先在 16 帧验证集评估热启动权重，并将第 0 步
+保存为候选 `best.pt`；后续训练只有真正超过它才替换。
+
+```bat
+python -B -m res.train_vtmot --device cuda --steps 1 --num-workers 0 --lr 0.0001 --init res_runs/control_warm_pilot/best.pt --overlay res/configs/ab_freeze_coarse.yaml --overlay res/configs/stage2_fine_interaction.yaml --output-dir res_runs/fine_frozen_smoke
+python -B -m res.train_vtmot --device cuda --run pilot --num-workers 0 --lr 0.0001 --init res_runs/control_warm_pilot/best.pt --overlay res/configs/ab_freeze_coarse.yaml --output-dir res_runs/local_frozen_control_pilot
+python -B -m res.train_vtmot --device cuda --run pilot --num-workers 0 --lr 0.0001 --init res_runs/control_warm_pilot/best.pt --overlay res/configs/ab_freeze_coarse.yaml --overlay res/configs/stage2_fine_interaction.yaml --output-dir res_runs/fine_frozen_pilot
+```
+
+两组在 16 帧上的 `coarse_epe_px` 应固定在相同的热启动值（约 6.867 px）。
+若它漂移，先停下检查冻结开关。之后分别对两组 `best.pt` 做相同的 80 帧
+评估，只有跨尺度组的最终 EPE 和 PCK 均优于冻结控制组，才保留该模块。
+
 当前 `res` 分支实现如下：
 
 ```text

@@ -22,6 +22,16 @@ from .model_factory import build_global_registration
 from .vtmot import VTMOTSingleFrameDataset
 
 
+def freeze_coarse_parameters(model: torch.nn.Module) -> None:
+    """Hold the 1/8 field fixed while comparing alternative 1/4 refiners."""
+    if model.local_matcher is None:
+        raise ValueError("freeze_coarse requires an enabled local matcher")
+    model.encoder.requires_grad_(False)
+    model.matcher.requires_grad_(False)
+    if model.coarse_transformer is not None:
+        model.coarse_transformer.requires_grad_(False)
+
+
 def _save(path: Path, step: int, model: torch.nn.Module,
           optimizer: torch.optim.Optimizer, config, best_ratio: float) -> None:
     torch.save({"step": step, "model": model.state_dict(),
@@ -95,6 +105,9 @@ def main() -> None:
     eval_loader = DataLoader(eval_dataset, batch_size=int(train_config.eval_batch_size), shuffle=False,
                              num_workers=0, pin_memory=device.type == "cuda")
     model = build_global_registration(config).to(device)
+    freeze_coarse = bool(train_config.get("freeze_coarse", False))
+    if freeze_coarse:
+        freeze_coarse_parameters(model)
     loss_fn = RegistrationLoss(config.loss.weights,
                                charbonnier_eps=float(config.loss.charbonnier_eps),
                                match_focal_gamma=float(config.loss.get("match_focal_gamma", 0.0)),
@@ -102,7 +115,8 @@ def main() -> None:
                                appearance_temperature=float(config.loss.get("appearance_temperature", 0.07))
                                ).to(device)
     learning_rate = float(args.lr if args.lr is not None else train_config.lr)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate,
+    optimizer = torch.optim.AdamW((parameter for parameter in model.parameters()
+                                   if parameter.requires_grad), lr=learning_rate,
                                   weight_decay=float(train_config.weight_decay))
     amp = bool(train_config.amp and device.type == "cuda")
     scaler = torch.amp.GradScaler(device.type, enabled=amp)
@@ -146,7 +160,7 @@ def main() -> None:
     device_name = torch.cuda.get_device_name(device) if device.type == "cuda" else "CPU"
     print(f"device={device} ({device_name}) run={args.run} steps={steps} train={len(train_dataset)} "
           f"eval={len(eval_dataset)} crop={crop_hw} batch={batch_size} workers={num_workers} "
-          f"lr={learning_rate:g}")
+          f"lr={learning_rate:g} freeze_coarse={freeze_coarse}")
     best_ratio = float("inf")
     if args.resume is not None:
         best_ratio = float(checkpoint.get("best_ratio", float("inf")))
@@ -165,6 +179,18 @@ def main() -> None:
         if best_ratio == float("inf"):
             best_ratio = float(evaluate(model, eval_loader, device)["relative_epe"])
         print(f"resume: step={start_step} prior best relative EPE={best_ratio:.4f}")
+    elif args.init is not None:
+        # A fine-tuning run must not discard a better warm-start checkpoint
+        # merely because every subsequent validation becomes worse.
+        initial_validation = evaluate(model, eval_loader, device)
+        best_ratio = float(initial_validation["relative_epe"])
+        _save(output_dir / "best.pt", 0, model, optimizer, config, best_ratio)
+        with metrics_file.open("a", encoding="utf-8") as file:
+            file.write(json.dumps({"step": 0, **{f"val_{name}": value
+                                                for name, value in initial_validation.items()}}) + "\n")
+        print(f"init eval epe={initial_validation['epe_px']:.3f} "
+              f"coarse={initial_validation['coarse_epe_px']:.3f} "
+              f"ratio={best_ratio:.4f}; saved step-0 best.pt")
     # num_workers=0 draws random crops on the main process. Restore its RNG
     # after model construction, which otherwise differs across architectures.
     torch.manual_seed(int(train_config.seed))

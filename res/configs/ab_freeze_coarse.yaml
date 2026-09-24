@@ -1,0 +1,4 @@
+# Fair local-stage ablation: keep MIND/Encoder/SA-CA/global matcher/WLS fixed.
+# Only the original local matcher and optional fine interaction are trained.
+vtmot_train:
+  freeze_coarse: true

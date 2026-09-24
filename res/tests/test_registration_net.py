@@ -9,10 +9,12 @@ import unittest
 import torch
 
 from res.encoder import MINDFeatureEncoder
+from res.fine_interaction import FineScaleInteraction
 from res.global_matcher import GlobalMatcher
 from res.mind import MINDDescriptor
 from res.local_matcher import LocalMatcher
 from res.registration_net import MINDGlobalRegistration
+from res.train_vtmot import freeze_coarse_parameters
 
 
 def small_model() -> MINDGlobalRegistration:
@@ -26,6 +28,24 @@ def small_model() -> MINDGlobalRegistration:
 
 
 class MINDGlobalRegistrationTest(unittest.TestCase):
+    def test_freeze_coarse_leaves_local_refiner_trainable(self):
+        model = small_model()
+        model.matcher = GlobalMatcher(temperature=0.1, learnable_temperature=True)
+        model.fine_interaction = FineScaleInteraction(16, 12)
+        freeze_coarse_parameters(model)
+        self.assertTrue(all(not parameter.requires_grad for parameter in model.encoder.parameters()))
+        self.assertTrue(all(not parameter.requires_grad for parameter in model.matcher.parameters()))
+        self.assertTrue(all(parameter.requires_grad for parameter in model.local_matcher.parameters()))
+        self.assertTrue(all(parameter.requires_grad for parameter in model.fine_interaction.parameters()))
+        ir, vi = torch.rand(1, 1, 64, 80), torch.rand(1, 3, 64, 80)
+        before = model(ir, vi).coarse_flow.detach().clone()
+        optimizer = torch.optim.AdamW((parameter for parameter in model.parameters()
+                                       if parameter.requires_grad), lr=1e-3)
+        model(ir, vi).final_flow.square().mean().backward()
+        optimizer.step()
+        after = model(ir, vi).coarse_flow.detach()
+        self.assertTrue(torch.equal(before, after))
+
     def test_output_shapes_finiteness_and_gradient(self):
         torch.manual_seed(17)
         model = small_model()
