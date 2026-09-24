@@ -251,6 +251,23 @@ python -B -m res.evaluate_vtmot --device cuda --split eval --frame-stride 10 --c
 若 oracle 很好而 soft 很差，应优先改 1/4 特征或匹配目标；若 soft
 已经好而最终场仍无增益，应检查残差头训练与输出方式。
 
+80 帧结果：窗口覆盖率 1.000，oracle EPE 1.506 px；当前 1/4 匹配的
+argmax EPE 19.333 px，概率加权位移 EPE 7.260 px，比粗场在 1/4 网格
+上的 6.857 px 还高。局部头平均只修正 0.592 px，只有 35.0% 的查询
+改善。首先需要改善窗口内候选的区分能力，而不是扩大窗口或叠加 DCN。
+
+同一 checkpoint 可比较 1/4 Encoder 特征与原始 MIND 描述子。评估时将
+MIND 平均池化到 1/4 网格，使用完全相同的粗场、候选窗口和局部温度；
+仅比较候选 argmax 和概率加权位移，原模型最终 EPE 不变：
+
+```bat
+python -B -m res.evaluate_vtmot --device cuda --split eval --frame-stride 10 --checkpoint res_runs/control_warm_pilot/best.pt --diagnose-local-mind --output res_runs/control_warm_pilot/eval_local_mind.json
+```
+
+若 `mind_local_argmax_epe_px` 和 `mind_local_soft_epe_px` 均显著低于
+Encoder 对应指标，再考虑把 MIND 直通特征送入专门的 1/4 局部分支；
+若 MIND 也差，则优先改局部描述子的监督和采样方式。
+
 当前 `res` 分支实现如下：
 
 ```text
