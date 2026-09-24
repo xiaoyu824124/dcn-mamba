@@ -137,6 +137,25 @@ class GlobalMatcherTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "affine_confidence_power"):
             GlobalMatcher(affine_confidence_power=-1.0)
 
+    def test_wls_border_margin_changes_only_affine_projection(self):
+        torch.manual_seed(12)
+        ir = torch.randn(1, 12, 8, 10)
+        vi = torch.randn_like(ir)
+        full = GlobalMatcher(temperature=0.12, dual_softmax=True)
+        interior = GlobalMatcher(temperature=0.12, dual_softmax=True,
+                                 affine_border_margin=1)
+        self.assertEqual(set(full.state_dict()), set(interior.state_dict()))
+        original, trimmed = full(ir, vi), interior(ir, vi)
+        self.assertTrue(torch.equal(original.matching_probability,
+                                    trimmed.matching_probability))
+        self.assertTrue(torch.equal(original.raw_flow, trimmed.raw_flow))
+        self.assertGreater(float((original.coarse_flow - trimmed.coarse_flow).abs().max()),
+                           0.1)
+        with self.assertRaisesRegex(ValueError, "affine_border_margin"):
+            GlobalMatcher(affine_border_margin=-1)
+        with self.assertRaisesRegex(ValueError, "affine_border_margin"):
+            GlobalMatcher(affine_border_margin=4)(ir, vi)
+
     def test_token_guard(self):
         matcher = GlobalMatcher(max_tokens=15)
         with self.assertRaisesRegex(ValueError, "max_tokens"):

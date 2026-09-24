@@ -268,7 +268,8 @@ def matching_diagnostics(probability: torch.Tensor, feature_hw: Tuple[int, int],
                          flow: torch.Tensor,
                          valid_mask: torch.Tensor | None = None,
                          appearance_scores: torch.Tensor | None = None,
-                         affine_confidence_power: float | None = None) -> Dict[str, float]:
+                         affine_confidence_power: float | None = None,
+                         affine_border_margin: int = 0) -> Dict[str, float]:
     """How the ground-truth match ranks against every competing key.
 
     ``match_frac_keys_beating_gt`` is a tie-aware rank fraction: ``0`` means
@@ -319,15 +320,24 @@ def matching_diagnostics(probability: torch.Tensor, feature_hw: Tuple[int, int],
     if affine_confidence_power is not None:
         if affine_confidence_power < 0:
             raise ValueError("affine_confidence_power must be non-negative")
-        weights = top2[..., 0].clamp_min(1e-8).pow(affine_confidence_power)
-        total_weight = weights.sum(dim=-1).clamp_min(1e-20)
-        valid_weights = weights * mask
+        if affine_border_margin < 0 or affine_border_margin * 2 >= min(feature_hw):
+            raise ValueError("affine_border_margin leaves no interior queries")
+        wls_weights = top2[..., 0].clamp_min(1e-8).pow(affine_confidence_power)
+        if affine_border_margin:
+            margin = affine_border_margin
+            interior = ((coordinates[:, 0] >= margin)
+                        & (coordinates[:, 0] < int(feature_hw[0]) - margin)
+                        & (coordinates[:, 1] >= margin)
+                        & (coordinates[:, 1] < int(feature_hw[1]) - margin))
+            wls_weights = wls_weights * interior.to(wls_weights.dtype).unsqueeze(0)
+        total_weight = wls_weights.sum(dim=-1).clamp_min(1e-20)
+        valid_weights = wls_weights * mask
         valid_weight = valid_weights.sum(dim=-1).clamp_min(1e-20)
         raw_error = torch.linalg.vector_norm((expected_flow - gt_flow) * stride,
                                               dim=-1)
         report["affine_weight_effective_queries_ratio"] = float((
             total_weight.square() /
-            (dense.shape[-1] * weights.square().sum(dim=-1).clamp_min(1e-20))).mean())
+            (dense.shape[-1] * wls_weights.square().sum(dim=-1).clamp_min(1e-20))).mean())
         report["affine_weight_valid_fraction"] = float(
             (valid_weight / total_weight).mean())
         report["affine_weighted_raw_epe_px"] = float(
@@ -340,7 +350,7 @@ def matching_diagnostics(probability: torch.Tensor, feature_hw: Tuple[int, int],
         scale = coordinates.new_tensor((max((int(feature_hw[0]) - 1) / 2, 1.0),
                                         max((int(feature_hw[1]) - 1) / 2, 1.0)))
         normalized = (coordinates - center) / scale
-        normalized_weights = weights / total_weight.unsqueeze(-1)
+        normalized_weights = wls_weights / total_weight.unsqueeze(-1)
         weighted_center = torch.einsum("bn,nc->bc", normalized_weights, normalized)
         offset = normalized.unsqueeze(0) - weighted_center.unsqueeze(1)
         covariance = torch.einsum("bn,bnc,bnd->bcd", normalized_weights,

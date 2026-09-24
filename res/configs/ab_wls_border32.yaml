@@ -1,0 +1,3 @@
+# Same-checkpoint WLS ablation: ignore the outer four 1/8 cells (about 32 px).
+global_matcher:
+  affine_border_margin: 4

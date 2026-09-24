@@ -209,6 +209,26 @@ python -B -m res.evaluate_vtmot --device cuda --split eval --frame-stride 10 --c
 空间分布高度聚集，先检查仿射拟合的几何覆盖与稳定性。若有效区域权重
 比例低，则先修正 WLS 对无效查询的处理。
 
+实测四次方 WLS 的加权软匹配误差为 11.65 px，经过仿射拟合后粗场为
+6.84 px；空间分布比例为 1.60，没有集中在一条窄带。但只有 47.7% 的
+WLS 权重对应 GT 在图内的查询。`valid_mask` 在当前 VTMOT 读取器中仅由
+GT 映射坐标是否落在图内决定；生成 `visible_mis` 时图像边界使用复制填充。
+这提示边界复制纹理可能产生高置信伪匹配，尚需同权重实验验证。
+
+`affine_border_margin` 只在仿射 WLS 拟合时排除 VI 查询网格的外圈，不改
+MIND、Encoder、全局匹配概率或局部头，也不需重训。默认 0 保持原行为。
+对 60×80 的 1/8 网格，下面两个配置分别排除约 16 px 和 32 px：
+
+```bat
+python -B -m res.evaluate_vtmot --device cuda --split eval --frame-stride 10 --checkpoint res_runs/control_warm_pilot/best.pt --overlay res/configs/ab_wls_border16.yaml --output res_runs/control_warm_pilot/eval_wls_border16.json
+python -B -m res.evaluate_vtmot --device cuda --split eval --frame-stride 10 --checkpoint res_runs/control_warm_pilot/best.pt --overlay res/configs/ab_wls_border32.yaml --output res_runs/control_warm_pilot/eval_wls_border32.json
+```
+
+比较 `affine_weight_valid_fraction`、`affine_weight_effective_queries_ratio`、
+`affine_weight_spread_ratio`、粗场 EPE 与最终 EPE。只有有效权重比例和
+配准误差都改善，才保留边界屏蔽；若比例升高但 EPE 变差，说明被排除
+的点中仍有关键的可靠匹配。
+
 当前 `res` 分支实现如下：
 
 ```text

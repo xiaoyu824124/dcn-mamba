@@ -57,6 +57,8 @@ class GlobalMatcher(nn.Module):
         affine_confidence_power: Exponent on detached match confidence used by
             affine WLS. Four reproduces the established weighting exactly;
             zero gives an unweighted fit for a same-checkpoint ablation.
+        affine_border_margin: Number of outer 1/8 feature cells excluded from
+            affine WLS. Zero preserves the established full-frame fit.
 
     Inputs:
         feature_ir: moving feature tensor ``[B,C,H8,W8]``.
@@ -70,7 +72,8 @@ class GlobalMatcher(nn.Module):
                  affine_ridge: float = 1e-3, dual_softmax: bool = False,
                  key_log_scale: bool = False,
                  spatial_prior_sigma: float = 0.0,
-                 affine_confidence_power: float = 4.0) -> None:
+                 affine_confidence_power: float = 4.0,
+                 affine_border_margin: int = 0) -> None:
         super().__init__()
         if temperature <= 0:
             raise ValueError("temperature must be positive")
@@ -82,12 +85,15 @@ class GlobalMatcher(nn.Module):
             raise ValueError("spatial_prior_sigma must be non-negative")
         if affine_confidence_power < 0:
             raise ValueError("affine_confidence_power must be non-negative")
+        if affine_border_margin < 0:
+            raise ValueError("affine_border_margin must be non-negative")
         self.learnable_temperature = bool(learnable_temperature)
         self.return_correlation = bool(return_correlation)
         self.max_tokens = int(max_tokens)
         self.affine_projection = bool(affine_projection)
         self.affine_ridge = float(affine_ridge)
         self.affine_confidence_power = float(affine_confidence_power)
+        self.affine_border_margin = int(affine_border_margin)
         self.dual_softmax = bool(dual_softmax)
         # Standard deviation in 1/8 feature cells. Zero preserves all prior
         # checkpoints and the unrestricted all-pairs baseline exactly.
@@ -175,6 +181,8 @@ class GlobalMatcher(nn.Module):
         raw_flow = raw_flow_yx.transpose(1, 2).reshape(batch, 2, height, width)
         confidence = probability.amax(dim=-1).reshape(batch, 1, height, width)
         if self.affine_projection:
+            if self.affine_border_margin * 2 >= min(height, width):
+                raise ValueError("affine_border_margin leaves no interior queries")
             # VTMOT's injected misalignment is affine.  Fitting the entire
             # all-pairs correspondence field to six parameters makes that
             # dataset prior explicit, rejects local soft-argmax noise and is
@@ -191,7 +199,18 @@ class GlobalMatcher(nn.Module):
             # up under AMP after a few hundred real VTMOT updates.
             weights = confidence.detach().flatten(1).clamp_min(1e-8).pow(
                 self.affine_confidence_power)
-            weights = weights / weights.mean(dim=1, keepdim=True).clamp_min(1e-8)
+            if self.affine_border_margin:
+                margin = self.affine_border_margin
+                interior = ((coordinates[:, 0] >= margin)
+                            & (coordinates[:, 0] < height - margin)
+                            & (coordinates[:, 1] >= margin)
+                            & (coordinates[:, 1] < width - margin))
+                weights = weights * interior.to(weights.dtype).unsqueeze(0)
+            # The interior ablation can remove the strongest border queries;
+            # keep the nonzero weights at the same mean scale as the baseline
+            # so the fixed ridge does not become a second changing variable.
+            floor = 1e-20 if self.affine_border_margin else 1e-8
+            weights = weights / weights.mean(dim=1, keepdim=True).clamp_min(floor)
             # Solve in a [-1,1] coordinate system. Pixel coordinates make the
             # affine normal matrix unnecessarily ill-conditioned on large grids.
             center = coordinates.new_tensor(((height - 1) / 2, (width - 1) / 2))

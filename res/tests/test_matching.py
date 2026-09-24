@@ -156,6 +156,13 @@ class MatchingDiagnosticsTest(unittest.TestCase):
         self.assertAlmostEqual(report["appearance_frac_keys_beating_gt"],
                                0.5 * (79 / 80), places=4)
         self.assertGreater(report["appearance_epe_argmax_px"], 0.0)
+        combined = matching_diagnostics(
+            probability, (8, 10), flow, appearance_scores=appearance,
+            affine_confidence_power=4.0, affine_border_margin=1)
+        self.assertAlmostEqual(combined["appearance_frac_keys_beating_gt"],
+                               report["appearance_frac_keys_beating_gt"], places=5)
+        self.assertAlmostEqual(combined["appearance_epe_argmax_px"],
+                               report["appearance_epe_argmax_px"], places=5)
 
     def test_affine_support_diagnostics_detect_single_trusted_query(self):
         flow = constant_flow(1, 64, 80, 0.0, 0.0)
@@ -177,6 +184,12 @@ class MatchingDiagnosticsTest(unittest.TestCase):
         self.assertLess(sparse["affine_weight_spread_ratio"], 0.05)
         self.assertLess(sparse["affine_weighted_raw_epe_px"],
                         flat["affine_weighted_raw_epe_px"])
+        trimmed = matching_diagnostics(uniform, (8, 10), flow,
+                                       affine_confidence_power=4.0,
+                                       affine_border_margin=1)
+        self.assertLess(trimmed["affine_weight_effective_queries_ratio"], 1.0)
+        self.assertAlmostEqual(trimmed["affine_weight_valid_fraction"], 1.0,
+                               places=5)
 
     def test_metrics_are_finite_under_cuda(self):
         if not torch.cuda.is_available():

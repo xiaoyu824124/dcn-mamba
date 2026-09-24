@@ -77,7 +77,8 @@ def evaluate(model: torch.nn.Module, loader: DataLoader, device: torch.device) -
                 output.match.matching_probability,
                 tuple(output.match.coarse_flow.shape[-2:]), target, valid,
                 appearance_scores=output.match.correlation,
-                affine_confidence_power=model.matcher.affine_confidence_power)
+                affine_confidence_power=model.matcher.affine_confidence_power,
+                affine_border_margin=model.matcher.affine_border_margin)
             for radius in (2, 4):
                 diagnostics.update(windowed_diagnostics(
                     output.match.matching_probability,
