@@ -1,0 +1,4 @@
+# Soft 1/8 displacement prior: sigma=4 feature cells = 32 input pixels.
+# This adds no parameters, so evaluate_vtmot can apply it to an existing best.pt.
+global_matcher:
+  spatial_prior_sigma: 4.0

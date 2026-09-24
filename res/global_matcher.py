@@ -52,6 +52,8 @@ class GlobalMatcher(nn.Module):
         max_tokens: Optional safety limit for ``N=H*W`` at this scale.  Zero
             disables the guard.  Global matching must remain at 1/8 or lower;
             never run it on the input-resolution grid.
+        spatial_prior_sigma: Optional Gaussian displacement prior in feature
+            cells, applied after appearance matching. Zero disables it.
 
     Inputs:
         feature_ir: moving feature tensor ``[B,C,H8,W8]``.
@@ -63,7 +65,8 @@ class GlobalMatcher(nn.Module):
                  return_correlation: bool = True,
                  max_tokens: int = 0, affine_projection: bool = True,
                  affine_ridge: float = 1e-3, dual_softmax: bool = False,
-                 key_log_scale: bool = False) -> None:
+                 key_log_scale: bool = False,
+                 spatial_prior_sigma: float = 0.0) -> None:
         super().__init__()
         if temperature <= 0:
             raise ValueError("temperature must be positive")
@@ -71,12 +74,17 @@ class GlobalMatcher(nn.Module):
             raise ValueError("max_tokens must be non-negative")
         if affine_ridge < 0:
             raise ValueError("affine_ridge must be non-negative")
+        if spatial_prior_sigma < 0:
+            raise ValueError("spatial_prior_sigma must be non-negative")
         self.learnable_temperature = bool(learnable_temperature)
         self.return_correlation = bool(return_correlation)
         self.max_tokens = int(max_tokens)
         self.affine_projection = bool(affine_projection)
         self.affine_ridge = float(affine_ridge)
         self.dual_softmax = bool(dual_softmax)
+        # Standard deviation in 1/8 feature cells. Zero preserves all prior
+        # checkpoints and the unrestricted all-pairs baseline exactly.
+        self.spatial_prior_sigma = float(spatial_prior_sigma)
         # LoFTR-style per-key learnable scale.  Only created when requested, so
         # disabling it leaves the state dict (and older checkpoints) unchanged;
         # warm-starting from such a checkpoint leaves exp(0)=1, i.e. neutral.
@@ -125,7 +133,24 @@ class GlobalMatcher(nn.Module):
             key_ir = key_ir * self.log_scale.exp()
         correlation = torch.bmm(query_vi, key_ir)  # [B, N_vi, N_ir]
         scaled = correlation / self.temperature.float()
-        if self.dual_softmax:
+        if self.spatial_prior_sigma > 0:
+            # A soft displacement prior suppresses distant false matches while
+            # leaving all keys available. Apply it *after* appearance-only
+            # dual softmax: including it in the column normaliser would give
+            # border keys an artificial advantage over interior keys.
+            logits = torch.log_softmax(scaled, dim=-1)
+            if self.dual_softmax:
+                logits = logits + torch.log_softmax(scaled, dim=-2)
+            y = torch.arange(height, device=logits.device, dtype=logits.dtype)
+            x = torch.arange(width, device=logits.device, dtype=logits.dtype)
+            denominator = 2.0 * self.spatial_prior_sigma ** 2
+            y_bias = -(y[:, None] - y[None, :]).square() / denominator
+            x_bias = -(x[:, None] - x[None, :]).square() / denominator
+            logits_grid = logits.view(batch, height, width, height, width)
+            logits_grid.add_(y_bias.view(1, height, 1, height, 1))
+            logits_grid.add_(x_bias.view(1, 1, width, 1, width))
+            probability = torch.softmax(logits, dim=-1)
+        elif self.dual_softmax:
             # Normalising both directions suppresses "hub" keys that are similar
             # to every query -- the dominant failure mode of a single softmax
             # over thousands of cross-modal keys.  Renormalising rows keeps the

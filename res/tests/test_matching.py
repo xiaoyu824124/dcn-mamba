@@ -123,6 +123,17 @@ class MatchingDiagnosticsTest(unittest.TestCase):
         self.assertAlmostEqual(report["match_effective_keys_ratio"], 1.0, places=4)
         self.assertAlmostEqual(report["match_top1_top2_logit_gap"], 0.0, places=4)
 
+    def test_appearance_rank_separates_feature_quality_from_probability_prior(self):
+        probability = torch.eye(80).unsqueeze(0)
+        appearance = torch.zeros(1, 80, 80)
+        flow = constant_flow(1, 64, 80, 0.0, 0.0)
+        report = matching_diagnostics(probability, (8, 10), flow,
+                                      appearance_scores=appearance)
+        self.assertLess(report["match_frac_keys_beating_gt"], 1e-4)
+        self.assertAlmostEqual(report["appearance_frac_keys_beating_gt"],
+                               0.5 * (79 / 80), places=4)
+        self.assertGreater(report["appearance_epe_argmax_px"], 0.0)
+
     def test_metrics_are_finite_under_cuda(self):
         if not torch.cuda.is_available():
             self.skipTest("CUDA is unavailable")

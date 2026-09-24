@@ -62,6 +62,30 @@ python -B -m res.evaluate_vtmot --device cuda --split eval --frame-stride 10 --c
 `match_frac_keys_beating_gt`、`match_epe_argmax_px` 和峰值显存；若注意力
 改善匹配但 WLS 粗场仍不改善，再检查置信度权重和仿射拟合。
 
+## 阶段 2：检验 1/8 远距离错配
+
+A4000 的 1500 步局部实验在 80 帧验证集上得到粗场 EPE 7.18 px，
+但全局匹配 argmax EPE 仍为 160.5 px。新增可选软位置先验，
+`spatial_prior_sigma=4` 表示 1/8 特征格上的标准差为 4 格，即图像上的
+32 px；所有位置仍参与匹配。本地抽样的验证集 GT 角点位移 99% 不超过
+约 21 px，因此先从较宽的 32 px 先验试起。这个开关不增加权重，
+可在相同 checkpoint 上直接比较打开前后，无需先训练：
+
+```bat
+git pull origin main
+python -B -m unittest discover -s res/tests -t .
+python -B -m res.evaluate_vtmot --device cuda --split eval --frame-stride 10 --checkpoint res_runs/local_from_coarse_pilot/best.pt --overlay res/configs/ab_spatial_prior32.yaml --diagnose-appearance --output res_runs/local_from_coarse_pilot/eval_prior32_stride10.json
+```
+
+将新报告与已保存的 `eval_stride10_step1500.json` 对照，优先看
+`coarse_epe_px`、`match_epe_argmax_px`、`match_frac_keys_beating_gt`、
+`pck_3px` 和 `epe_px`。新增的 `appearance_frac_keys_beating_gt` 与
+`appearance_epe_argmax_px` 只看 Encoder 的原始余弦分数，不包含位置先验，
+用于判断特征是否真的找到 GT。若粗场 EPE 未改善，先分析特征和 GT 对应点的相似度，
+不要仅凭概率分布变集中就增加训练步数。`--overlay` 评估时仍严格加载原权重，
+适用于这类不改变参数形状的开关；`--diagnose-appearance` 会暂时多保留一张
+4800×4800 的分数矩阵，适合评估，不要用于训练。
+
 后续阶段依次为：1/4 的粗场中心局部窗口与轻量 FSFT、1/2 小范围残差修正，
 最后才评估 DCN 亚像素修正。CRFT 的 `fine_process` 使用窗口展开后的注意力，
 在 480×640 上需改为逐窗口或分块计算；不能直接复制全序列实现。

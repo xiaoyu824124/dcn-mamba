@@ -75,7 +75,8 @@ def evaluate(model: torch.nn.Module, loader: DataLoader, device: torch.device) -
         if output.match is not None:
             diagnostics = matching_diagnostics(
                 output.match.matching_probability,
-                tuple(output.match.coarse_flow.shape[-2:]), target, valid)
+                tuple(output.match.coarse_flow.shape[-2:]), target, valid,
+                appearance_scores=output.match.correlation)
             for radius in (2, 4):
                 diagnostics.update(windowed_diagnostics(
                     output.match.matching_probability,
@@ -110,6 +111,10 @@ def main() -> None:
     parser.add_argument("--split", choices=("train", "eval", "test"), default="eval",
                         help="use eval while tuning; reserve test for one final report")
     parser.add_argument("--checkpoint", type=Path, default=None)
+    parser.add_argument("--overlay", type=Path, action="append", default=[],
+                        help="parameter-free config overlay for a same-checkpoint ablation")
+    parser.add_argument("--diagnose-appearance", action="store_true",
+                        help="also rank raw cosine matches, before dual softmax or spatial prior")
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--frame-stride", type=int, default=10)
@@ -139,10 +144,15 @@ def main() -> None:
         if args.checkpoint is None:
             raise SystemExit("--checkpoint is required unless --check-gt is used")
         checkpoint = torch.load(args.checkpoint, map_location=device, weights_only=True)
-        config = OmegaConf.create(checkpoint["config"])
+        config = OmegaConf.merge(OmegaConf.create(checkpoint["config"]),
+                                 *(OmegaConf.load(path) for path in args.overlay))
         model = build_global_registration(config).to(device)
         model.load_state_dict(checkpoint["model"], strict=True)
+        if args.diagnose_appearance:
+            model.matcher.return_correlation = True
         report = evaluate(model, loader, device)
+        if args.overlay:
+            report["evaluation_overlays"] = [str(path) for path in args.overlay]
         report["field_of_view_hw"] = list(fov)
         # Beating zero flow only means "not worse than doing nothing".  A field
         # this coarse still ghosts under fusion, so report readiness explicitly

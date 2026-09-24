@@ -217,7 +217,8 @@ def windowed_diagnostics(probability: torch.Tensor, feature_hw: Tuple[int, int],
 @torch.no_grad()
 def matching_diagnostics(probability: torch.Tensor, feature_hw: Tuple[int, int],
                          flow: torch.Tensor,
-                         valid_mask: torch.Tensor | None = None) -> Dict[str, float]:
+                         valid_mask: torch.Tensor | None = None,
+                         appearance_scores: torch.Tensor | None = None) -> Dict[str, float]:
     """How the ground-truth match ranks against every competing key.
 
     ``match_frac_keys_beating_gt`` is a tie-aware rank fraction: ``0`` means
@@ -254,7 +255,7 @@ def matching_diagnostics(probability: torch.Tensor, feature_hw: Tuple[int, int],
     tied = (dense == target_probability.unsqueeze(-1)).to(dense.dtype).sum(dim=-1)
     rank_fraction = ((higher + 0.5 * (tied - 1).clamp_min(0)) / dense.shape[-1]).clamp_max(1)
 
-    return {
+    report = {
         "match_frac_keys_beating_gt": masked(rank_fraction),
         "match_epe_argmax_px": masked(
             torch.linalg.vector_norm((argmax_flow - gt_flow) * stride, dim=-1)),
@@ -265,3 +266,17 @@ def matching_diagnostics(probability: torch.Tensor, feature_hw: Tuple[int, int],
             top2[..., 0].clamp_min(1e-12).log() - top2[..., 1].clamp_min(1e-12).log()),
         "match_effective_keys_ratio": masked(entropy.exp() / dense.shape[-1]),
     }
+    if appearance_scores is not None:
+        if appearance_scores.shape != probability.shape:
+            raise ValueError("appearance_scores must match probability shape")
+        appearance = appearance_scores.detach().float()
+        gt_score = (appearance.gather(2, indices) * weights).sum(dim=-1)
+        higher = (appearance > gt_score.unsqueeze(-1)).to(dense.dtype).sum(dim=-1)
+        tied = (appearance == gt_score.unsqueeze(-1)).to(dense.dtype).sum(dim=-1)
+        appearance_rank = ((higher + 0.5 * (tied - 1).clamp_min(0))
+                           / appearance.shape[-1]).clamp_max(1)
+        appearance_argmax = coordinates[appearance.argmax(dim=-1)] - reference
+        report["appearance_frac_keys_beating_gt"] = masked(appearance_rank)
+        report["appearance_epe_argmax_px"] = masked(
+            torch.linalg.vector_norm((appearance_argmax - gt_flow) * stride, dim=-1))
+    return report

@@ -81,6 +81,41 @@ class GlobalMatcherTest(unittest.TestCase):
         self.assertTrue(torch.allclose(plain(ir, vi).matching_probability,
                                        scaled(ir, vi).matching_probability, atol=1e-6))
 
+    def test_soft_spatial_prior_suppresses_distant_ties_without_new_weights(self):
+        # Every cosine score is identical. The optional prior should select
+        # the same location while retaining a normalised all-pairs matrix.
+        ir = torch.ones(1, 4, 8, 10)
+        vi = ir.clone()
+        baseline = GlobalMatcher(dual_softmax=True, affine_projection=False)
+        prior = GlobalMatcher(dual_softmax=True, affine_projection=False,
+                              spatial_prior_sigma=4.0)
+        self.assertEqual(set(baseline.state_dict()), set(prior.state_dict()))
+        output = prior(ir, vi)
+        indices = output.matching_probability.argmax(dim=-1)
+        self.assertTrue(torch.equal(indices[0], torch.arange(80)))
+        self.assertTrue(torch.allclose(output.matching_probability.sum(-1),
+                                       torch.ones(1, 80), atol=1e-6))
+        self.assertGreater(float(output.matching_probability[0, 11, 11]),
+                           float(output.matching_probability[0, 11, 79]))
+
+    def test_spatial_prior_keeps_a_distinct_match_five_cells_away(self):
+        ir, vi, valid = translated_unique_features(16, 17, 5, -4)
+        matcher = GlobalMatcher(temperature=0.01, affine_projection=False,
+                                spatial_prior_sigma=4.0)
+        output = matcher(ir, vi)
+        picked = output.matching_probability.argmax(dim=-1).reshape(16, 17)[valid]
+        yy, xx = torch.meshgrid(torch.arange(16), torch.arange(17), indexing="ij")
+        expected = ((yy + 5) * 17 + xx - 4)[valid]
+        self.assertTrue(torch.equal(picked, expected))
+
+    def test_spatial_prior_gradients_are_finite(self):
+        ir = torch.randn(1, 8, 8, 10, requires_grad=True)
+        vi = torch.randn(1, 8, 8, 10, requires_grad=True)
+        output = GlobalMatcher(dual_softmax=True, spatial_prior_sigma=4.0)(ir, vi)
+        output.coarse_flow.square().mean().backward()
+        self.assertTrue(torch.isfinite(ir.grad).all())
+        self.assertTrue(torch.isfinite(vi.grad).all())
+
     def test_token_guard(self):
         matcher = GlobalMatcher(max_tokens=15)
         with self.assertRaisesRegex(ValueError, "max_tokens"):
