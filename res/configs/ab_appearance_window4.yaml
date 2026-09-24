@@ -1,0 +1,10 @@
+# Fine-tune the 1/8 encoder with raw cosine supervision in a GT-centred 9x9
+# feature-grid window. No spatial prior is applied to inference.
+global_matcher:
+  return_correlation: true
+
+loss:
+  appearance_window_radius: 4
+  appearance_temperature: 0.07
+  weights:
+    appearance: 1.0

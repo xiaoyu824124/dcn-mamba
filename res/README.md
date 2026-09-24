@@ -105,6 +105,49 @@ python -B -m res.evaluate_vtmot --device cuda --split eval --frame-stride 10 --c
 最后才评估 DCN 亚像素修正。CRFT 的 `fine_process` 使用窗口展开后的注意力，
 在 480×640 上需改为逐窗口或分块计算；不能直接复制全序列实现。
 
+## 下一轮结构对照：SA-CA 与 1/4 跨尺度特征
+
+64 px 先验的 80 帧对照粗场 EPE 为 7.25 px、最终 EPE 为 7.37 px，
+仍未优于无先验的 7.18/7.26 px。原始外观分数在粗场附近的 ±2 格窗口内，
+真实对应点仅约 36.8% 的查询排第一。因此先停止扩大先验，检查特征学习。
+
+`ab_saca_full.yaml` 在已训练的 Encoder 与 1/8 全局匹配器之间插入 SA-CA，
+保留已训练的局部头。SA-CA 的残差增益从零初始化，所以热启动第一步仍与
+原权重输出一致。此前从零训练 300 步的 SA-CA 对照未见收益，这次验证的是
+已训练权重上继续学习的效果。`stage2_fine_interaction.yaml` 在 1/4 局部匹配前添加共享的
+IR/VI 投影及各自的 1/8→1/4 上采样上下文融合；其残差增益也从零开始。
+全局匹配器、WLS、局部匹配器及其坐标约定不变。当前 `res` 单帧入口尚未接
+DCN；原有 `src/model/registration/dcn_refinement.py` 保留，待单帧粗细场达到
+精度门槛后再评估接入，避免 DCN 掩盖上游误差。
+
+先用相同权重、数据顺序、学习率和步数做有无 SA-CA 对照：
+
+```bat
+python -B -m res.train_vtmot --device cuda --run pilot --num-workers 0 --lr 0.0001 --init res_runs/local_from_coarse_pilot/best.pt --output-dir res_runs/control_warm_pilot
+python -B -m res.train_vtmot --device cuda --run pilot --num-workers 0 --lr 0.0001 --init res_runs/local_from_coarse_pilot/best.pt --overlay res/configs/ab_saca_full.yaml --output-dir res_runs/saca_warm_pilot
+python -B -m res.evaluate_vtmot --device cuda --split eval --frame-stride 10 --checkpoint res_runs/control_warm_pilot/best.pt --diagnose-appearance --output res_runs/control_warm_pilot/eval_stride10.json
+python -B -m res.evaluate_vtmot --device cuda --split eval --frame-stride 10 --checkpoint res_runs/saca_warm_pilot/best.pt --diagnose-appearance --output res_runs/saca_warm_pilot/eval_stride10.json
+```
+
+比较 `coarse_epe_px`、`epe_px`、`appearance_window2_argmax_correct` 和
+`appearance_window4_argmax_correct`。只有 SA-CA 至少改善外观判别力且不损害
+粗场 EPE，才以其 `best.pt` 为起点测试 1/4 跨尺度模块。独立的
+`ab_appearance_window4.yaml` 可为两组训练同时增加不含位置先验的局部外观
+监督；不要只给其中一组开启。该损失会额外保留全局相关矩阵，先做一步显存
+试跑，再决定是否用于完整训练。
+
+若 SA-CA 对照通过，再从同一 SA-CA 权重测试 1/4 投影与跨尺度融合；两组
+都显式加载 SA-CA 配置，因为 `--init` 只导入权重，不导入模型结构配置：
+
+```bat
+python -B -m res.train_vtmot --device cuda --steps 1 --num-workers 0 --lr 0.0001 --init res_runs/saca_warm_pilot/best.pt --overlay res/configs/ab_saca_full.yaml --overlay res/configs/stage2_fine_interaction.yaml --output-dir res_runs/fine_interaction_smoke
+python -B -m res.train_vtmot --device cuda --run pilot --num-workers 0 --lr 0.0001 --init res_runs/saca_warm_pilot/best.pt --overlay res/configs/ab_saca_full.yaml --output-dir res_runs/local_saca_control_pilot
+python -B -m res.train_vtmot --device cuda --run pilot --num-workers 0 --lr 0.0001 --init res_runs/saca_warm_pilot/best.pt --overlay res/configs/ab_saca_full.yaml --overlay res/configs/stage2_fine_interaction.yaml --output-dir res_runs/fine_interaction_pilot
+```
+
+先确认一步试跑的损失、梯度和显存正常，再比较两组 80 帧评估中的
+`coarse_epe_px`、`epe_px`、`local_argmax_epe_px` 与 `pck_3px`。
+
 当前 `res` 分支实现如下：
 
 ```text

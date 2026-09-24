@@ -1,0 +1,8 @@
+# Warm-start ablation on the trained full coarse-to-fine checkpoint.
+# Inserts SA-CA immediately before the unchanged 1/8 global matcher, while
+# retaining the existing 1/4 local matcher and its weights.
+coarse_transformer:
+  enabled: true
+  num_layers: 2
+  num_heads: 4
+  ffn_ratio: 2

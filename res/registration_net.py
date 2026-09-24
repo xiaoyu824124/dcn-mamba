@@ -9,6 +9,7 @@ import torch.nn.functional as F
 
 from .encoder import MINDFeatureEncoder
 from .coarse_transformer import CoarseSACATransformer
+from .fine_interaction import FineScaleInteraction
 from .global_matcher import GlobalMatchOutput, GlobalMatcher
 from .local_matcher import LocalMatchOutput, LocalMatcher
 from .mind import MINDDescriptor, paired_mind
@@ -51,7 +52,8 @@ class MINDGlobalRegistration(nn.Module):
                  encoder: MINDFeatureEncoder | None = None,
                  matcher: GlobalMatcher | None = None,
                  local_matcher: LocalMatcher | None = None,
-                 coarse_transformer: CoarseSACATransformer | None = None) -> None:
+                 coarse_transformer: CoarseSACATransformer | None = None,
+                 fine_interaction: FineScaleInteraction | None = None) -> None:
         super().__init__()
         self.mind = mind if mind is not None else MINDDescriptor()
         self.encoder = (encoder if encoder is not None else
@@ -59,6 +61,7 @@ class MINDGlobalRegistration(nn.Module):
         self.matcher = matcher if matcher is not None else GlobalMatcher()
         self.local_matcher = local_matcher
         self.coarse_transformer = coarse_transformer
+        self.fine_interaction = fine_interaction
         if self.encoder.in_channels != self.mind.channels:
             raise ValueError(
                 "encoder input channels must equal MIND channels: "
@@ -99,13 +102,16 @@ class MINDGlobalRegistration(nn.Module):
         final_flow = None
         final_aligned_ir = None
         if self.local_matcher is not None:
-            feature_hw = features_ir["1/4"].shape[-2:]
+            fine_ir, fine_vi = features_ir["1/4"], features_vi["1/4"]
+            if self.fine_interaction is not None:
+                fine_ir, fine_vi = self.fine_interaction(
+                    fine_ir, fine_vi, coarse_ir, coarse_vi)
+            feature_hw = fine_ir.shape[-2:]
             stride_4 = coarse_flow.new_tensor((height / feature_hw[0],
                                                width / feature_hw[1])).view(1, 2, 1, 1)
             coarse_flow_4 = F.interpolate(coarse_flow, size=feature_hw,
                                           mode="bilinear", align_corners=False) / stride_4
-            local_match = self.local_matcher(features_ir["1/4"], features_vi["1/4"],
-                                             coarse_flow_4)
+            local_match = self.local_matcher(fine_ir, fine_vi, coarse_flow_4)
             final_flow = upsample_feature_flow(local_match.refined_flow, (height, width),
                                                (height / feature_hw[0], width / feature_hw[1]))
             final_aligned_ir = warp(ir, final_flow)

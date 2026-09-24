@@ -11,7 +11,7 @@ import torch
 from res.global_matcher import GlobalMatcher
 from res.losses import RegistrationLoss
 from res.matching import (bilinear_target_cells, coarse_matching_loss,
-                          correspondence_targets, matching_diagnostics,
+                          appearance_window_loss, correspondence_targets, matching_diagnostics,
                           windowed_diagnostics)
 from res.registration_net import CoarseRegistrationOutput
 
@@ -101,6 +101,29 @@ class CoarseMatchingLossTest(unittest.TestCase):
         flow = constant_flow(1, 64, 80, 8.0, 8.0)
         value = coarse_matching_loss(probability, (8, 10), flow, focal_gamma=2.0)
         self.assertTrue(torch.isfinite(value))
+
+
+class AppearanceWindowLossTest(unittest.TestCase):
+    def test_gt_score_beats_nearby_candidates_and_receives_gradient(self):
+        flow = constant_flow(1, 40, 40, 0.0, 0.0)
+        valid = torch.zeros(1, 1, 40, 40)
+        valid[:, :, 16:24, 16:24] = 1.0  # query (2,2) on the 5x5 grid
+        scores = torch.zeros(1, 25, 25, requires_grad=True)
+        uniform = appearance_window_loss(scores, (5, 5), flow, valid,
+                                         radius=2, temperature=0.1)
+        self.assertAlmostEqual(float(uniform), torch.tensor(25.0).log().item(), places=5)
+        uniform.backward()
+        self.assertLess(float(scores.grad[0, 12, 12]), 0.0)
+        improved = scores.detach().clone()
+        improved[0, 12, 12] = 1.0
+        self.assertLess(float(appearance_window_loss(improved, (5, 5), flow, valid,
+                                                     radius=2, temperature=0.1)),
+                        float(uniform))
+
+    def test_invalid_geometry_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "scores"):
+            appearance_window_loss(torch.zeros(1, 3, 4), (2, 2),
+                                   constant_flow(1, 16, 16, 0.0, 0.0))
 
 
 class MatchingDiagnosticsTest(unittest.TestCase):

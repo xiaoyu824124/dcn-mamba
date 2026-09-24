@@ -8,6 +8,7 @@ import unittest
 
 import torch
 
+from res.global_matcher import GlobalMatcher
 from res.losses import RegistrationLoss
 
 
@@ -49,6 +50,26 @@ class RegistrationLossTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "match"):
             RegistrationLoss({"flow": 1.0, "mind": 0.5, "edge": 0.25,
                               "smooth": 0.05, "affine": 1.0})
+
+    def test_appearance_term_requires_raw_scores_and_updates_features(self):
+        weights = {"flow": 1.0, "match": 1.0, "appearance": 1.0,
+                   "mind": 0.5, "edge": 0.25, "smooth": 0.05, "affine": 1.0}
+        loss = RegistrationLoss(weights)
+        ir = torch.randn(1, 8, 4, 5, requires_grad=True)
+        vi = torch.randn(1, 8, 4, 5, requires_grad=True)
+        gt = torch.zeros(1, 2, 32, 40)
+        inputs = {"aligned_ir": torch.rand(1, 1, 32, 40),
+                  "visible": torch.rand(1, 3, 32, 40),
+                  "coarse_flow": gt, "gt_flow": gt}
+        hidden = GlobalMatcher(return_correlation=False)(ir, vi)
+        with self.assertRaisesRegex(ValueError, "return_correlation"):
+            loss(**inputs, match=hidden)
+        visible = GlobalMatcher(return_correlation=True)(ir, vi)
+        result = loss(**inputs, match=visible)
+        self.assertGreater(float(result.appearance), 0.0)
+        result.appearance.backward()
+        self.assertTrue(torch.isfinite(ir.grad).all())
+        self.assertGreater(float(ir.grad.abs().sum()), 0.0)
 
     def test_affine_gt_has_small_loss_for_matching_parameters(self):
         height, width = 32, 40

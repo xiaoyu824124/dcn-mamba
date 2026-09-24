@@ -1,0 +1,4 @@
+# 1/4 ablation: shared IR/VI projection and 1/8-to-1/4 context fusion.
+# The original local matcher and affine global matcher are unchanged.
+fine_interaction:
+  enabled: true

@@ -12,7 +12,7 @@ import torch.nn.functional as F
 from .mind import MINDDescriptor, rgb_to_gray
 from .affine import homography_to_normalised_affine_yx
 from .global_matcher import GlobalMatchOutput
-from .matching import coarse_matching_loss
+from .matching import appearance_window_loss, coarse_matching_loss
 from .local_matcher import LocalMatchOutput, local_matching_loss
 
 
@@ -28,12 +28,13 @@ class RegistrationLossOutput:
     affine: torch.Tensor
     match: torch.Tensor
     local: torch.Tensor
+    appearance: torch.Tensor
 
     def as_dict(self) -> Dict[str, torch.Tensor]:
         return {"loss": self.total, "loss_flow": self.flow, "loss_mind": self.mind,
                 "loss_edge": self.edge, "loss_smooth": self.smooth,
                 "loss_affine": self.affine, "loss_match": self.match,
-                "loss_local": self.local}
+                "loss_local": self.local, "loss_appearance": self.appearance}
 
 
 class RegistrationLoss(nn.Module):
@@ -63,16 +64,25 @@ class RegistrationLoss(nn.Module):
     def __init__(self, weights: Dict[str, float],
                  mind_descriptor: Optional[MINDDescriptor] = None,
                  charbonnier_eps: float = 1e-3,
-                 match_focal_gamma: float = 0.0) -> None:
+                 match_focal_gamma: float = 0.0,
+                 appearance_window_radius: int = 4,
+                 appearance_temperature: float = 0.07) -> None:
         super().__init__()
         missing = set(self.REQUIRED_WEIGHTS).difference(weights)
         if missing:
             raise ValueError(f"registration loss weights missing: {sorted(missing)}")
         self.weights = {key: float(weights[key]) for key in self.REQUIRED_WEIGHTS}
         self.weights["local"] = float(weights.get("local", 0.0))
+        self.weights["appearance"] = float(weights.get("appearance", 0.0))
+        if self.weights["appearance"] < 0:
+            raise ValueError("appearance weight must be non-negative")
         if float(match_focal_gamma) < 0:
             raise ValueError("match_focal_gamma must be non-negative")
         self.match_focal_gamma = float(match_focal_gamma)
+        if appearance_window_radius < 1 or appearance_temperature <= 0:
+            raise ValueError("appearance window radius and temperature must be positive")
+        self.appearance_window_radius = int(appearance_window_radius)
+        self.appearance_temperature = float(appearance_temperature)
         self.mind_descriptor = (mind_descriptor if mind_descriptor is not None
                                 else MINDDescriptor())
         self.charbonnier_eps = float(charbonnier_eps)
@@ -165,6 +175,14 @@ class RegistrationLoss(nn.Module):
                 focal_gamma=self.match_focal_gamma)
         loss_local = (local_matching_loss(local_match, gt_flow, valid_mask)
                       if local_match is not None and gt_flow is not None else zero)
+        loss_appearance = zero
+        if self.weights["appearance"] > 0 and match is not None and gt_flow is not None:
+            if match.correlation is None:
+                raise ValueError("appearance loss requires global_matcher.return_correlation=true")
+            loss_appearance = appearance_window_loss(
+                match.correlation, tuple(match.coarse_flow.shape[-2:]), gt_flow,
+                valid_mask, radius=self.appearance_window_radius,
+                temperature=self.appearance_temperature)
 
         # MIND compares self-similarity patterns, not raw IR/RGB intensities.
         loss_mind = F.l1_loss(self.mind_descriptor(aligned_ir),
@@ -174,10 +192,11 @@ class RegistrationLoss(nn.Module):
         loss_smooth = self.edge_aware_smoothness(active_flow, visible)
         total = (self.weights["flow"] * loss_flow
                  + self.weights["match"] * loss_match
+                 + self.weights["appearance"] * loss_appearance
                  + self.weights["local"] * loss_local
                  + self.weights["mind"] * loss_mind
                  + self.weights["edge"] * loss_edge
                  + self.weights["smooth"] * loss_smooth
                  + self.weights["affine"] * loss_affine)
         return RegistrationLossOutput(total, loss_flow, loss_mind, loss_edge, loss_smooth,
-                                      loss_affine, loss_match, loss_local)
+                                      loss_affine, loss_match, loss_local, loss_appearance)

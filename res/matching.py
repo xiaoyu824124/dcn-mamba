@@ -145,6 +145,42 @@ def coarse_matching_loss(probability: torch.Tensor, feature_hw: Tuple[int, int],
     return (per_query * mask).sum() / mask.sum().clamp_min(1.0)
 
 
+def appearance_window_loss(scores: torch.Tensor, feature_hw: Tuple[int, int],
+                           flow: torch.Tensor, valid_mask: torch.Tensor | None = None,
+                           radius: int = 4, temperature: float = 0.07) -> torch.Tensor:
+    """Supervise raw cosine scores against nearby keys, without a position prior.
+
+    The GT position may fall between cells. Its four bilinear neighbours form a
+    soft target; other in-bounds keys in the GT-centred window are competitors.
+    This trains feature discrimination even when a spatial prior makes the
+    final all-pairs probability appear well localised.
+    """
+    if radius < 1 or temperature <= 0:
+        raise ValueError("radius and temperature must be positive")
+    height, width = int(feature_hw[0]), int(feature_hw[1])
+    tokens = height * width
+    if scores.ndim != 3 or scores.shape[1:] != (tokens, tokens):
+        raise ValueError("scores must be [B,N,N] for the feature grid")
+    target, query_mask = correspondence_targets(flow, feature_hw, valid_mask)
+    center = target.round().long()
+    offsets_1d = torch.arange(-radius, radius + 1, device=scores.device)
+    offset_y, offset_x = torch.meshgrid(offsets_1d, offsets_1d, indexing="ij")
+    offsets = torch.stack((offset_y.flatten(), offset_x.flatten()), dim=-1)
+    candidates = center.unsqueeze(2) + offsets.view(1, 1, -1, 2)
+    inside = ((candidates[..., 0] >= 0) & (candidates[..., 0] < height)
+              & (candidates[..., 1] >= 0) & (candidates[..., 1] < width))
+    flat = (candidates[..., 0].clamp(0, height - 1) * width
+            + candidates[..., 1].clamp(0, width - 1))
+    scaled = scores.float() / temperature
+    local_logits = scaled.gather(2, flat).masked_fill(~inside, -1.0e4)
+    log_partition = torch.logsumexp(local_logits, dim=-1)
+    indices, weights = bilinear_target_cells(target, feature_hw)
+    positive_logit = (scaled.gather(2, indices) * weights).sum(dim=-1)
+    per_query = log_partition - positive_logit
+    mask = query_mask.to(per_query.dtype)
+    return (per_query * mask).sum() / mask.sum().clamp_min(1.0)
+
+
 @torch.no_grad()
 def windowed_diagnostics(probability: torch.Tensor, feature_hw: Tuple[int, int],
                          predicted_feature_flow: torch.Tensor, flow: torch.Tensor,

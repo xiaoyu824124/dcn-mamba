@@ -97,7 +97,9 @@ def main() -> None:
     model = build_global_registration(config).to(device)
     loss_fn = RegistrationLoss(config.loss.weights,
                                charbonnier_eps=float(config.loss.charbonnier_eps),
-                               match_focal_gamma=float(config.loss.get("match_focal_gamma", 0.0))
+                               match_focal_gamma=float(config.loss.get("match_focal_gamma", 0.0)),
+                               appearance_window_radius=int(config.loss.get("appearance_window_radius", 4)),
+                               appearance_temperature=float(config.loss.get("appearance_temperature", 0.07))
                                ).to(device)
     learning_rate = float(args.lr if args.lr is not None else train_config.lr)
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate,
@@ -197,6 +199,7 @@ def main() -> None:
         record = {"step": step, "train_loss": float(losses.total.detach()),
                   "train_epe": float(train_epe), "flow": float(losses.flow.detach()),
                   "match": float(losses.match.detach()),
+                  "appearance": float(losses.appearance.detach()),
                   "local": float(losses.local.detach()),
                   "temperature": float(model.matcher.temperature.detach()),
                   "peak_mem_mib": (torch.cuda.max_memory_allocated() / 2 ** 20
@@ -204,7 +207,8 @@ def main() -> None:
                   "affine": float(losses.affine.detach())}
         if step == 1 or step % int(train_config.log_every) == 0:
             print("step={step:5d} loss={train_loss:.5f} train_epe={train_epe:.3f} "
-                  "match={match:.4f} local={local:.4f} affine={affine:.4f}".format(**record))
+                  "match={match:.4f} appearance={appearance:.4f} "
+                  "local={local:.4f} affine={affine:.4f}".format(**record))
             # Localisation view of the same batch: does the correct key rank first?
             record.update(matching_diagnostics(output.match.matching_probability,
                                                tuple(output.match.coarse_flow.shape[-2:]),
