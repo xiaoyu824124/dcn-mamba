@@ -1,0 +1,19 @@
+# Freeze the learned 1/4 descriptor and coarse registration; train only the
+# existing local residual head against VTMOT flow ground truth.
+fine_interaction:
+  enabled: true
+
+vtmot_train:
+  freeze_coarse: true
+  freeze_fine_interaction: true
+
+loss:
+  weights:
+    flow: 1.0
+    match: 0.0
+    appearance: 0.0
+    local: 0.0
+    mind: 0.0
+    edge: 0.0
+    smooth: 0.0
+    affine: 0.0

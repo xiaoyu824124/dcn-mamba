@@ -39,6 +39,13 @@ def freeze_local_refinement_parameters(model: torch.nn.Module) -> None:
     model.local_matcher.refinement.requires_grad_(False)
 
 
+def freeze_fine_interaction_parameters(model: torch.nn.Module) -> None:
+    """Train the residual head against a fixed learned local descriptor."""
+    if model.fine_interaction is None:
+        raise ValueError("freeze_fine_interaction requires an enabled fine interaction")
+    model.fine_interaction.requires_grad_(False)
+
+
 def _save(path: Path, step: int, model: torch.nn.Module,
           optimizer: torch.optim.Optimizer, config, best_ratio: float) -> None:
     torch.save({"step": step, "model": model.state_dict(),
@@ -118,6 +125,9 @@ def main() -> None:
     freeze_local_refinement = bool(train_config.get("freeze_local_refinement", False))
     if freeze_local_refinement:
         freeze_local_refinement_parameters(model)
+    freeze_fine_interaction = bool(train_config.get("freeze_fine_interaction", False))
+    if freeze_fine_interaction:
+        freeze_fine_interaction_parameters(model)
     loss_fn = RegistrationLoss(config.loss.weights,
                                charbonnier_eps=float(config.loss.charbonnier_eps),
                                match_focal_gamma=float(config.loss.get("match_focal_gamma", 0.0)),
@@ -171,7 +181,8 @@ def main() -> None:
     print(f"device={device} ({device_name}) run={args.run} steps={steps} train={len(train_dataset)} "
           f"eval={len(eval_dataset)} crop={crop_hw} batch={batch_size} workers={num_workers} "
           f"lr={learning_rate:g} freeze_coarse={freeze_coarse} "
-          f"freeze_local_refinement={freeze_local_refinement}")
+          f"freeze_local_refinement={freeze_local_refinement} "
+          f"freeze_fine_interaction={freeze_fine_interaction}")
     best_ratio = float("inf")
     if args.resume is not None:
         best_ratio = float(checkpoint.get("best_ratio", float("inf")))

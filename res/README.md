@@ -302,6 +302,27 @@ python -B -m res.evaluate_vtmot --device cuda --split eval --frame-stride 10 --c
 argmax 继续改善，再单独解冻残差头。此处继续看 `last.pt` 的特征质量，
 不以最终 EPE 选出的 `best.pt` 代替它。
 
+900 步结果显示候选排序继续改善：80 帧局部 argmax EPE 从原来的
+19.333 降至 15.939 px；但 soft EPE 仅从 7.260 降至 7.051 px，
+仍高于粗场的 6.857 px。16 帧验证集上的局部 soft EPE 在约 400 步
+达到 7.068 px 后没有持续下降，900 步为 7.134 px。80 帧最终 EPE
+只从 6.827 降至 6.810 px。停止延长描述子单独训练。
+
+下一步保留 900 步学到的描述子，固定 Encoder、全局匹配器、WLS 和
+1/4 特征交互模块，只用 GT 流场训练已有局部残差头。这验证较好的候选
+排序能否转化成最终配准收益：平均 soft EPE 虽然高于粗场，残差头仍可能
+只选择可靠区域来修正。不改变搜索半径或增加 DCN。
+
+```bat
+python -B -m res.train_vtmot --device cuda --steps 1 --num-workers 0 --lr 0.0001 --init res_runs/local_descriptor_only_900/last.pt --overlay res/configs/ab_local_head_from_descriptor.yaml --output-dir res_runs/local_head_from_descriptor_smoke
+python -B -m res.train_vtmot --device cuda --run pilot --num-workers 0 --lr 0.0001 --init res_runs/local_descriptor_only_900/last.pt --overlay res/configs/ab_local_head_from_descriptor.yaml --output-dir res_runs/local_head_from_descriptor_pilot
+python -B -m res.evaluate_vtmot --device cuda --split eval --frame-stride 10 --checkpoint res_runs/local_head_from_descriptor_pilot/last.pt --output res_runs/local_head_from_descriptor_pilot/eval_stride10.json
+```
+
+80 帧粗场 EPE 应继续固定在 6.843 px，局部 argmax 和 soft EPE 应
+保持约 15.939 和 7.051 px；变化只应出现在残差修正与最终流场。
+若最终 EPE 仍只改善几百分之一像素，就不再延长这一路局部头训练。
+
 当前 `res` 分支实现如下：
 
 ```text
