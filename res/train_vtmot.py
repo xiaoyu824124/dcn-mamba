@@ -257,6 +257,10 @@ def main() -> None:
                   "zero={zero_flow_epe_px:.3f} ratio={relative_epe:.3f} "
                   "gt_rank_frac={match_frac_keys_beating_gt:.3f} "
                   "argmax_epe={match_epe_argmax_px:.1f}px".format(**validation))
+            if "local_soft_epe_px" in validation:
+                print("  local soft_epe={local_soft_epe_px:.3f}px "
+                      "argmax_epe={local_argmax_epe_px:.1f}px "
+                      "oracle_epe={local_oracle_epe_px:.3f}px".format(**validation))
             if validation["relative_epe"] < best_ratio:
                 best_ratio = validation["relative_epe"]
                 _save(output_dir / "best.pt", step, model, optimizer, config,

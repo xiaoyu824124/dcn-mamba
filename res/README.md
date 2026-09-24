@@ -286,6 +286,22 @@ python -B -m res.evaluate_vtmot --device cuda --split eval --frame-stride 10 --c
 局部 soft EPE 基线为 7.260 px，粗场在 1/4 网格上的误差为 6.857 px。
 只有局部 soft EPE 低于粗场且 argmax EPE 也下降，才继续训练残差头。
 
+300 步局部描述子实验保持 80 帧粗场 EPE 6.843 px 不变；局部 argmax EPE
+从 19.333 降至 17.225 px，soft EPE 从 7.260 降至 7.002 px；最终 EPE
+仅从 6.827 降至 6.820 px。训练有信号，但局部概率加权位移仍差于
+6.857 px 的粗场。下一轮从相同的热启动权重训练 900 步，使前 300 步
+与上一轮可比，再观察后 600 步是否持续下降。训练输出现在会在每次验证
+时打印局部 soft、argmax 与 oracle EPE。
+
+```bat
+python -B -m res.train_vtmot --device cuda --steps 900 --num-workers 0 --lr 0.0001 --init res_runs/control_warm_pilot/best.pt --overlay res/configs/ab_local_descriptor_only.yaml --output-dir res_runs/local_descriptor_only_900
+python -B -m res.evaluate_vtmot --device cuda --split eval --frame-stride 10 --checkpoint res_runs/local_descriptor_only_900/last.pt --output res_runs/local_descriptor_only_900/eval_stride10.json
+```
+
+若局部 soft EPE 不再下降，停止延长这一结构；若稳定低于粗场且
+argmax 继续改善，再单独解冻残差头。此处继续看 `last.pt` 的特征质量，
+不以最终 EPE 选出的 `best.pt` 代替它。
+
 当前 `res` 分支实现如下：
 
 ```text
