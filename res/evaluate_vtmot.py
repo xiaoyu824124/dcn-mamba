@@ -76,13 +76,8 @@ def evaluate(model: torch.nn.Module, loader: DataLoader, device: torch.device) -
             diagnostics = matching_diagnostics(
                 output.match.matching_probability,
                 tuple(output.match.coarse_flow.shape[-2:]), target, valid,
-                appearance_scores=output.match.correlation)
-            confidence = output.match.confidence.detach().float().flatten(1)
-            weights = confidence.clamp_min(1e-8).pow(
-                model.matcher.affine_confidence_power)
-            effective = weights.sum(dim=1).square() / (
-                weights.shape[1] * weights.square().sum(dim=1).clamp_min(1e-20))
-            diagnostics["affine_weight_effective_queries_ratio"] = float(effective.mean())
+                appearance_scores=output.match.correlation,
+                affine_confidence_power=model.matcher.affine_confidence_power)
             for radius in (2, 4):
                 diagnostics.update(windowed_diagnostics(
                     output.match.matching_probability,

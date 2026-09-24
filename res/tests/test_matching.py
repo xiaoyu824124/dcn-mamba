@@ -157,6 +157,27 @@ class MatchingDiagnosticsTest(unittest.TestCase):
                                0.5 * (79 / 80), places=4)
         self.assertGreater(report["appearance_epe_argmax_px"], 0.0)
 
+    def test_affine_support_diagnostics_detect_single_trusted_query(self):
+        flow = constant_flow(1, 64, 80, 0.0, 0.0)
+        uniform = torch.full((1, 80, 80), 1.0 / 80.0)
+        flat = matching_diagnostics(uniform, (8, 10), flow,
+                                    affine_confidence_power=4.0)
+        self.assertAlmostEqual(flat["affine_weight_effective_queries_ratio"], 1.0,
+                               places=5)
+        self.assertAlmostEqual(flat["affine_weight_valid_fraction"], 1.0,
+                               places=5)
+        self.assertAlmostEqual(flat["affine_weight_spread_ratio"], 1.0,
+                               places=5)
+        concentrated = uniform.clone()
+        concentrated[0, 11] = 0.0
+        concentrated[0, 11, 11] = 1.0
+        sparse = matching_diagnostics(concentrated, (8, 10), flow,
+                                      affine_confidence_power=4.0)
+        self.assertLess(sparse["affine_weight_effective_queries_ratio"], 0.02)
+        self.assertLess(sparse["affine_weight_spread_ratio"], 0.05)
+        self.assertLess(sparse["affine_weighted_raw_epe_px"],
+                        flat["affine_weighted_raw_epe_px"])
+
     def test_metrics_are_finite_under_cuda(self):
         if not torch.cuda.is_available():
             self.skipTest("CUDA is unavailable")

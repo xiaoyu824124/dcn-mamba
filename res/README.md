@@ -190,6 +190,25 @@ python -B -m res.evaluate_vtmot --device cuda --split eval --frame-stride 10 --c
 只有粗场与最终 EPE 都改善，才考虑更改默认权重；否则继续检查原始
 1/8 特征与 GT 对应关系。
 
+80 帧结果确认四次方仍最好：有效查询比例仅 0.00428（4800 格中约 21 格），
+粗场 EPE 6.843 px；二次方有效比例 0.01839，粗场 EPE 10.583 px；均匀
+权重粗场 EPE 97.405 px。匹配概率与原始外观完全相同，因此问题是低置信
+查询的软坐标严重偏离 GT，而不是 WLS 需要更均匀的权重。保持四次方默认值。
+
+下一步同一权重再报告三项 WLS 支撑诊断：
+`affine_weight_valid_fraction` 是 WLS 权重落在有 GT 且对应点在图内查询的
+比例；`affine_weighted_raw_epe_px` 是这些点的加权软匹配误差；
+`affine_weight_spread_ratio` 是高权重查询在较窄空间方向上的分布宽度，
+均匀覆盖为 1，接近 0 表示高度聚集。
+
+```bat
+python -B -m res.evaluate_vtmot --device cuda --split eval --frame-stride 10 --checkpoint res_runs/control_warm_pilot/best.pt --output res_runs/control_warm_pilot/eval_wls_support.json
+```
+
+若加权软匹配误差仍大，优先改进高置信点本身的跨模态特征；若它较小但
+空间分布高度聚集，先检查仿射拟合的几何覆盖与稳定性。若有效区域权重
+比例低，则先修正 WLS 对无效查询的处理。
+
 当前 `res` 分支实现如下：
 
 ```text

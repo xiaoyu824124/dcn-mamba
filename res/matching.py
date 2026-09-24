@@ -267,7 +267,8 @@ def windowed_diagnostics(probability: torch.Tensor, feature_hw: Tuple[int, int],
 def matching_diagnostics(probability: torch.Tensor, feature_hw: Tuple[int, int],
                          flow: torch.Tensor,
                          valid_mask: torch.Tensor | None = None,
-                         appearance_scores: torch.Tensor | None = None) -> Dict[str, float]:
+                         appearance_scores: torch.Tensor | None = None,
+                         affine_confidence_power: float | None = None) -> Dict[str, float]:
     """How the ground-truth match ranks against every competing key.
 
     ``match_frac_keys_beating_gt`` is a tie-aware rank fraction: ``0`` means
@@ -315,6 +316,38 @@ def matching_diagnostics(probability: torch.Tensor, feature_hw: Tuple[int, int],
             top2[..., 0].clamp_min(1e-12).log() - top2[..., 1].clamp_min(1e-12).log()),
         "match_effective_keys_ratio": masked(entropy.exp() / dense.shape[-1]),
     }
+    if affine_confidence_power is not None:
+        if affine_confidence_power < 0:
+            raise ValueError("affine_confidence_power must be non-negative")
+        weights = top2[..., 0].clamp_min(1e-8).pow(affine_confidence_power)
+        total_weight = weights.sum(dim=-1).clamp_min(1e-20)
+        valid_weights = weights * mask
+        valid_weight = valid_weights.sum(dim=-1).clamp_min(1e-20)
+        raw_error = torch.linalg.vector_norm((expected_flow - gt_flow) * stride,
+                                              dim=-1)
+        report["affine_weight_effective_queries_ratio"] = float((
+            total_weight.square() /
+            (dense.shape[-1] * weights.square().sum(dim=-1).clamp_min(1e-20))).mean())
+        report["affine_weight_valid_fraction"] = float(
+            (valid_weight / total_weight).mean())
+        report["affine_weighted_raw_epe_px"] = float(
+            ((valid_weights * raw_error).sum(dim=-1) / valid_weight).mean())
+
+        # Minimum spatial variance measures whether the trusted queries span
+        # both axes well enough to constrain all six affine parameters.
+        center = coordinates.new_tensor(((int(feature_hw[0]) - 1) / 2,
+                                         (int(feature_hw[1]) - 1) / 2))
+        scale = coordinates.new_tensor((max((int(feature_hw[0]) - 1) / 2, 1.0),
+                                        max((int(feature_hw[1]) - 1) / 2, 1.0)))
+        normalized = (coordinates - center) / scale
+        normalized_weights = weights / total_weight.unsqueeze(-1)
+        weighted_center = torch.einsum("bn,nc->bc", normalized_weights, normalized)
+        offset = normalized.unsqueeze(0) - weighted_center.unsqueeze(1)
+        covariance = torch.einsum("bn,bnc,bnd->bcd", normalized_weights,
+                                  offset, offset)
+        uniform_min_variance = normalized.var(dim=0, unbiased=False).min().clamp_min(1e-8)
+        report["affine_weight_spread_ratio"] = float(
+            (torch.linalg.eigvalsh(covariance)[:, 0] / uniform_min_variance).mean())
     if appearance_scores is not None:
         if appearance_scores.shape != probability.shape:
             raise ValueError("appearance_scores must match probability shape")
