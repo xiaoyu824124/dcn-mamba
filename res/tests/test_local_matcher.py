@@ -1,10 +1,13 @@
 """Geometry and training checks for prediction-centred local matching."""
 
 import unittest
+from types import SimpleNamespace
 
 import torch
 
+from res.fine_interaction import FineScaleInteraction
 from res.local_matcher import LocalMatcher, local_matching_diagnostics, local_matching_loss
+from res.train_vtmot import freeze_local_refinement_parameters
 
 
 class LocalMatcherTest(unittest.TestCase):
@@ -42,6 +45,24 @@ class LocalMatcherTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "coarse_flow"):
             matcher(torch.rand(1, 4, 8, 8), torch.rand(1, 4, 8, 8),
                     torch.zeros(1, 2, 4, 4))
+
+    def test_local_only_loss_trains_feature_adapter_without_updating_head(self):
+        torch.manual_seed(13)
+        adapter = FineScaleInteraction(8, 8, hidden_channels=8)
+        matcher = LocalMatcher(radius=2, temperature=0.1)
+        fine_ir, fine_vi = torch.randn(1, 8, 8, 10), torch.randn(1, 8, 8, 10)
+        coarse_ir, coarse_vi = torch.randn(1, 8, 4, 5), torch.randn(1, 8, 4, 5)
+        adapted_ir, adapted_vi = adapter(fine_ir, fine_vi, coarse_ir, coarse_vi)
+        match = matcher(adapted_ir, adapted_vi, torch.zeros(1, 2, 8, 10))
+        local_matching_loss(match, torch.zeros(1, 2, 32, 40)).backward()
+        self.assertIsNotNone(adapter.gain.grad)
+        self.assertGreater(float(adapter.gain.grad.abs()), 0.0)
+        self.assertIsNone(matcher.refinement[-1].weight.grad)
+        freeze_local_refinement_parameters(SimpleNamespace(local_matcher=matcher))
+        self.assertTrue(all(not parameter.requires_grad
+                            for parameter in matcher.refinement.parameters()))
+        with self.assertRaisesRegex(ValueError, "freeze_local_refinement"):
+            freeze_local_refinement_parameters(SimpleNamespace(local_matcher=None))
 
 
 if __name__ == "__main__":

@@ -268,6 +268,24 @@ python -B -m res.evaluate_vtmot --device cuda --split eval --frame-stride 10 --c
 Encoder 对应指标，再考虑把 MIND 直通特征送入专门的 1/4 局部分支；
 若 MIND 也差，则优先改局部描述子的监督和采样方式。
 
+实测原始 MIND 的局部 argmax／soft EPE 为 20.433／7.432 px，均差于
+Encoder 的 19.333／7.260 px。因此继续使用 Encoder 的 1/4 特征，
+不接入原始 MIND 细匹配。下一轮只训练已有的共享 1/4 特征交互模块，
+用局部候选的真值 NLL 判断它能否学到更好的跨模态描述子。
+`ab_local_descriptor_only.yaml` 固定 Encoder、全局匹配器、WLS 和局部
+残差头，其他损失权重置零；只有局部特征交互模块更新。
+
+```bat
+python -B -m res.train_vtmot --device cuda --steps 1 --num-workers 0 --lr 0.0001 --init res_runs/control_warm_pilot/best.pt --overlay res/configs/ab_local_descriptor_only.yaml --output-dir res_runs/local_descriptor_only_smoke
+python -B -m res.train_vtmot --device cuda --run pilot --num-workers 0 --lr 0.0001 --init res_runs/control_warm_pilot/best.pt --overlay res/configs/ab_local_descriptor_only.yaml --output-dir res_runs/local_descriptor_only_pilot
+python -B -m res.evaluate_vtmot --device cuda --split eval --frame-stride 10 --checkpoint res_runs/local_descriptor_only_pilot/last.pt --output res_runs/local_descriptor_only_pilot/eval_stride10.json
+```
+
+这一轮按 `last.pt` 比较局部指标：`best.pt` 仍按最终 EPE 选取，可能保留
+第 0 步而错过描述子是否学会匹配。粗场 EPE 应保持约 6.843 px；
+局部 soft EPE 基线为 7.260 px，粗场在 1/4 网格上的误差为 6.857 px。
+只有局部 soft EPE 低于粗场且 argmax EPE 也下降，才继续训练残差头。
+
 当前 `res` 分支实现如下：
 
 ```text

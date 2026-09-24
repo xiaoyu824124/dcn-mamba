@@ -1,0 +1,19 @@
+# Isolate 1/4 correspondence learning with the established coarse field fixed.
+# Local NLL updates FineScaleInteraction; the residual head stays fixed.
+fine_interaction:
+  enabled: true
+
+vtmot_train:
+  freeze_coarse: true
+  freeze_local_refinement: true
+
+loss:
+  weights:
+    flow: 0.0
+    match: 0.0
+    appearance: 0.0
+    local: 1.0
+    mind: 0.0
+    edge: 0.0
+    smooth: 0.0
+    affine: 0.0

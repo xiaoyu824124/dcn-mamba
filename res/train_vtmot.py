@@ -32,6 +32,13 @@ def freeze_coarse_parameters(model: torch.nn.Module) -> None:
         model.coarse_transformer.requires_grad_(False)
 
 
+def freeze_local_refinement_parameters(model: torch.nn.Module) -> None:
+    """Train local correspondence features without adapting the residual head."""
+    if model.local_matcher is None:
+        raise ValueError("freeze_local_refinement requires an enabled local matcher")
+    model.local_matcher.refinement.requires_grad_(False)
+
+
 def _save(path: Path, step: int, model: torch.nn.Module,
           optimizer: torch.optim.Optimizer, config, best_ratio: float) -> None:
     torch.save({"step": step, "model": model.state_dict(),
@@ -108,6 +115,9 @@ def main() -> None:
     freeze_coarse = bool(train_config.get("freeze_coarse", False))
     if freeze_coarse:
         freeze_coarse_parameters(model)
+    freeze_local_refinement = bool(train_config.get("freeze_local_refinement", False))
+    if freeze_local_refinement:
+        freeze_local_refinement_parameters(model)
     loss_fn = RegistrationLoss(config.loss.weights,
                                charbonnier_eps=float(config.loss.charbonnier_eps),
                                match_focal_gamma=float(config.loss.get("match_focal_gamma", 0.0)),
@@ -160,7 +170,8 @@ def main() -> None:
     device_name = torch.cuda.get_device_name(device) if device.type == "cuda" else "CPU"
     print(f"device={device} ({device_name}) run={args.run} steps={steps} train={len(train_dataset)} "
           f"eval={len(eval_dataset)} crop={crop_hw} batch={batch_size} workers={num_workers} "
-          f"lr={learning_rate:g} freeze_coarse={freeze_coarse}")
+          f"lr={learning_rate:g} freeze_coarse={freeze_coarse} "
+          f"freeze_local_refinement={freeze_local_refinement}")
     best_ratio = float("inf")
     if args.resume is not None:
         best_ratio = float(checkpoint.get("best_ratio", float("inf")))
