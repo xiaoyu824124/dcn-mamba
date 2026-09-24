@@ -194,6 +194,18 @@ class WindowedDiagnosticsTest(unittest.TestCase):
         self.assertAlmostEqual(report["window2_argmax_correct"], 0.0, places=5)
         self.assertAlmostEqual(report["window2_frac_cells_beating_gt"], 1.0 / 25.0, places=5)
 
+    def test_appearance_window_exposes_prior_only_peak(self):
+        probability = torch.eye(80).unsqueeze(0)
+        appearance = torch.zeros_like(probability)
+        appearance[:, :, 1] = 1.0
+        flow = constant_flow(1, 64, 80, 0.0, 0.0)
+        report = windowed_diagnostics(probability, (8, 10),
+                                      torch.zeros(1, 2, 8, 10), flow, radius=2,
+                                      appearance_scores=appearance)
+        self.assertAlmostEqual(report["window2_argmax_correct"], 1.0, places=5)
+        self.assertLess(report["appearance_window2_argmax_correct"], 1.0)
+        self.assertGreater(report["appearance_window2_frac_cells_beating_gt"], 0.0)
+
 
 class RegistrationLossIntegrationTest(unittest.TestCase):
     def test_match_term_backpropagates_through_the_matcher(self):

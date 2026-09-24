@@ -1,0 +1,4 @@
+# Same checkpoint ablation: sigma=8 feature cells = 64 input pixels.
+# A wider prior tests whether the 32 px prior over-constrains affine matches.
+global_matcher:
+  spatial_prior_sigma: 8.0

@@ -81,7 +81,8 @@ def evaluate(model: torch.nn.Module, loader: DataLoader, device: torch.device) -
                 diagnostics.update(windowed_diagnostics(
                     output.match.matching_probability,
                     tuple(output.match.coarse_flow.shape[-2:]),
-                    output.match.coarse_flow, target, valid, radius=radius))
+                    output.match.coarse_flow, target, valid, radius=radius,
+                    appearance_scores=output.match.correlation))
             for name, value in diagnostics.items():
                 diagnostic_sums[name] = diagnostic_sums.get(name, 0.0) + value * float(predicted.shape[0])
         if output.local_match is not None:

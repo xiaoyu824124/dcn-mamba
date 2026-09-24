@@ -149,7 +149,8 @@ def coarse_matching_loss(probability: torch.Tensor, feature_hw: Tuple[int, int],
 def windowed_diagnostics(probability: torch.Tensor, feature_hw: Tuple[int, int],
                          predicted_feature_flow: torch.Tensor, flow: torch.Tensor,
                          valid_mask: torch.Tensor | None = None,
-                         radius: int = 2) -> Dict[str, float]:
+                         radius: int = 2,
+                         appearance_scores: torch.Tensor | None = None) -> Dict[str, float]:
     """Would a local window around the *predicted* key recover the true match?
 
     ``predicted_feature_flow`` is the matcher's own feature-grid ``[dy,dx]``
@@ -201,7 +202,7 @@ def windowed_diagnostics(probability: torch.Tensor, feature_hw: Tuple[int, int],
         return float((value * mask).sum() / denominator)
 
     beating = (window_probability > gt_probability.unsqueeze(-1)).sum(dim=-1)
-    return {
+    report = {
         # Coverage is over every valid query.  The other window statistics are
         # conditional on the truth being inside the window.
         f"window{radius}_coverage": float(mask.sum() / valid_count),
@@ -212,6 +213,18 @@ def windowed_diagnostics(probability: torch.Tensor, feature_hw: Tuple[int, int],
         "coarse_error_p90_px": float(
             torch.quantile(error_px[query_mask].flatten().float(), 0.9)) if bool(query_mask.any()) else float("nan"),
     }
+    if appearance_scores is not None:
+        if appearance_scores.shape != probability.shape:
+            raise ValueError("appearance_scores must match probability shape")
+        appearance = appearance_scores.detach().float()
+        window_appearance = appearance.gather(2, flat).masked_fill(~inside, float("-inf"))
+        gt_appearance = (appearance.gather(2, indices) * weights).sum(dim=-1)
+        appearance_beating = (window_appearance > gt_appearance.unsqueeze(-1)).sum(dim=-1)
+        report[f"appearance_window{radius}_frac_cells_beating_gt"] = masked(
+            appearance_beating.to(dense.dtype) / channels)
+        report[f"appearance_window{radius}_argmax_correct"] = masked(
+            (appearance_beating == 0).to(dense.dtype))
+    return report
 
 
 @torch.no_grad()

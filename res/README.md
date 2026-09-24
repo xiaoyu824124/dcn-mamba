@@ -86,6 +86,21 @@ python -B -m res.evaluate_vtmot --device cuda --split eval --frame-stride 10 --c
 适用于这类不改变参数形状的开关；`--diagnose-appearance` 会暂时多保留一张
 4800×4800 的分数矩阵，适合评估，不要用于训练。
 
+A4000 的 80 帧对照中，32 px 先验把匹配 argmax EPE 从约 160.5 px 降到
+13.7 px，但粗场 EPE 从 7.18 px 升到 7.23 px，最终 EPE 从 7.26 px 升到
+7.37 px。原始外观分数的 argmax EPE 仍为 160.8 px；峰值位置的改善主要来自
+先验，不能据此认定 Encoder 已学到可靠的全局对应。局部头在该权重上也没有
+补偿粗场误差。先用同一权重试更宽的 64 px 先验，并查看新增的
+`appearance_window2_*` 和 `appearance_window4_*`：这些指标仅比较粗场附近的
+原始余弦分数，排除位置先验。评估命令：
+
+```bat
+python -B -m res.evaluate_vtmot --device cuda --split eval --frame-stride 10 --checkpoint res_runs/local_from_coarse_pilot/best.pt --overlay res/configs/ab_spatial_prior64.yaml --diagnose-appearance --output res_runs/local_from_coarse_pilot/eval_prior64_stride10.json
+```
+
+若 64 px 先验仍未降低 `coarse_epe_px`，先保持当前最好的无先验权重，
+针对 1/8 特征的局部判别力调整训练目标，不直接增加训练步数或接入融合。
+
 后续阶段依次为：1/4 的粗场中心局部窗口与轻量 FSFT、1/2 小范围残差修正，
 最后才评估 DCN 亚像素修正。CRFT 的 `fine_process` 使用窗口展开后的注意力，
 在 480×640 上需改为逐窗口或分块计算；不能直接复制全序列实现。
