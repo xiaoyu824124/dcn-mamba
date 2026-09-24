@@ -4,7 +4,7 @@ import unittest
 
 import torch
 
-from res.local_matcher import LocalMatcher, local_matching_loss
+from res.local_matcher import LocalMatcher, local_matching_diagnostics, local_matching_loss
 
 
 class LocalMatcherTest(unittest.TestCase):
@@ -22,6 +22,14 @@ class LocalMatcherTest(unittest.TestCase):
         gt = torch.zeros(1, 2, 16 * 4, 20 * 4)
         gt[:, 0] = 8
         gt[:, 1] = -4
+        diagnostics = local_matching_diagnostics(output, gt)
+        self.assertAlmostEqual(diagnostics["local_window_coverage"], 1.0, places=5)
+        self.assertLess(diagnostics["local_oracle_epe_px"], 1e-4)
+        self.assertAlmostEqual(diagnostics["local_pred_residual_px"], 0.0, places=5)
+        self.assertAlmostEqual(diagnostics["local_refinement_improved_fraction"],
+                               0.0, places=5)
+        self.assertLess(diagnostics["local_soft_epe_px"],
+                        diagnostics["local_gt_residual_px"])
         loss = local_matching_loss(output, gt)
         self.assertTrue(torch.isfinite(loss))
         (loss + (output.refined_flow - gt[:, :, ::4, ::4] / 4).square().mean()).backward()

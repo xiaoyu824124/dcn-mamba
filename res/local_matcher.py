@@ -133,7 +133,7 @@ def local_matching_loss(match: LocalMatchOutput, gt_flow: torch.Tensor,
 @torch.no_grad()
 def local_matching_diagnostics(match: LocalMatchOutput, gt_flow: torch.Tensor,
                                valid_mask: torch.Tensor | None = None) -> dict[str, float]:
-    """Coverage of the coarse-centred window and local argmax accuracy."""
+    """Separate local search capacity, feature matching, and learned correction."""
     height, width = match.coarse_flow.shape[-2:]
     target, query_mask = correspondence_targets(gt_flow, (height, width), valid_mask)
     target = target.transpose(1, 2).reshape(gt_flow.shape[0], 2, height, width)
@@ -149,7 +149,27 @@ def local_matching_diagnostics(match: LocalMatchOutput, gt_flow: torch.Tensor,
     stride = gt_flow.new_tensor((gt_flow.shape[-2] / height,
                                 gt_flow.shape[-1] / width)).view(1, 2, 1, 1)
     error = torch.linalg.vector_norm((prediction - target) * stride, dim=1)
+    coarse_error = torch.linalg.vector_norm((centre - target) * stride, dim=1)
+    soft_prediction = centre + match.matched_residual.float()
+    soft_error = torch.linalg.vector_norm((soft_prediction - target) * stride, dim=1)
+    refined_prediction = centre + match.residual_flow.float()
+    refined_error = torch.linalg.vector_norm((refined_prediction - target) * stride, dim=1)
+    candidate_positions = (centre.unsqueeze(1)
+                           + match.offsets_yx.to(centre).view(1, -1, 2, 1, 1))
+    candidate_error = torch.linalg.vector_norm(
+        (candidate_positions - target.unsqueeze(1)) * stride.unsqueeze(1), dim=2)
+    oracle_error = candidate_error.masked_fill(~match.valid_candidates, float("inf")).amin(dim=1)
+    oracle_mask = mask & covered & match.valid_candidates.any(dim=1)
+    valid_count = mask.sum().clamp_min(1)
     return {
-        "local_window_coverage": float((covered & mask).sum() / mask.sum().clamp_min(1)),
-        "local_argmax_epe_px": float((error * mask).sum() / mask.sum().clamp_min(1)),
+        "local_window_coverage": float((covered & mask).sum() / valid_count),
+        "local_argmax_epe_px": float((error * mask).sum() / valid_count),
+        "local_oracle_epe_px": float(torch.where(oracle_mask, oracle_error, 0).sum()
+                                      / oracle_mask.sum().clamp_min(1)),
+        "local_soft_epe_px": float((soft_error * mask).sum() / valid_count),
+        "local_gt_residual_px": float((coarse_error * mask).sum() / valid_count),
+        "local_pred_residual_px": float((torch.linalg.vector_norm(
+            match.residual_flow.float() * stride, dim=1) * mask).sum() / valid_count),
+        "local_refinement_improved_fraction": float(
+            ((refined_error < coarse_error) & mask).sum() / valid_count),
     }

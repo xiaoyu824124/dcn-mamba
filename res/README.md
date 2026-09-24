@@ -229,6 +229,28 @@ python -B -m res.evaluate_vtmot --device cuda --split eval --frame-stride 10 --c
 配准误差都改善，才保留边界屏蔽；若比例升高但 EPE 变差，说明被排除
 的点中仍有关键的可靠匹配。
 
+80 帧实测排除 16 px 后有效权重比例从 0.477 升至 0.996，但粗场 EPE
+从 6.843 升至 16.838 px，最终 EPE 从 6.827 升至 14.005 px；排除
+32 px 后粗场与最终 EPE 继续恶化至 24.353 和 19.937 px。对应的加权
+软匹配误差从 11.653 升至 16.156、19.633 px，空间分布比例从 1.597
+降至 0.666、0.472。边缘高权重点虽然常被 GT 有效掩码排除，却对当前
+仿射估计有关键作用。保留默认完整 WLS，不按 GT 有效比例单独筛点。
+
+下一步先诊断 1/4 局部头的增益上限。同一 checkpoint 重新评估即可，
+不需重训：
+
+```bat
+python -B -m res.evaluate_vtmot --device cuda --split eval --frame-stride 10 --checkpoint res_runs/control_warm_pilot/best.pt --output res_runs/control_warm_pilot/eval_local_diagnostics.json
+```
+
+`local_oracle_epe_px` 是窗口内最佳合法候选的误差，只在 GT 被窗口覆盖的
+查询上统计；`local_soft_epe_px` 是候选概率加权平均位移的误差；
+`local_gt_residual_px` 是 1/4 网格上粗场剩余误差；
+`local_pred_residual_px` 是局部头实际修正幅度；
+`local_refinement_improved_fraction` 是局部头降低误差的查询比例。
+若 oracle 很好而 soft 很差，应优先改 1/4 特征或匹配目标；若 soft
+已经好而最终场仍无增益，应检查残差头训练与输出方式。
+
 当前 `res` 分支实现如下：
 
 ```text
