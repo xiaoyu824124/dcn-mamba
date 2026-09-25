@@ -27,7 +27,7 @@ def main() -> None:
     parser.add_argument("--max-samples", type=int, default=0)
     parser.add_argument("--model-hw", type=int, nargs=2, default=None,
                         metavar=("HEIGHT", "WIDTH"),
-                        help="defaults to checkpoint model size or 96x96 for official weights")
+                        help="square evaluation size; defaults to checkpoint size or 96x96")
     parser.add_argument("--device", choices=("cuda", "cpu"), default="cuda")
     parser.add_argument("--output", type=Path, default=None)
     args = parser.parse_args()
@@ -41,14 +41,13 @@ def main() -> None:
                         pin_memory=device.type == "cuda")
     model = build_crft(args.crft_root, device)
     saved_hw = load_crft_weights(model, args.checkpoint)
-    if args.model_hw is not None and saved_hw is not None and tuple(args.model_hw) != saved_hw:
-        raise ValueError("--model-hw differs from the training checkpoint")
     model_hw = validate_model_hw(
         tuple(args.model_hw) if args.model_hw is not None else saved_hw or DEFAULT_MODEL_HW)
     report = evaluate_crft(model, loader, device, model_hw)
     report.update({"model": "official_CRFT", "checkpoint": str(args.checkpoint),
                    "split": args.split, "frame_stride": args.frame_stride,
-                   "field_of_view_hw": [480, 640]})
+                   "field_of_view_hw": [480, 640],
+                   "trained_model_hw": list(saved_hw) if saved_hw is not None else None})
     print(json.dumps(report, indent=2))
     if args.output is not None:
         args.output.parent.mkdir(parents=True, exist_ok=True)

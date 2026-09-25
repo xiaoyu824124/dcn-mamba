@@ -82,7 +82,7 @@ def main() -> None:
     if args.init is not None:
         saved_hw = load_crft_weights(model, args.init)
         if saved_hw is not None and saved_hw != model_hw:
-            raise ValueError("--model-hw differs from the initialization checkpoint")
+            print(f"init: transferring weights from model_hw={saved_hw} to {model_hw}")
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
     start_step = 0
     best_epe = float("inf")

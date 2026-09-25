@@ -38,6 +38,17 @@ python -B -m res.evaluate_crft_vtmot --crft-root G:\cxj\CRFT-main --checkpoint r
 `coarse_epe_px`、`pck_3px`、`zero_flow_epe_px` 与显存峰值。
 完整数据和 CRFT 官方权重均不随 Git 提交，服务器须分别放置。
 
+96×96 模型从零训练 300 步后，可以先用同一个权重在相同的 80 帧上
+做输入分辨率诊断；`--model-hw` 只改变评估时的方形输入大小，不改权重。
+JSON 同时记录训练和评估输入大小。先运行 96×96，再尝试 128×128；
+若显存不足，不再增大输入。不同分辨率的推理结果是诊断，正式基线
+应使用相应分辨率继续训练并重新评估。
+
+```bat
+python -B -m res.evaluate_crft_vtmot --crft-root G:\cxj\CRFT-main --checkpoint res_runs\crft_vtmot_pilot\best.pt --device cuda --split eval --frame-stride 10 --model-hw 96 96 --output res_runs\crft_vtmot_pilot\eval_96_stride10.json
+python -B -m res.evaluate_crft_vtmot --crft-root G:\cxj\CRFT-main --checkpoint res_runs\crft_vtmot_pilot\best.pt --device cuda --split eval --frame-stride 10 --model-hw 128 128 --output res_runs\crft_vtmot_pilot\eval_128_stride10.json
+```
+
 ## A4000 服务器准备（当前为 Windows 环境）
 
 你贴出的 `G:\cxj\VF-Bench-main` 和 `C:\Users\cxj\.conda` 表明当前 SSH 终端连接的是
