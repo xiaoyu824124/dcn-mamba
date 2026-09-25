@@ -528,6 +528,36 @@ python -B -m res.evaluate_vtmot --device cuda --split eval --frame-stride 10 --m
 EPE。若 300 步后粗场仍明显高于旧模型的 6.843 px，不延长此热身路线；
 若接近或优于旧模型，再决定是否做同计算量的 IR–VI 对照训练。
 
+实测从同模态权重切回 IR–VI 后，300 步的 80 帧最终 EPE 为 8.493 px，
+粗场 EPE 8.931 px，全局 argmax EPE 157.483 px，PCK@3px 0.099。
+它们均弱于旧 IR–VI 权重的最终 EPE 6.760 px、粗场 6.843 px、
+全局 argmax 149.558 px 和 PCK@3px 0.169。因此按上述门槛停止
+同模态预热路线，不继续投入更长训练；这组试验仍证明匹配器可学习
+同模态几何，但没有证明该表示可直接迁移到 IR–VI。
+
+### IR 特征适配消融
+
+改从已验证的 IR–VI 权重 `local_head_from_descriptor_pilot/last.pt`
+出发，在共享 Encoder 之后分别为 IR 的 1/4、1/8 特征加零初始化残差层。
+VI 特征和已有的 Encoder、全局匹配器、WLS、1/4 交互与局部头均保持固定；
+只训练新层，以检验小范围跨模态特征校准能否改善粗匹配和局部匹配。
+零初始化保证第 0 步与原权重的预测相同。此消融尚无 A4000 结果。
+
+在服务器拉取代码后执行，每次训练使用新目录：
+
+```bat
+python -B -m unittest discover -s res/tests -t .
+python -B -m res.train_vtmot --device cuda --steps 1 --num-workers 0 --lr 0.0001 --init res_runs/local_head_from_descriptor_pilot/last.pt --overlay res/configs/ab_ir_feature_adapter.yaml --output-dir res_runs/ir_adapter_smoke
+python -B -m res.train_vtmot --device cuda --run pilot --num-workers 0 --lr 0.0001 --init res_runs/local_head_from_descriptor_pilot/last.pt --overlay res/configs/ab_ir_feature_adapter.yaml --output-dir res_runs/ir_adapter_pilot
+python -B -m res.evaluate_vtmot --device cuda --split eval --frame-stride 10 --checkpoint res_runs/ir_adapter_pilot/last.pt --output res_runs/ir_adapter_pilot/eval_last_stride10.json
+```
+
+先确认训练启动时打印 `ir_adapter_only=True`，一步训练的损失有限，
+并确认第 0 步验证与旧权重相同。300 步后用相同的 80 帧比较最终
+EPE 6.760 px、粗场 EPE 6.843 px、全局 argmax EPE 149.558 px、
+局部 soft EPE 7.051 px 和 PCK@3px 0.169。若粗场和最终 EPE
+均未改善，就停止此适配路线；如有明确改善，再看局部指标是否同步改善。
+
 当前 `res` 分支实现如下：
 
 ```text

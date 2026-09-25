@@ -8,6 +8,7 @@ from .encoder import MINDFeatureEncoder
 from .coarse_transformer import CoarseSACATransformer
 from .fine_interaction import FineScaleInteraction
 from .fine_cross_attention import FineCrossModalAttention
+from .ir_feature_adapter import IRFeatureAdapter
 from .global_matcher import GlobalMatcher
 from .local_matcher import LocalMatcher
 from .mind import MINDDescriptor
@@ -21,6 +22,14 @@ def build_global_registration(config) -> MINDGlobalRegistration:
         **OmegaConf.to_container(config.encoder, resolve=True),
     )
     matcher = GlobalMatcher(**OmegaConf.to_container(config.global_matcher, resolve=True))
+    adapter_config = config.get("ir_feature_adapter")
+    ir_feature_adapter = None
+    if adapter_config is not None and bool(adapter_config.get("enabled", False)):
+        settings = {key: value for key, value in
+                    OmegaConf.to_container(adapter_config, resolve=True).items()
+                    if key != "enabled"}
+        ir_feature_adapter = IRFeatureAdapter(encoder.base_channels * 2,
+                                              encoder.out_channels, **settings)
     transformer_config = config.get("coarse_transformer")
     coarse_transformer = None
     if transformer_config is not None and bool(transformer_config.get("enabled", False)):
@@ -60,5 +69,6 @@ def build_global_registration(config) -> MINDGlobalRegistration:
                                   coarse_transformer=coarse_transformer,
                                   fine_interaction=fine_interaction,
                                   fine_cross_attention=fine_cross_attention,
+                                  ir_feature_adapter=ir_feature_adapter,
                                   coarse_match_max_tokens=int(config.get(
                                       "coarse_match_max_tokens", 0)))

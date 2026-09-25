@@ -46,6 +46,14 @@ def freeze_fine_interaction_parameters(model: torch.nn.Module) -> None:
     model.fine_interaction.requires_grad_(False)
 
 
+def freeze_except_ir_adapter_parameters(model: torch.nn.Module) -> None:
+    """Hold all established registration weights fixed for adapter ablation."""
+    if model.ir_feature_adapter is None:
+        raise ValueError("ir_adapter_only requires an enabled IR feature adapter")
+    model.requires_grad_(False)
+    model.ir_feature_adapter.requires_grad_(True)
+
+
 def _save(path: Path, step: int, model: torch.nn.Module,
           optimizer: torch.optim.Optimizer, config, best_ratio: float) -> None:
     torch.save({"step": step, "model": model.state_dict(),
@@ -137,6 +145,11 @@ def main() -> None:
     freeze_fine_interaction = bool(train_config.get("freeze_fine_interaction", False))
     if freeze_fine_interaction:
         freeze_fine_interaction_parameters(model)
+    ir_adapter_only = bool(train_config.get("ir_adapter_only", False))
+    if ir_adapter_only:
+        if moving_source != "ir":
+            raise ValueError("ir_adapter_only requires moving_source=ir")
+        freeze_except_ir_adapter_parameters(model)
     loss_fn = RegistrationLoss(config.loss.weights,
                                charbonnier_eps=float(config.loss.charbonnier_eps),
                                match_focal_gamma=float(config.loss.get("match_focal_gamma", 0.0)),
@@ -200,7 +213,8 @@ def main() -> None:
           f"eval={len(eval_dataset)} crop={crop_hw} batch={batch_size} workers={num_workers} "
           f"lr={learning_rate:g} moving_source={moving_source} freeze_coarse={freeze_coarse} "
           f"freeze_local_refinement={freeze_local_refinement} "
-          f"freeze_fine_interaction={freeze_fine_interaction}")
+          f"freeze_fine_interaction={freeze_fine_interaction} "
+          f"ir_adapter_only={ir_adapter_only}")
     best_ratio = float("inf")
     if args.resume is not None:
         best_ratio = float(checkpoint.get("best_ratio", float("inf")))

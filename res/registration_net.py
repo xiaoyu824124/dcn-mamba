@@ -12,6 +12,7 @@ from .encoder import MINDFeatureEncoder
 from .coarse_transformer import CoarseSACATransformer
 from .fine_interaction import FineScaleInteraction
 from .fine_cross_attention import FineCrossModalAttention
+from .ir_feature_adapter import IRFeatureAdapter
 from .global_matcher import GlobalMatchOutput, GlobalMatcher
 from .local_matcher import LocalMatchOutput, LocalMatcher
 from .mind import MINDDescriptor, paired_mind
@@ -57,6 +58,7 @@ class MINDGlobalRegistration(nn.Module):
                  coarse_transformer: CoarseSACATransformer | None = None,
                  fine_interaction: FineScaleInteraction | None = None,
                  fine_cross_attention: FineCrossModalAttention | None = None,
+                 ir_feature_adapter: IRFeatureAdapter | None = None,
                  coarse_match_max_tokens: int = 0) -> None:
         super().__init__()
         self.mind = mind if mind is not None else MINDDescriptor()
@@ -67,6 +69,7 @@ class MINDGlobalRegistration(nn.Module):
         self.coarse_transformer = coarse_transformer
         self.fine_interaction = fine_interaction
         self.fine_cross_attention = fine_cross_attention
+        self.ir_feature_adapter = ir_feature_adapter
         if coarse_match_max_tokens < 0:
             raise ValueError("coarse_match_max_tokens must be non-negative")
         self.coarse_match_max_tokens = int(coarse_match_max_tokens)
@@ -92,6 +95,8 @@ class MINDGlobalRegistration(nn.Module):
         self._validate_inputs(ir, vi)
         mind_ir, mind_vi = paired_mind(ir, vi, self.mind)
         features_ir, features_vi = self.encoder.encode_pair(mind_ir, mind_vi)
+        if self.ir_feature_adapter is not None:
+            features_ir = self.ir_feature_adapter(features_ir)
         coarse_ir, coarse_vi = features_ir["1/8"], features_vi["1/8"]
         match_ir, match_vi = coarse_ir, coarse_vi
         coarse_height, coarse_width = coarse_ir.shape[-2:]

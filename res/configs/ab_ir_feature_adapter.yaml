@@ -1,0 +1,22 @@
+# Keep the established IR-VI registration model fixed; learn only small
+# infrared-specific corrections to its 1/4 and 1/8 feature maps.
+fine_interaction:
+  enabled: true
+
+ir_feature_adapter:
+  enabled: true
+  hidden_channels: 32
+
+vtmot_train:
+  ir_adapter_only: true
+
+loss:
+  weights:
+    flow: 1.0
+    match: 1.0
+    local: 1.0
+    affine: 10.0
+    mind: 0.0
+    edge: 0.0
+    smooth: 0.0
+    appearance: 0.0
