@@ -583,7 +583,14 @@ python -B -m res.evaluate_xoftr_vtmot --xoftr-root third_party\XoFTR --checkpoin
 同时显式报告 `fit_success_fraction` 和仅成功帧的 `fit_only_epe_px`；比较旧
 模型 EPE 6.760 px 时要同时看覆盖率。GT 只用于评估匹配和流场，不参与拟合。
 
-当前未取得官方权重，因此这里没有 XoFTR 的实测数值。
+取得权重后在 A4000 实测的 80 帧结果：XoFTR 仿射 EPE 6.834 px、
+PCK@3px 0.246、拟合成功 80/80 帧；原始匹配中位误差 6.605 px、
+PCK@3px 0.180。原 `res` 模型同集最终 EPE 6.760 px、PCK@3px 0.169。
+两者平均误差接近，而 XoFTR 有更高的小误差像素比例。要判断哪些匹配
+可以给现有局部模块使用，进一步报告高置信度 10% 匹配与 RANSAC 内点的
+GT PCK@3px；RANSAC 内点仅代表几何自洽，不能当作 GT 正确匹配。
+拉取新代码后沿用上面的完整 80 帧命令重新运行即可。注意 VTMOT 的仿射 GT
+描述的是合成的可见光错位，原始 IR 与 VI 的残余对齐误差也会计入匹配误差。
 
 当前 `res` 分支实现如下：
 

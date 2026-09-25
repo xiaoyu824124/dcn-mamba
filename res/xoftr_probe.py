@@ -148,8 +148,9 @@ def affine_to_flow(affine: np.ndarray, height: int, width: int,
 
 def match_gt_error(points0: np.ndarray, points1: np.ndarray,
                    gt_flow: torch.Tensor,
-                   valid_mask: torch.Tensor) -> np.ndarray:
-    """Return error for matches whose VI point has valid bilinear GT support."""
+                   valid_mask: torch.Tensor, *,
+                   keep_invalid: bool = False) -> np.ndarray:
+    """Return match errors; optionally retain invalid GT locations as NaN."""
     if len(points0) == 0:
         return np.empty(0, dtype=np.float32)
     height, width = gt_flow.shape[-2:]
@@ -164,7 +165,12 @@ def match_gt_error(points0: np.ndarray, points1: np.ndarray,
     predicted = torch.as_tensor(points1.copy(), device=gt_flow.device,
                                 dtype=torch.float32)
     errors = torch.linalg.vector_norm(predicted - coords - sampled_flow, dim=-1)
-    return errors[sampled_valid >= 0.999].cpu().numpy()
+    errors = errors.cpu().numpy()
+    supported = (sampled_valid >= 0.999).cpu().numpy()
+    if keep_invalid:
+        errors[~supported] = np.nan
+        return errors
+    return errors[supported]
 
 
 @torch.no_grad()
@@ -177,18 +183,37 @@ def evaluate_xoftr(model: torch.nn.Module, loader, device: torch.device,
     fit_valid = fit_epe = 0.0
     pixel_hits = {threshold: 0.0 for threshold in (1, 3, 5)}
     raw_errors: list[np.ndarray] = []
+    top_conf_errors: list[np.ndarray] = []
+    remaining_conf_errors: list[np.ndarray] = []
+    inlier_errors: list[np.ndarray] = []
+    outlier_errors: list[np.ndarray] = []
     samples = matches = inliers = successes = 0
     for batch in loader:
         ir, vi = batch["ir"].to(device), batch["vi"].to(device)
         target, valid = batch["gt_flow"].to(device), batch["valid_mask"].to(device)
-        points0, points1, _ = run_xoftr(model, ir, vi)
-        errors = match_gt_error(points0, points1, target, valid)
-        raw_errors.append(errors)
+        points0, points1, confidence = run_xoftr(model, ir, vi)
+        errors = match_gt_error(points0, points1, target, valid,
+                                keep_invalid=True)
+        supported = np.isfinite(errors)
+        raw_errors.append(errors[supported])
+        if len(confidence):
+            top_count = max(1, int(np.ceil(0.1 * len(confidence))))
+            top_indices = np.argsort(-confidence, kind="stable")[:top_count]
+            top_mask = np.zeros(len(confidence), dtype=bool)
+            top_mask[top_indices] = True
+            top_conf_errors.append(errors[top_mask & supported])
+            remaining_conf_errors.append(errors[~top_mask & supported])
         matches += len(points0)
         affine, count = fit_affine_ransac(points0, points1, seed=samples,
                                          iterations=ransac_iterations,
                                          threshold_px=ransac_threshold_px)
-        inliers += count
+        if affine is not None:
+            inliers += count
+            design = np.column_stack((points0, np.ones(len(points0))))
+            residual = np.linalg.norm(design @ affine.T - points1, axis=1)
+            inlier_mask = residual <= ransac_threshold_px
+            inlier_errors.append(errors[inlier_mask & supported])
+            outlier_errors.append(errors[~inlier_mask & supported])
         height, width = target.shape[-2:]
         prediction = (affine_to_flow(affine, height, width, device)
                       if affine is not None else torch.zeros_like(target))
@@ -209,6 +234,11 @@ def evaluate_xoftr(model: torch.nn.Module, loader, device: torch.device,
     if total_valid <= 0:
         raise ValueError("VTMOT evaluation has no valid pixels")
     all_errors = np.concatenate(raw_errors) if raw_errors else np.empty(0)
+    top_errors = np.concatenate(top_conf_errors) if top_conf_errors else np.empty(0)
+    remaining_errors = (np.concatenate(remaining_conf_errors)
+                        if remaining_conf_errors else np.empty(0))
+    fit_inlier_errors = np.concatenate(inlier_errors) if inlier_errors else np.empty(0)
+    fit_outlier_errors = np.concatenate(outlier_errors) if outlier_errors else np.empty(0)
     report: dict[str, object] = {
         "epe_px": total_epe / total_valid,
         "zero_flow_epe_px": total_zero / total_valid,
@@ -224,6 +254,16 @@ def evaluate_xoftr(model: torch.nn.Module, loader, device: torch.device,
         "ransac_inlier_matches": inliers,
         "match_epe_px": float(all_errors.mean()) if len(all_errors) else None,
         "match_median_epe_px": float(np.median(all_errors)) if len(all_errors) else None,
+        "match_top10pct_conf_valid": int(len(top_errors)),
+        "match_top10pct_conf_pck_3px": float((top_errors <= 3).mean())
+        if len(top_errors) else None,
+        "match_remaining90pct_conf_pck_3px": float((remaining_errors <= 3).mean())
+        if len(remaining_errors) else None,
+        "match_ransac_inlier_gt_valid": int(len(fit_inlier_errors)),
+        "match_ransac_inlier_pck_3px": float((fit_inlier_errors <= 3).mean())
+        if len(fit_inlier_errors) else None,
+        "match_ransac_outlier_pck_3px": float((fit_outlier_errors <= 3).mean())
+        if len(fit_outlier_errors) else None,
     }
     report.update({f"match_pck_{threshold}px": float((all_errors <= threshold).mean())
                    if len(all_errors) else None for threshold in (1, 3, 5)})

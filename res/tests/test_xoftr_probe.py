@@ -10,10 +10,12 @@ from res.xoftr_probe import (affine_to_flow, evaluate_xoftr, fit_affine_ransac,
 
 
 class FakeXoFTR(torch.nn.Module):
-    def __init__(self, points0, points1):
+    def __init__(self, points0, points1, confidence=None):
         super().__init__()
         self.points0 = torch.tensor(points0, dtype=torch.float32)
         self.points1 = torch.tensor(points1, dtype=torch.float32)
+        self.confidence = (torch.tensor(confidence, dtype=torch.float32)
+                           if confidence is not None else torch.ones(len(points0)))
 
     def forward(self, data):
         assert data["image0"].shape[1] == 1  # fixed visible grayscale
@@ -22,7 +24,7 @@ class FakeXoFTR(torch.nn.Module):
         assert torch.allclose(data["image1"], torch.full_like(data["image1"], 0.25))
         data["mkpts0_f"] = self.points0
         data["mkpts1_f"] = self.points1
-        data["mconf_f"] = torch.ones(len(self.points0))
+        data["mconf_f"] = self.confidence
         data["m_bids"] = torch.zeros(len(self.points0), dtype=torch.long)
 
 
@@ -63,6 +65,9 @@ class XoFTRProbeTest(unittest.TestCase):
         errors = match_gt_error(source, target, flow, valid)
         self.assertEqual(len(errors), 1)
         self.assertAlmostEqual(float(errors[0]), 0.0, places=4)
+        all_errors = match_gt_error(source, target, flow, valid, keep_invalid=True)
+        self.assertEqual(len(all_errors), 2)
+        self.assertTrue(np.isnan(all_errors[1]))
 
     def test_full_report_includes_failed_frames_with_zero_fallback(self):
         points0 = np.array([[12, 12], [60, 12], [110, 12],
@@ -87,6 +92,22 @@ class XoFTRProbeTest(unittest.TestCase):
         self.assertIsNone(failed["fit_only_epe_px"])
         self.assertAlmostEqual(failed["epe_px"], failed["zero_flow_epe_px"])
         self.assertEqual(failed["match_pck_3px"], 1.0)
+
+    def test_confidence_and_ransac_inlier_diagnostics_use_gt_only_for_scoring(self):
+        rng = np.random.default_rng(21)
+        points0 = rng.uniform((10, 10), (95, 75), size=(20, 2)).astype(np.float32)
+        points1 = points0 + np.array([4, -2], dtype=np.float32)
+        points1[14:] = points0[14:] + np.array([18, 12], dtype=np.float32)
+        confidence = np.r_[np.full(14, 0.9), np.full(6, 0.1)]
+        report = evaluate_xoftr(FakeXoFTR(points0, points1, confidence),
+                                [one_frame()], torch.device("cpu"),
+                                ransac_iterations=300)
+        self.assertEqual(report["matches_total"], 20)
+        self.assertAlmostEqual(report["match_pck_3px"], 0.7)
+        self.assertAlmostEqual(report["match_top10pct_conf_pck_3px"], 1.0)
+        self.assertLess(report["match_remaining90pct_conf_pck_3px"], 1.0)
+        self.assertAlmostEqual(report["match_ransac_inlier_pck_3px"], 1.0)
+        self.assertAlmostEqual(report["match_ransac_outlier_pck_3px"], 0.0)
 
 
 if __name__ == "__main__":
