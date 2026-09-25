@@ -323,6 +323,22 @@ python -B -m res.evaluate_vtmot --device cuda --split eval --frame-stride 10 --c
 保持约 15.939 和 7.051 px；变化只应出现在残差修正与最终流场。
 若最终 EPE 仍只改善几百分之一像素，就不再延长这一路局部头训练。
 
+实测局部头 300 步后，80 帧粗场 EPE 和局部 soft／argmax EPE 完全不变；
+最终 EPE 从 6.810 降至 6.760 px，改善查询比例从 37.1% 升至 47.5%，
+但 PCK@3px 只从 0.16865 到 0.16874。停止延长这一局部头训练。
+
+同一 checkpoint 增加局部匹配可靠性诊断，不需重训：
+
+```bat
+python -B -m res.evaluate_vtmot --device cuda --split eval --frame-stride 10 --checkpoint res_runs/local_head_from_descriptor_pilot/last.pt --output res_runs/local_head_from_descriptor_pilot/eval_local_confidence.json
+```
+
+`local_soft_improved_fraction` 表示直接采用局部概率加权位移时改善粗场
+的查询比例。`local_top10pct_*` 只看最大候选概率最高的 10% 有效查询，
+分别比较这些位置的粗场、概率加权位移和 argmax 误差，以及概率加权位移
+实际改善的比例。若高置信区域也无法优于粗场，后续应重做 1/4 特征；
+若这部分明显更准，再试按置信度选择性修正。
+
 当前 `res` 分支实现如下：
 
 ```text

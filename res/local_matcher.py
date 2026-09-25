@@ -161,12 +161,35 @@ def local_matching_diagnostics(match: LocalMatchOutput, gt_flow: torch.Tensor,
     oracle_error = candidate_error.masked_fill(~match.valid_candidates, float("inf")).amin(dim=1)
     oracle_mask = mask & covered & match.valid_candidates.any(dim=1)
     valid_count = mask.sum().clamp_min(1)
+    confidence = match.probability.amax(dim=1)
+    top_coarse = top_soft = top_argmax = top_improved = 0.0
+    top_count = 0
+    for batch_index in range(mask.shape[0]):
+        valid_indices = mask[batch_index].flatten().nonzero(as_tuple=True)[0]
+        if valid_indices.numel() == 0:
+            continue
+        count = max(1, (valid_indices.numel() + 9) // 10)
+        ranking = confidence[batch_index].flatten()[valid_indices].topk(count).indices
+        selected = valid_indices[ranking]
+        coarse_selected = coarse_error[batch_index].flatten()[selected]
+        soft_selected = soft_error[batch_index].flatten()[selected]
+        top_coarse += float(coarse_selected.sum())
+        top_soft += float(soft_selected.sum())
+        top_argmax += float(error[batch_index].flatten()[selected].sum())
+        top_improved += float((soft_selected < coarse_selected).sum())
+        top_count += count
     return {
         "local_window_coverage": float((covered & mask).sum() / valid_count),
         "local_argmax_epe_px": float((error * mask).sum() / valid_count),
         "local_oracle_epe_px": float(torch.where(oracle_mask, oracle_error, 0).sum()
                                       / oracle_mask.sum().clamp_min(1)),
         "local_soft_epe_px": float((soft_error * mask).sum() / valid_count),
+        "local_soft_improved_fraction": float(
+            ((soft_error < coarse_error) & mask).sum() / valid_count),
+        "local_top10pct_coarse_epe_px": top_coarse / max(top_count, 1),
+        "local_top10pct_soft_epe_px": top_soft / max(top_count, 1),
+        "local_top10pct_argmax_epe_px": top_argmax / max(top_count, 1),
+        "local_top10pct_soft_improved_fraction": top_improved / max(top_count, 1),
         "local_gt_residual_px": float((coarse_error * mask).sum() / valid_count),
         "local_pred_residual_px": float((torch.linalg.vector_norm(
             match.residual_flow.float() * stride, dim=1) * mask).sum() / valid_count),

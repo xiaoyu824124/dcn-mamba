@@ -34,6 +34,10 @@ class LocalMatcherTest(unittest.TestCase):
                                0.0, places=5)
         self.assertLess(diagnostics["local_soft_epe_px"],
                         diagnostics["local_gt_residual_px"])
+        self.assertLess(diagnostics["local_top10pct_soft_epe_px"],
+                        diagnostics["local_top10pct_coarse_epe_px"])
+        self.assertGreater(diagnostics["local_top10pct_soft_improved_fraction"],
+                           0.5)
         loss = local_matching_loss(output, gt)
         self.assertTrue(torch.isfinite(loss))
         (loss + (output.refined_flow - gt[:, :, ::4, ::4] / 4).square().mean()).backward()
