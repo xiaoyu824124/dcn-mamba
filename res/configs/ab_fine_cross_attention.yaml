@@ -1,0 +1,26 @@
+# Isolate 1/4 coarse-aligned cross-modal interaction with the established
+# coarse field, shared 1/4 projection and residual head held fixed.
+fine_interaction:
+  enabled: true
+
+fine_cross_attention:
+  enabled: true
+  hidden_channels: 16
+  window_size: 5
+  temperature: 0.2
+
+vtmot_train:
+  freeze_coarse: true
+  freeze_local_refinement: true
+  freeze_fine_interaction: true
+
+loss:
+  weights:
+    flow: 0.0
+    match: 0.0
+    appearance: 0.0
+    local: 1.0
+    mind: 0.0
+    edge: 0.0
+    smooth: 0.0
+    affine: 0.0

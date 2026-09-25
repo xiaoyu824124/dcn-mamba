@@ -445,6 +445,36 @@ python -B -m res.evaluate_vtmot --device cuda --split eval --frame-stride 10 --c
 python -B -m res.evaluate_vtmot --device cuda --split eval --frame-stride 10 --checkpoint res_runs/local_head_from_descriptor_pilot/last.pt --diagnose-confidence-gate --output res_runs/local_head_from_descriptor_pilot/eval_confidence_gate_stride10.json
 ```
 
+80 帧实测：完整局部头 EPE 6.760 px，粗场 6.843 px；只采用最高置信度
+10%／25%／50% 的局部头，EPE 为 6.833／6.815／6.789 px，均不及完整
+局部头。相应 soft 位移为 6.864／6.863／6.873 px；最高置信 10% 查询的
+局部 soft EPE 7.283 px，比同位置粗场 7.158 px 更差。因此最大候选概率
+目前不能识别可靠修正，不把门控接入推理。
+
+下一步单独检验 [XoFTR++](https://www.nature.com/articles/s41598-026-68975-9)
+启发的细尺度跨模态交互：`fine_cross_attention.py` 在 1/4 上先按粗场
+预对齐 IR 特征，再用 5×5 局部注意力给 VI 查询补充 IR 上下文。
+IR 原特征仍留在原坐标供原局部匹配器搜索；全局 WLS、搜索窗口与
+残差头均不变。模块残差增益从零开始，加载旧权重时第 0 步输出相同。
+这是对论文思想的轻量消融，不声称复现其完整双向模块。
+
+先固定粗场、已有跨尺度模块和局部残差头，只以局部匹配 NLL 训练
+新增模块。训练不需要重新计算基线；旧 checkpoint 就是同初始化的
+零模块对照。
+
+```bat
+python -B -m res.train_vtmot --device cuda --steps 1 --num-workers 0 --lr 0.0001 --init res_runs/local_head_from_descriptor_pilot/last.pt --overlay res/configs/ab_fine_cross_attention.yaml --output-dir res_runs/fine_cross_smoke
+python -B -m res.train_vtmot --device cuda --run pilot --num-workers 0 --lr 0.0001 --init res_runs/local_head_from_descriptor_pilot/last.pt --overlay res/configs/ab_fine_cross_attention.yaml --output-dir res_runs/fine_cross_pilot
+python -B -m res.evaluate_vtmot --device cuda --split eval --frame-stride 10 --checkpoint res_runs/fine_cross_pilot/last.pt --output res_runs/fine_cross_pilot/eval_last_stride10.json
+```
+
+核对第 0 步评估与旧权重一致，`coarse_epe_px` 保持约 6.843 px；
+重点比较 `local_argmax_epe_px`（旧 15.939）、`local_soft_epe_px`
+（旧 7.051）和最终 `epe_px`（旧 6.760）。`best.pt` 可能因 16 帧验证
+保留第 0 步，所以用 `last.pt` 看模块是否学到东西。若局部排名和
+soft 位移都没有改善，就停止这一模块；若明显改善，再解冻局部残差头
+做第二阶段训练。
+
 当前 `res` 分支实现如下：
 
 ```text

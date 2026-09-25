@@ -11,6 +11,7 @@ import torch.nn.functional as F
 from .encoder import MINDFeatureEncoder
 from .coarse_transformer import CoarseSACATransformer
 from .fine_interaction import FineScaleInteraction
+from .fine_cross_attention import FineCrossModalAttention
 from .global_matcher import GlobalMatchOutput, GlobalMatcher
 from .local_matcher import LocalMatchOutput, LocalMatcher
 from .mind import MINDDescriptor, paired_mind
@@ -55,6 +56,7 @@ class MINDGlobalRegistration(nn.Module):
                  local_matcher: LocalMatcher | None = None,
                  coarse_transformer: CoarseSACATransformer | None = None,
                  fine_interaction: FineScaleInteraction | None = None,
+                 fine_cross_attention: FineCrossModalAttention | None = None,
                  coarse_match_max_tokens: int = 0) -> None:
         super().__init__()
         self.mind = mind if mind is not None else MINDDescriptor()
@@ -64,6 +66,7 @@ class MINDGlobalRegistration(nn.Module):
         self.local_matcher = local_matcher
         self.coarse_transformer = coarse_transformer
         self.fine_interaction = fine_interaction
+        self.fine_cross_attention = fine_cross_attention
         if coarse_match_max_tokens < 0:
             raise ValueError("coarse_match_max_tokens must be non-negative")
         self.coarse_match_max_tokens = int(coarse_match_max_tokens)
@@ -133,6 +136,9 @@ class MINDGlobalRegistration(nn.Module):
                                                width / feature_hw[1])).view(1, 2, 1, 1)
             coarse_flow_4 = F.interpolate(coarse_flow, size=feature_hw,
                                           mode="bilinear", align_corners=False) / stride_4
+            if self.fine_cross_attention is not None:
+                fine_ir, fine_vi = self.fine_cross_attention(fine_ir, fine_vi,
+                                                              coarse_flow_4)
             local_match = self.local_matcher(fine_ir, fine_vi, coarse_flow_4)
             final_flow = upsample_feature_flow(local_match.refined_flow, (height, width),
                                                (height / feature_hw[0], width / feature_hw[1]))

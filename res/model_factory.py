@@ -7,6 +7,7 @@ from omegaconf import OmegaConf
 from .encoder import MINDFeatureEncoder
 from .coarse_transformer import CoarseSACATransformer
 from .fine_interaction import FineScaleInteraction
+from .fine_cross_attention import FineCrossModalAttention
 from .global_matcher import GlobalMatcher
 from .local_matcher import LocalMatcher
 from .mind import MINDDescriptor
@@ -44,9 +45,20 @@ def build_global_registration(config) -> MINDGlobalRegistration:
                     if key != "enabled"}
         fine_interaction = FineScaleInteraction(encoder.base_channels * 2,
                                                 encoder.out_channels, **settings)
+    cross_config = config.get("fine_cross_attention")
+    fine_cross_attention = None
+    if cross_config is not None and bool(cross_config.get("enabled", False)):
+        if local_matcher is None:
+            raise ValueError("fine_cross_attention requires local_matcher.enabled=true")
+        settings = {key: value for key, value in
+                    OmegaConf.to_container(cross_config, resolve=True).items()
+                    if key != "enabled"}
+        fine_cross_attention = FineCrossModalAttention(encoder.base_channels * 2,
+                                                       **settings)
     return MINDGlobalRegistration(mind=mind, encoder=encoder, matcher=matcher,
                                   local_matcher=local_matcher,
                                   coarse_transformer=coarse_transformer,
                                   fine_interaction=fine_interaction,
+                                  fine_cross_attention=fine_cross_attention,
                                   coarse_match_max_tokens=int(config.get(
                                       "coarse_match_max_tokens", 0)))
