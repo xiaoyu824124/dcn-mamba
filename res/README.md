@@ -49,6 +49,25 @@ python -B -m res.evaluate_crft_vtmot --crft-root G:\cxj\CRFT-main --checkpoint r
 python -B -m res.evaluate_crft_vtmot --crft-root G:\cxj\CRFT-main --checkpoint res_runs\crft_vtmot_pilot\best.pt --device cuda --split eval --frame-stride 10 --model-hw 128 128 --output res_runs\crft_vtmot_pilot\eval_128_stride10.json
 ```
 
+## 本模型：限制粗匹配候选数
+
+480×640 输入的 1/8 网格有 60×80＝4800 个候选。可选配置
+`ab_compact_global300.yaml` 只把送入全局匹配器的 1/8 特征平均池化到
+15×20，保留全图视场，但把每个查询的候选数降为 300。原始 1/8 特征
+仍送入 1/4 跨尺度模块，局部匹配器、WLS 和全分辨率流场监督不变。
+训练与推理必须使用同一配置；不开启时旧 checkpoint 的行为不变。
+
+先对既有 1/4 描述子 checkpoint 做同权重 80 帧诊断：
+
+```bat
+python -B -m res.evaluate_vtmot --device cuda --split eval --frame-stride 10 --checkpoint res_runs/local_head_from_descriptor_pilot/last.pt --overlay res/configs/ab_compact_global300.yaml --output res_runs/local_head_from_descriptor_pilot/eval_compact300_stride10.json
+```
+
+与该 checkpoint 原始全局网格的结果比较 `coarse_match_candidates`、
+`coarse_epe_px`、`match_epe_argmax_px`、`local_window_coverage` 和
+`epe_px`。这是复用旧权重的诊断：池化同时改变了特征和候选数，结果
+不能单独证明候选数的因果作用，也不能代替在小网格上重新训练。
+
 ## A4000 服务器准备（当前为 Windows 环境）
 
 你贴出的 `G:\cxj\VF-Bench-main` 和 `C:\Users\cxj\.conda` 表明当前 SSH 终端连接的是

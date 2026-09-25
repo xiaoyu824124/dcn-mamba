@@ -55,11 +55,14 @@ def evaluate(model: torch.nn.Module, loader: DataLoader, device: torch.device,
     total_corner_epe = total_cycle_epe = 0.0
     hit_sums = {f"pck_{threshold}px": 0.0 for threshold in (1, 3, 5)}
     diagnostic_sums: Dict[str, float] = {}
+    coarse_grid_hw = None
     model.eval()
     for batch in loader:
         ir, vi = batch["ir"].to(device), batch["vi"].to(device)
         target, valid = batch["gt_flow"].to(device), batch["valid_mask"].to(device)
         output = model(ir, vi)
+        if output.match is not None:
+            coarse_grid_hw = tuple(output.match.coarse_flow.shape[-2:])
         predicted = output.final_flow if output.final_flow is not None else output.coarse_flow
         epe = endpoint_error(predicted, target, valid)
         coarse_epe = endpoint_error(output.coarse_flow, target, valid)
@@ -111,6 +114,9 @@ def evaluate(model: torch.nn.Module, loader: DataLoader, device: torch.device,
               "coarse_epe_px": total_coarse_epe / max(total_valid, 1.0),
               "zero_flow_epe_px": total_baseline / max(total_valid, 1.0),
               "valid_pixels": total_valid}
+    if coarse_grid_hw is not None:
+        report["coarse_match_grid_hw"] = list(coarse_grid_hw)
+        report["coarse_match_candidates"] = coarse_grid_hw[0] * coarse_grid_hw[1]
     report["relative_epe"] = report["epe_px"] / max(report["zero_flow_epe_px"], 1e-8)
     report["affine_corner_epe_px"] = total_corner_epe / max(total_samples, 1.0)
     report["affine_gt_inverse_cycle_px"] = total_cycle_epe / max(total_samples, 1.0)

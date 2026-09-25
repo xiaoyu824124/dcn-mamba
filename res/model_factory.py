@@ -47,4 +47,6 @@ def build_global_registration(config) -> MINDGlobalRegistration:
     return MINDGlobalRegistration(mind=mind, encoder=encoder, matcher=matcher,
                                   local_matcher=local_matcher,
                                   coarse_transformer=coarse_transformer,
-                                  fine_interaction=fine_interaction)
+                                  fine_interaction=fine_interaction,
+                                  coarse_match_max_tokens=int(config.get(
+                                      "coarse_match_max_tokens", 0)))

@@ -72,6 +72,32 @@ class MINDGlobalRegistrationTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "divisible by 8"):
             small_model()(torch.rand(1, 1, 65, 64), torch.rand(1, 3, 65, 64))
 
+    def test_compact_coarse_matching_preserves_full_resolution_fine_stage(self):
+        torch.manual_seed(23)
+        model = small_model()
+        model.fine_interaction = FineScaleInteraction(16, 12)
+        model.eval()
+        ir, vi = torch.rand(1, 1, 64, 80), torch.rand(1, 3, 64, 80)
+        full = model(ir, vi)
+        model.coarse_match_max_tokens = 100
+        unchanged = model(ir, vi)
+        self.assertTrue(torch.equal(full.coarse_flow, unchanged.coarse_flow))
+        model.coarse_match_max_tokens = 20
+        compact = model(ir, vi)
+        self.assertEqual(tuple(compact.match.coarse_flow.shape[-2:]), (4, 5))
+        self.assertEqual(tuple(compact.match.matching_probability.shape), (1, 20, 20))
+        self.assertEqual(tuple(compact.coarse_flow.shape), (1, 2, 64, 80))
+        self.assertEqual(tuple(compact.local_match.probability.shape[-2:]), (16, 20))
+        self.assertTrue(torch.isfinite(compact.final_flow).all())
+        compact.final_flow.square().mean().backward()
+        self.assertIsNotNone(model.encoder.stage_8[0][0].weight.grad)
+
+    def test_compact_coarse_matching_rejects_degenerate_wls_grid(self):
+        model = small_model()
+        model.coarse_match_max_tokens = 4
+        with self.assertRaisesRegex(ValueError, "fewer than 3 cells"):
+            model(torch.rand(1, 1, 64, 80), torch.rand(1, 3, 64, 80))
+
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA is unavailable")
     def test_cuda(self):
         model = small_model().cuda()

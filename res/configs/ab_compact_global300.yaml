@@ -1,0 +1,4 @@
+# Compare the same full-resolution encoder and local matcher with 300 rather
+# than 4800 candidates in the coarse all-pairs stage. Use this overlay for both
+# training and evaluation; evaluation alone is a same-checkpoint diagnostic.
+coarse_match_max_tokens: 300

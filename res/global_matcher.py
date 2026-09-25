@@ -17,10 +17,10 @@ import torch.nn.functional as F
 
 @dataclass
 class GlobalMatchOutput:
-    """Outputs of :class:`GlobalMatcher` on the 1/8 feature grid.
+    """Outputs of :class:`GlobalMatcher` on its input feature grid.
 
     ``coarse_flow`` is in **feature-grid pixels**, ordered ``[dy, dx]``, with
-    shape ``[B,2,H8,W8]``.  It follows the project's backward-warp convention:
+    shape ``[B,2,Hf,Wf]``.  It follows the project's backward-warp convention:
 
     ``aligned_ir(p_vi) = ir(p_vi + coarse_flow(p_vi))``.
 

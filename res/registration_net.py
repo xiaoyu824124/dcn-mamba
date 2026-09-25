@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -43,9 +44,9 @@ class MINDGlobalRegistration(nn.Module):
         ir: moving infrared frame ``[B,1,H,W]``.
         vi: fixed visible RGB frame ``[B,3,H,W]``.
 
-    The input size must be divisible by eight.  The encoder's 1/8 grid has a
-    physical stride of exactly eight input pixels, therefore 1/8 `[dy,dx]` flow
-    is lifted by ``(8,8)`` before image-grid backward warping.
+    The input size must be divisible by eight. The encoder emits a 1/8 grid;
+    optionally pooling only the global-matching branch reduces its candidate
+    count. Flow lifting uses the actual match-grid dimensions in either case.
     """
 
     def __init__(self, mind: MINDDescriptor | None = None,
@@ -53,7 +54,8 @@ class MINDGlobalRegistration(nn.Module):
                  matcher: GlobalMatcher | None = None,
                  local_matcher: LocalMatcher | None = None,
                  coarse_transformer: CoarseSACATransformer | None = None,
-                 fine_interaction: FineScaleInteraction | None = None) -> None:
+                 fine_interaction: FineScaleInteraction | None = None,
+                 coarse_match_max_tokens: int = 0) -> None:
         super().__init__()
         self.mind = mind if mind is not None else MINDDescriptor()
         self.encoder = (encoder if encoder is not None else
@@ -62,6 +64,9 @@ class MINDGlobalRegistration(nn.Module):
         self.local_matcher = local_matcher
         self.coarse_transformer = coarse_transformer
         self.fine_interaction = fine_interaction
+        if coarse_match_max_tokens < 0:
+            raise ValueError("coarse_match_max_tokens must be non-negative")
+        self.coarse_match_max_tokens = int(coarse_match_max_tokens)
         if self.encoder.in_channels != self.mind.channels:
             raise ValueError(
                 "encoder input channels must equal MIND channels: "
@@ -87,7 +92,18 @@ class MINDGlobalRegistration(nn.Module):
         coarse_ir, coarse_vi = features_ir["1/8"], features_vi["1/8"]
         if self.coarse_transformer is not None:
             coarse_ir, coarse_vi = self.coarse_transformer(coarse_ir, coarse_vi)
-        match: GlobalMatchOutput = self.matcher(coarse_ir, coarse_vi)
+        match_ir, match_vi = coarse_ir, coarse_vi
+        coarse_height, coarse_width = coarse_ir.shape[-2:]
+        if (self.coarse_match_max_tokens
+                and coarse_height * coarse_width > self.coarse_match_max_tokens):
+            scale = math.sqrt(self.coarse_match_max_tokens / (coarse_height * coarse_width))
+            match_hw = (max(1, int(coarse_height * scale)),
+                        max(1, int(coarse_width * scale)))
+            if min(match_hw) < 3 and self.matcher.affine_projection:
+                raise ValueError("coarse_match_max_tokens leaves fewer than 3 cells per axis for WLS")
+            match_ir = F.adaptive_avg_pool2d(coarse_ir, match_hw)
+            match_vi = F.adaptive_avg_pool2d(coarse_vi, match_hw)
+        match: GlobalMatchOutput = self.matcher(match_ir, match_vi)
 
         height, width = ir.shape[-2:]
         feature_height, feature_width = match.coarse_flow.shape[-2:]
