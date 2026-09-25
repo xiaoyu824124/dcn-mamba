@@ -90,8 +90,6 @@ class MINDGlobalRegistration(nn.Module):
         mind_ir, mind_vi = paired_mind(ir, vi, self.mind)
         features_ir, features_vi = self.encoder.encode_pair(mind_ir, mind_vi)
         coarse_ir, coarse_vi = features_ir["1/8"], features_vi["1/8"]
-        if self.coarse_transformer is not None:
-            coarse_ir, coarse_vi = self.coarse_transformer(coarse_ir, coarse_vi)
         match_ir, match_vi = coarse_ir, coarse_vi
         coarse_height, coarse_width = coarse_ir.shape[-2:]
         if (self.coarse_match_max_tokens
@@ -103,6 +101,14 @@ class MINDGlobalRegistration(nn.Module):
                 raise ValueError("coarse_match_max_tokens leaves fewer than 3 cells per axis for WLS")
             match_ir = F.adaptive_avg_pool2d(coarse_ir, match_hw)
             match_vi = F.adaptive_avg_pool2d(coarse_vi, match_hw)
+        if self.coarse_transformer is not None:
+            match_ir, match_vi = self.coarse_transformer(match_ir, match_vi)
+        # The original 1/4 module expects full-size 1/8 context. In the
+        # unpooled path, preserve its established post-SA-CA input exactly.
+        if match_ir.shape[-2:] == coarse_ir.shape[-2:]:
+            fine_context_ir, fine_context_vi = match_ir, match_vi
+        else:
+            fine_context_ir, fine_context_vi = coarse_ir, coarse_vi
         match: GlobalMatchOutput = self.matcher(match_ir, match_vi)
 
         height, width = ir.shape[-2:]
@@ -121,7 +127,7 @@ class MINDGlobalRegistration(nn.Module):
             fine_ir, fine_vi = features_ir["1/4"], features_vi["1/4"]
             if self.fine_interaction is not None:
                 fine_ir, fine_vi = self.fine_interaction(
-                    fine_ir, fine_vi, coarse_ir, coarse_vi)
+                    fine_ir, fine_vi, fine_context_ir, fine_context_vi)
             feature_hw = fine_ir.shape[-2:]
             stride_4 = coarse_flow.new_tensor((height / feature_hw[0],
                                                width / feature_hw[1])).view(1, 2, 1, 1)

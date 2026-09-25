@@ -53,8 +53,9 @@ python -B -m res.evaluate_crft_vtmot --crft-root G:\cxj\CRFT-main --checkpoint r
 
 480×640 输入的 1/8 网格有 60×80＝4800 个候选。可选配置
 `ab_compact_global300.yaml` 只把送入全局匹配器的 1/8 特征平均池化到
-15×20，保留全图视场，但把每个查询的候选数降为 300。原始 1/8 特征
-仍送入 1/4 跨尺度模块，局部匹配器、WLS 和全分辨率流场监督不变。
+15×20，保留全图视场，但把每个查询的候选数降为 300。若启用 SA–CA，
+它也在池化后的小网格上运行；原始 1/8 特征仍送入 1/4 跨尺度模块。
+局部匹配器、WLS 和全分辨率流场监督不变。
 训练与推理必须使用同一配置；不开启时旧 checkpoint 的行为不变。
 
 先对既有 1/4 描述子 checkpoint 做同权重 80 帧诊断：
@@ -67,6 +68,21 @@ python -B -m res.evaluate_vtmot --device cuda --split eval --frame-stride 10 --c
 `coarse_epe_px`、`match_epe_argmax_px`、`local_window_coverage` 和
 `epe_px`。这是复用旧权重的诊断：池化同时改变了特征和候选数，结果
 不能单独证明候选数的因果作用，也不能代替在小网格上重新训练。
+
+如果继续检验小网格上的学习，从同一 1/4 描述子／局部头权重做两组
+300 步训练。两组都显式启用 `stage2_fine_interaction.yaml`，因为
+`--init` 只加载权重，不恢复 checkpoint 的结构配置。第二组仅增加
+SA–CA；其残差增益从零开始，因此两组的第 0 步输出相同。
+
+```bat
+python -B -m res.train_vtmot --device cuda --run pilot --num-workers 0 --lr 0.0001 --init res_runs/local_head_from_descriptor_pilot/last.pt --overlay res/configs/stage2_fine_interaction.yaml --overlay res/configs/ab_compact_global300.yaml --output-dir res_runs/compact300_control_pilot
+python -B -m res.train_vtmot --device cuda --run pilot --num-workers 0 --lr 0.0001 --init res_runs/local_head_from_descriptor_pilot/last.pt --overlay res/configs/stage2_fine_interaction.yaml --overlay res/configs/ab_compact_global300.yaml --overlay res/configs/ab_saca_full.yaml --output-dir res_runs/compact300_saca_pilot
+python -B -m res.evaluate_vtmot --device cuda --split eval --frame-stride 10 --checkpoint res_runs/compact300_control_pilot/last.pt --output res_runs/compact300_control_pilot/eval_last_stride10.json
+python -B -m res.evaluate_vtmot --device cuda --split eval --frame-stride 10 --checkpoint res_runs/compact300_saca_pilot/last.pt --output res_runs/compact300_saca_pilot/eval_last_stride10.json
+```
+
+比较 0、100、200、300 步和两组 `last.pt` 的 80 帧指标；`best.pt`
+按 16 帧 EPE 选取，可能保留第 0 步，不能用来判断 SA–CA 是否学会。
 
 ## A4000 服务器准备（当前为 Windows 环境）
 

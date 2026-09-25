@@ -73,17 +73,31 @@ class MINDGlobalRegistrationTest(unittest.TestCase):
             small_model()(torch.rand(1, 1, 65, 64), torch.rand(1, 3, 65, 64))
 
     def test_compact_coarse_matching_preserves_full_resolution_fine_stage(self):
+        class RecordingTransformer(torch.nn.Module):
+            def forward(self, ir, vi):
+                self.input_hw = tuple(ir.shape[-2:])
+                return ir, vi
+
+        class RecordingFineInteraction(FineScaleInteraction):
+            def forward(self, fine_ir, fine_vi, coarse_ir, coarse_vi):
+                self.coarse_hw = tuple(coarse_ir.shape[-2:])
+                return super().forward(fine_ir, fine_vi, coarse_ir, coarse_vi)
+
         torch.manual_seed(23)
         model = small_model()
-        model.fine_interaction = FineScaleInteraction(16, 12)
+        model.coarse_transformer = RecordingTransformer()
+        model.fine_interaction = RecordingFineInteraction(16, 12)
         model.eval()
         ir, vi = torch.rand(1, 1, 64, 80), torch.rand(1, 3, 64, 80)
         full = model(ir, vi)
+        self.assertEqual(model.coarse_transformer.input_hw, (8, 10))
         model.coarse_match_max_tokens = 100
         unchanged = model(ir, vi)
         self.assertTrue(torch.equal(full.coarse_flow, unchanged.coarse_flow))
         model.coarse_match_max_tokens = 20
         compact = model(ir, vi)
+        self.assertEqual(model.coarse_transformer.input_hw, (4, 5))
+        self.assertEqual(model.fine_interaction.coarse_hw, (8, 10))
         self.assertEqual(tuple(compact.match.coarse_flow.shape[-2:]), (4, 5))
         self.assertEqual(tuple(compact.match.matching_probability.shape), (1, 20, 20))
         self.assertEqual(tuple(compact.coarse_flow.shape), (1, 2, 64, 80))
