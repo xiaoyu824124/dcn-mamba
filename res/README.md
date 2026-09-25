@@ -1,5 +1,43 @@
 # IR–VI 单帧配准：先粗后细
 
+## CRFT 独立基线（VTMOT 同协议）
+
+官方 [CRFT 代码](https://github.com/NEU-Liuxuecong/CRFT) 单独解压，不复制进本仓库。
+本仓库的 `res.evaluate_crft_vtmot` 和 `res.train_crft_vtmot` 直接调用其模型，
+沿用本仓库的 VTMOT 清单、480×640 预处理、有效像素掩码、EPE 和逐像素 PCK。
+CRFT 输入顺序为可见光 `image0`、红外 `image1`，输出流场为 `[dx,dy]`；
+适配器转成 VTMOT 的 `[dy,dx]` 后才计算指标。
+
+官方细尺度位置编码需要方形输入，因此适配器默认把 480×640 等比缩至
+72×96，居中补边到 96×96，预测后裁去补边，再把位移按比例升回
+480×640 评估；JSON 会记录 `model_input_hw`。这一设置是 VTMOT 适配实验，
+不是复现论文的 RoadScene 2.37 px。论文的 CMR@3px 是按样本 EPE
+是否低于阈值计数，也不能直接与这里逐像素 `pck_3px` 比较。
+
+在 A4000 服务器安装本仓库依赖和适配器所需的 `yacs`、`einops`，
+并将官方 CRFT 仓库单独解压，例如 `G:\cxj\CRFT-main`。若已下载
+官方 RoadScene 权重，可先评估零样本迁移：
+
+```bat
+python -m pip install yacs einops -i https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple
+python -B -m res.evaluate_crft_vtmot --crft-root G:\cxj\CRFT-main --checkpoint G:\cxj\CRFT-main\checkpoints\CRFT_RoadScene.ckpt --device cuda --split eval --frame-stride 10 --output res_runs\crft_roadscene\eval_stride10.json
+```
+
+若没有官方权重，可从零训练；有权重则在命令中加入
+`--init G:\cxj\CRFT-main\checkpoints\CRFT_RoadScene.ckpt`，
+以相同 VTMOT 数据进行微调。先做一步烟雾测试，再跑 300 步试验：
+
+```bat
+python -B -m res.train_crft_vtmot --crft-root G:\cxj\CRFT-main --device cuda --steps 1 --eval-every 1 --eval-max-samples 2 --num-workers 0 --output-dir res_runs\crft_smoke
+python -B -m res.train_crft_vtmot --crft-root G:\cxj\CRFT-main --device cuda --steps 300 --num-workers 0 --output-dir res_runs\crft_vtmot_pilot
+python -B -m res.evaluate_crft_vtmot --crft-root G:\cxj\CRFT-main --checkpoint res_runs\crft_vtmot_pilot\best.pt --device cuda --split eval --frame-stride 10 --output res_runs\crft_vtmot_pilot\eval_stride10.json
+```
+
+训练入口用相同的 VTMOT 密集真值监督 CRFT 最终场，并给粗场 0.25
+权重；它不声称复现官方训练目标。先比较同一 80 帧的 `epe_px`、
+`coarse_epe_px`、`pck_3px`、`zero_flow_epe_px` 与显存峰值。
+完整数据和 CRFT 官方权重均不随 Git 提交，服务器须分别放置。
+
 ## A4000 服务器准备（当前为 Windows 环境）
 
 你贴出的 `G:\cxj\VF-Bench-main` 和 `C:\Users\cxj\.conda` 表明当前 SSH 终端连接的是
