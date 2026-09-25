@@ -1,12 +1,13 @@
 """Check the external sparse matcher boundary and affine evaluation geometry."""
 
 import unittest
+from types import SimpleNamespace
 
 import numpy as np
 import torch
 
 from res.xoftr_probe import (affine_to_flow, evaluate_xoftr, fit_affine_ransac,
-                             match_gt_error, run_xoftr)
+                             match_flow_disagreement, match_gt_error, run_xoftr)
 
 
 class FakeXoFTR(torch.nn.Module):
@@ -26,6 +27,18 @@ class FakeXoFTR(torch.nn.Module):
         data["mkpts1_f"] = self.points1
         data["mconf_f"] = self.confidence
         data["m_bids"] = torch.zeros(len(self.points0), dtype=torch.long)
+
+
+class FakeReference(torch.nn.Module):
+    def __init__(self, dx, dy):
+        super().__init__()
+        self.dx, self.dy = dx, dy
+
+    def forward(self, ir, vi):
+        flow = torch.empty(ir.shape[0], 2, *ir.shape[-2:])
+        flow[:, 0] = self.dy
+        flow[:, 1] = self.dx
+        return SimpleNamespace(coarse_flow=flow, final_flow=flow)
 
 
 def one_frame():
@@ -68,6 +81,8 @@ class XoFTRProbeTest(unittest.TestCase):
         all_errors = match_gt_error(source, target, flow, valid, keep_invalid=True)
         self.assertEqual(len(all_errors), 2)
         self.assertTrue(np.isnan(all_errors[1]))
+        disagreement = match_flow_disagreement(source, target, flow)
+        np.testing.assert_allclose(disagreement, 0.0, atol=1e-4)
 
     def test_full_report_includes_failed_frames_with_zero_fallback(self):
         points0 = np.array([[12, 12], [60, 12], [110, 12],
@@ -108,6 +123,19 @@ class XoFTRProbeTest(unittest.TestCase):
         self.assertLess(report["match_remaining90pct_conf_pck_3px"], 1.0)
         self.assertAlmostEqual(report["match_ransac_inlier_pck_3px"], 1.0)
         self.assertAlmostEqual(report["match_ransac_outlier_pck_3px"], 0.0)
+
+        # The reference predicts the six wrong matches. Agreement must select
+        # them despite their GT error, proving the gate never reads GT.
+        agreement = evaluate_xoftr(
+            FakeXoFTR(points0, points1, confidence), [one_frame()],
+            torch.device("cpu"), ransac_iterations=300,
+            reference_model=FakeReference(dx=18, dy=12))
+        self.assertEqual(agreement["agreement_coarse_3px_matches"], 6)
+        self.assertEqual(agreement["agreement_coarse_3px_gt_valid"], 6)
+        self.assertAlmostEqual(agreement["agreement_coarse_3px_match_pck_3px"], 0.0)
+        self.assertAlmostEqual(agreement["agreement_final_3px_match_pck_3px"], 0.0)
+        self.assertEqual(agreement["agreement_coarse_5px_ransac_inlier_matches"], 0)
+        self.assertIsNone(agreement["agreement_coarse_5px_top10pct_conf_match_pck_3px"])
 
 
 if __name__ == "__main__":

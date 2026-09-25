@@ -592,6 +592,19 @@ GT PCK@3px；RANSAC 内点仅代表几何自洽，不能当作 GT 正确匹配�
 拉取新代码后沿用上面的完整 80 帧命令重新运行即可。注意 VTMOT 的仿射 GT
 描述的是合成的可见光错位，原始 IR 与 VI 的残余对齐误差也会计入匹配误差。
 
+实测高置信度 10% 匹配的 GT PCK@3px 为 0.272，RANSAC 内点为 0.278，
+其余置信度匹配为 0.169，RANSAC 外点为 0.019。筛选有作用，但尚不足以
+直接当精确伪标签。下一步在不改任何权重的条件下，用现有 `res` 模型的粗场和
+最终场逐点检查 XoFTR 匹配的一致性。`agreement_*_matches` 是仅凭两模型
+预测选出的点数；对应的 `*_match_pck_3px` 才用 GT 评分。若一致点仍不准，
+停止这条混合路线。
+同时查看 5 px 一致窗口与高置信度、RANSAC 内点的交集：只有交集在保留
+足够点数时明显提高 GT 命中率，才有使用稀疏匹配监督的依据。
+
+```bat
+python -B -m res.evaluate_xoftr_vtmot --xoftr-root third_party\XoFTR --checkpoint third_party\XoFTR\weights\weights_xoftr_640.ckpt --res-checkpoint res_runs\local_head_from_descriptor_pilot\last.pt --device cuda --split eval --frame-stride 10 --output res_runs\xoftr_probe\eval_agreement_stride10.json
+```
+
 当前 `res` 分支实现如下：
 
 ```text

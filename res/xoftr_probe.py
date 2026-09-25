@@ -153,13 +153,7 @@ def match_gt_error(points0: np.ndarray, points1: np.ndarray,
     """Return match errors; optionally retain invalid GT locations as NaN."""
     if len(points0) == 0:
         return np.empty(0, dtype=np.float32)
-    height, width = gt_flow.shape[-2:]
-    coords = torch.as_tensor(points0.copy(), device=gt_flow.device, dtype=torch.float32)
-    grid = torch.stack((coords[:, 0] * (2 / (width - 1)) - 1,
-                        coords[:, 1] * (2 / (height - 1)) - 1), dim=-1)
-    grid = grid.view(1, 1, -1, 2)
-    sampled_flow = F.grid_sample(gt_flow, grid, mode="bilinear",
-                                 align_corners=True).reshape(2, -1).T[:, [1, 0]]
+    grid, coords, sampled_flow = _sample_flow_xy(points0, gt_flow)
     sampled_valid = F.grid_sample(valid_mask, grid, mode="bilinear",
                                   align_corners=True).flatten()
     predicted = torch.as_tensor(points1.copy(), device=gt_flow.device,
@@ -173,10 +167,37 @@ def match_gt_error(points0: np.ndarray, points1: np.ndarray,
     return errors[supported]
 
 
+def _sample_flow_xy(points0: np.ndarray, flow_yx: torch.Tensor
+                    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Sample a dense [dy,dx] field at VI points, returning [dx,dy]."""
+    height, width = flow_yx.shape[-2:]
+    coords = torch.as_tensor(points0.copy(), device=flow_yx.device,
+                             dtype=torch.float32)
+    grid = torch.stack((coords[:, 0] * (2 / (width - 1)) - 1,
+                        coords[:, 1] * (2 / (height - 1)) - 1), dim=-1)
+    grid = grid.view(1, 1, -1, 2)
+    sampled_flow = F.grid_sample(flow_yx, grid, mode="bilinear",
+                                 align_corners=True).reshape(2, -1).T[:, [1, 0]]
+    return grid, coords, sampled_flow
+
+
+def match_flow_disagreement(points0: np.ndarray, points1: np.ndarray,
+                            flow_yx: torch.Tensor) -> np.ndarray:
+    """Compare XoFTR displacement with a reference prediction, without GT."""
+    if len(points0) == 0:
+        return np.empty(0, dtype=np.float32)
+    _, coords, sampled_flow = _sample_flow_xy(points0, flow_yx)
+    predicted = torch.as_tensor(points1.copy(), device=flow_yx.device,
+                                dtype=torch.float32)
+    return torch.linalg.vector_norm(predicted - coords - sampled_flow,
+                                    dim=-1).cpu().numpy()
+
+
 @torch.no_grad()
 def evaluate_xoftr(model: torch.nn.Module, loader, device: torch.device,
                    *, ransac_iterations: int = 1000,
-                   ransac_threshold_px: float = 5.0) -> dict[str, object]:
+                   ransac_threshold_px: float = 5.0,
+                   reference_model: torch.nn.Module | None = None) -> dict[str, object]:
     """Report raw match quality and full-frame affine EPE with failure coverage."""
     model.eval()
     total_valid = total_epe = total_zero = 0.0
@@ -187,7 +208,17 @@ def evaluate_xoftr(model: torch.nn.Module, loader, device: torch.device,
     remaining_conf_errors: list[np.ndarray] = []
     inlier_errors: list[np.ndarray] = []
     outlier_errors: list[np.ndarray] = []
+    agreement_errors = {(stage, threshold): [] for stage in ("coarse", "final")
+                        for threshold in (3, 5, 10)}
+    agreement_counts = {(stage, threshold): 0 for stage in ("coarse", "final")
+                        for threshold in (3, 5, 10)}
+    combined_errors = {(stage, gate): [] for stage in ("coarse", "final")
+                       for gate in ("top10pct_conf", "ransac_inlier")}
+    combined_counts = {(stage, gate): 0 for stage in ("coarse", "final")
+                       for gate in ("top10pct_conf", "ransac_inlier")}
     samples = matches = inliers = successes = 0
+    if reference_model is not None:
+        reference_model.eval()
     for batch in loader:
         ir, vi = batch["ir"].to(device), batch["vi"].to(device)
         target, valid = batch["gt_flow"].to(device), batch["valid_mask"].to(device)
@@ -196,10 +227,10 @@ def evaluate_xoftr(model: torch.nn.Module, loader, device: torch.device,
                                 keep_invalid=True)
         supported = np.isfinite(errors)
         raw_errors.append(errors[supported])
+        top_mask = np.zeros(len(confidence), dtype=bool)
         if len(confidence):
             top_count = max(1, int(np.ceil(0.1 * len(confidence))))
             top_indices = np.argsort(-confidence, kind="stable")[:top_count]
-            top_mask = np.zeros(len(confidence), dtype=bool)
             top_mask[top_indices] = True
             top_conf_errors.append(errors[top_mask & supported])
             remaining_conf_errors.append(errors[~top_mask & supported])
@@ -207,6 +238,7 @@ def evaluate_xoftr(model: torch.nn.Module, loader, device: torch.device,
         affine, count = fit_affine_ransac(points0, points1, seed=samples,
                                          iterations=ransac_iterations,
                                          threshold_px=ransac_threshold_px)
+        inlier_mask = np.zeros(len(points0), dtype=bool)
         if affine is not None:
             inliers += count
             design = np.column_stack((points0, np.ones(len(points0))))
@@ -214,6 +246,25 @@ def evaluate_xoftr(model: torch.nn.Module, loader, device: torch.device,
             inlier_mask = residual <= ransac_threshold_px
             inlier_errors.append(errors[inlier_mask & supported])
             outlier_errors.append(errors[~inlier_mask & supported])
+        if reference_model is not None:
+            reference = reference_model(ir, vi)
+            reference_fields = {"coarse": reference.coarse_flow,
+                                "final": (reference.final_flow if reference.final_flow is not None
+                                          else reference.coarse_flow)}
+            for stage, field in reference_fields.items():
+                disagreement = match_flow_disagreement(points0, points1, field)
+                for threshold in (3, 5, 10):
+                    selected = disagreement <= threshold
+                    agreement_counts[(stage, threshold)] += int(selected.sum())
+                    agreement_errors[(stage, threshold)].append(errors[selected & supported])
+                    if threshold == 5:
+                        for gate, mask in (("top10pct_conf", top_mask),
+                                           ("ransac_inlier", inlier_mask)):
+                            combined = selected & mask
+                            combined_counts[(stage, gate)] += int(combined.sum())
+                            combined_errors[(stage, gate)].append(
+                                errors[combined & supported])
+            del reference
         height, width = target.shape[-2:]
         prediction = (affine_to_flow(affine, height, width, device)
                       if affine is not None else torch.zeros_like(target))
@@ -272,4 +323,19 @@ def evaluate_xoftr(model: torch.nn.Module, loader, device: torch.device,
     report["beats_zero_flow"] = report["relative_epe"] < 1.0
     report["fusion_ready"] = (successes == samples and report["epe_px"] <= 2.0
                               and report["pck_3px"] >= 0.90)
+    if reference_model is not None:
+        for (stage, threshold), pieces in agreement_errors.items():
+            selected_errors = np.concatenate(pieces) if pieces else np.empty(0)
+            name = f"agreement_{stage}_{threshold}px"
+            report[f"{name}_matches"] = agreement_counts[(stage, threshold)]
+            report[f"{name}_gt_valid"] = int(len(selected_errors))
+            report[f"{name}_match_pck_3px"] = (
+                float((selected_errors <= 3).mean()) if len(selected_errors) else None)
+        for (stage, gate), pieces in combined_errors.items():
+            selected_errors = np.concatenate(pieces) if pieces else np.empty(0)
+            name = f"agreement_{stage}_5px_{gate}"
+            report[f"{name}_matches"] = combined_counts[(stage, gate)]
+            report[f"{name}_gt_valid"] = int(len(selected_errors))
+            report[f"{name}_match_pck_3px"] = (
+                float((selected_errors <= 3).mean()) if len(selected_errors) else None)
     return report
