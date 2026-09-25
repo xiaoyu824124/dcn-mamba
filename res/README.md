@@ -506,6 +506,28 @@ python -B -m res.evaluate_vtmot --device cuda --split eval --frame-stride 10 --m
 并与旧 IR–VI 80 帧 EPE 6.760 px 比较。`--resume` 只能续同一输入源；
 `--init` 可以做 `visible_gt → ir` 的阶段切换。
 
+80 帧实测同模态热身在 300 步后达到 EPE 1.405 px、PCK@3px 0.909，
+全局 argmax EPE 3.835 px、局部 soft EPE 1.891 px；说明当前匹配器
+能学会同模态几何。相同权重零微调切换到 IR–VI 后，EPE 升至 72.719 px，
+粗场 73.594 px，局部窗口覆盖率仅 0.121。主要失败发生在跨模态粗匹配，
+不能把同模态的 `fusion_ready` 当作 IR–VI 性能。评测入口现只对 IR–VI
+设置 `fusion_ready=true`。
+
+下一步让完整 Encoder／全局匹配器在 IR–VI 上微调，保留同模态学到的
+局部模块。使用 `stage2_fine_interaction.yaml` 保持预训练时的结构；
+`--init` 只加载权重，不会自动恢复结构。先做一步，再跑 300 步，
+最后用相同 80 帧与旧 IR–VI 最佳 EPE 6.760 px 比较。
+
+```bat
+python -B -m res.train_vtmot --device cuda --steps 1 --num-workers 0 --lr 0.0001 --init res_runs/visible_warmup_pilot/last.pt --overlay res/configs/stage2_fine_interaction.yaml --output-dir res_runs/ir_from_visible_smoke
+python -B -m res.train_vtmot --device cuda --run pilot --num-workers 0 --lr 0.0001 --init res_runs/visible_warmup_pilot/last.pt --overlay res/configs/stage2_fine_interaction.yaml --output-dir res_runs/ir_from_visible_pilot
+python -B -m res.evaluate_vtmot --device cuda --split eval --frame-stride 10 --moving-source ir --checkpoint res_runs/ir_from_visible_pilot/last.pt --output res_runs/ir_from_visible_pilot/eval_last_stride10.json
+```
+
+查看第 0／100／200／300 步的粗场 EPE、全局 argmax、局部覆盖率及最终
+EPE。若 300 步后粗场仍明显高于旧模型的 6.843 px，不延长此热身路线；
+若接近或优于旧模型，再决定是否做同计算量的 IR–VI 对照训练。
+
 当前 `res` 分支实现如下：
 
 ```text

@@ -10,7 +10,7 @@ import numpy as np
 import torch
 from omegaconf import OmegaConf
 
-from res.evaluate_vtmot import evaluate
+from res.evaluate_vtmot import _registration_status, evaluate
 from res.mind import rgb_to_gray
 from res.model_factory import build_global_registration
 from res.vtmot import (VTMOTSingleFrameDataset, aspect_resize_affine,
@@ -43,6 +43,14 @@ class VTMOTGeometryTest(unittest.TestCase):
 
 
 class VTMOTSplitTest(unittest.TestCase):
+    def test_same_modal_accuracy_does_not_claim_fusion_ready(self):
+        report = {"relative_epe": 0.156, "epe_px": 1.405, "pck_3px": 0.909}
+        beats, ready, message = _registration_status(report, "visible_gt")
+        self.assertTrue(beats)
+        self.assertFalse(ready)
+        self.assertIn("SAME-MODAL WARMUP", message)
+        self.assertTrue(_registration_status(report, "ir")[1])
+
     def test_same_modal_evaluation_uses_visible_gt_without_infrared(self):
         config = OmegaConf.merge(OmegaConf.load("res/configs/registration.yaml"),
                                  OmegaConf.load("res/configs/ab_visible_warmup.yaml"))

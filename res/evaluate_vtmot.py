@@ -30,6 +30,26 @@ def _threshold_hits(predicted: torch.Tensor, target: torch.Tensor, valid: torch.
             for threshold in (1, 3, 5)}
 
 
+def _registration_status(report: Dict[str, float], moving_source: str
+                         ) -> tuple[bool, bool, str]:
+    """Keep same-modal warmup accuracy separate from IR--VI fusion readiness."""
+    beats_zero = bool(report["relative_epe"] < 1.0)
+    accuracy_gate = bool(report["epe_px"] <= 2.0 and report["pck_3px"] >= 0.90)
+    fusion_ready = moving_source == "ir" and beats_zero and accuracy_gate
+    if moving_source == "visible_gt":
+        message = (f"SAME-MODAL WARMUP: EPE={report['epe_px']:.2f}px and "
+                   f"pck@3px={report['pck_3px']:.3f}; evaluate IR-VI separately.")
+    elif fusion_ready:
+        message = "FUSION READY: sub-2px EPE and at least 90% of pixels within 3px."
+    elif beats_zero:
+        message = (f"NEEDS REFINEMENT: beats zero flow (ratio={report['relative_epe']:.3f}) but "
+                   f"EPE={report['epe_px']:.2f}px and pck@3px={report['pck_3px']:.3f}. "
+                   "Continue single-frame training before connecting to fusion.")
+    else:
+        message = "NOT READY: relative_epe >= 1, so do not connect this model to fusion."
+    return beats_zero, fusion_ready, message
+
+
 def _top_confidence_gate(probability: torch.Tensor, valid_candidates: torch.Tensor,
                          image_hw: tuple[int, int], fraction: float) -> torch.Tensor:
     """Select the most confident sampled 1/4 queries, then lift to image size.
@@ -246,17 +266,11 @@ def main() -> None:
         # Beating zero flow only means "not worse than doing nothing".  A field
         # this coarse still ghosts under fusion, so report readiness explicitly
         # instead of letting a ratio just below 1 look like success.
-        report["beats_zero_flow"] = bool(report["relative_epe"] < 1.0)
-        report["fusion_ready"] = bool(report["epe_px"] <= 2.0 and report["pck_3px"] >= 0.90)
+        beats_zero, fusion_ready, status = _registration_status(report, args.moving_source)
+        report["beats_zero_flow"] = beats_zero
+        report["fusion_ready"] = fusion_ready
         print(json.dumps(report, indent=2))
-        if report["fusion_ready"]:
-            print("FUSION READY: sub-2px EPE and at least 90% of pixels within 3px.")
-        elif report["beats_zero_flow"]:
-            print(f"NEEDS REFINEMENT: beats zero flow (ratio={report['relative_epe']:.3f}) but "
-                  f"EPE={report['epe_px']:.2f}px and pck@3px={report['pck_3px']:.3f}. "
-                  "Continue single-frame training before connecting to fusion.")
-        else:
-            print("NOT READY: relative_epe >= 1, so do not connect this model to fusion.")
+        print(status)
     if args.output is not None:
         args.output.parent.mkdir(parents=True, exist_ok=True)
         args.output.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
