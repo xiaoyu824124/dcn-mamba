@@ -1,0 +1,235 @@
+"""Evaluate official XoFTR sparse VI->IR matches against VTMOT geometry.
+
+The upstream repository and pretrained weights remain separate from this repo.
+Coordinates are [x, y]; VTMOT flow channels are [dy, dx]. No ground truth is
+used to estimate the affine transform.
+"""
+
+from __future__ import annotations
+
+import importlib
+import sys
+from pathlib import Path
+
+import numpy as np
+import torch
+import torch.nn.functional as F
+
+from .mind import rgb_to_gray
+
+
+def build_xoftr(source_root: str | Path, checkpoint_path: str | Path,
+                device: torch.device) -> torch.nn.Module:
+    """Construct XoFTR from its official source and load a strict checkpoint."""
+    root = Path(source_root).resolve()
+    if not (root / "src" / "xoftr" / "xoftr.py").is_file() or not (
+            root / "src" / "config" / "default.py").is_file():
+        raise FileNotFoundError(f"official XoFTR source tree not found at {root}")
+    checkpoint_file = Path(checkpoint_path)
+    if not checkpoint_file.is_file():
+        raise FileNotFoundError(f"XoFTR checkpoint not found at {checkpoint_file}")
+    if str(root) not in sys.path:
+        sys.path.insert(0, str(root))
+    upstream_config = importlib.import_module("src.config.default")
+    if not Path(upstream_config.__file__).resolve().is_relative_to(root):
+        raise RuntimeError("a different 'src' package is imported; run in a fresh process")
+    config = upstream_config.get_cfg_defaults(inference=True)
+    config_dict = {str(key).lower(): _lower_config(value)
+                   for key, value in config.items()}
+    model = importlib.import_module("src.xoftr.xoftr").XoFTR(config_dict["xoftr"])
+    checkpoint = torch.load(checkpoint_file, map_location="cpu", weights_only=True)
+    if not isinstance(checkpoint, dict):
+        raise ValueError("XoFTR checkpoint must contain a tensor state dictionary")
+    state = checkpoint.get("state_dict", checkpoint)
+    if not isinstance(state, dict) or not state:
+        raise ValueError("XoFTR checkpoint has no tensor state dictionary")
+    # Official Lightning checkpoints prefix the matching network with matcher.
+    state = {name.removeprefix("matcher."): value for name, value in state.items()}
+    model.load_state_dict(state, strict=True)
+    return model.to(device).eval()
+
+
+def _lower_config(value):
+    if hasattr(value, "items"):
+        return {str(key).lower(): _lower_config(item) for key, item in value.items()}
+    return value
+
+
+@torch.no_grad()
+def run_xoftr(model: torch.nn.Module, ir: torch.Tensor,
+              vi: torch.Tensor) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Return official keypoints in full-image VI and IR pixel coordinates."""
+    if ir.ndim != 4 or ir.shape[1] != 1 or vi.ndim != 4 or vi.shape[1] != 3:
+        raise ValueError("expected IR [1,1,H,W] and visible [1,3,H,W]")
+    if ir.shape[0] != 1 or vi.shape[0] != 1 or ir.shape[-2:] != vi.shape[-2:]:
+        raise ValueError("XoFTR probe uses one equally sized image pair")
+    height, width = ir.shape[-2:]
+    if height % 8 or width % 8:
+        raise ValueError("XoFTR input height and width must be divisible by 8")
+    data = {"image0": rgb_to_gray(vi), "image1": ir}
+    model(data)
+    points0 = data["mkpts0_f"].detach().float().cpu().numpy()
+    points1 = data["mkpts1_f"].detach().float().cpu().numpy()
+    confidence = data["mconf_f"].detach().float().cpu().numpy()
+    if (points0.ndim != 2 or points0.shape[1] != 2 or
+            points1.shape != points0.shape or
+            confidence.shape != (len(points0),)):
+        raise ValueError("upstream XoFTR returned malformed matches")
+    if not (np.isfinite(points0).all() and np.isfinite(points1).all()
+            and np.isfinite(confidence).all()):
+        raise ValueError("upstream XoFTR returned non-finite matches")
+    if "m_bids" in data and not bool((data["m_bids"] == 0).all()):
+        raise ValueError("upstream XoFTR returned matches for another batch item")
+    inside = ((points0[:, 0] >= 0) & (points0[:, 0] <= width - 1)
+              & (points0[:, 1] >= 0) & (points0[:, 1] <= height - 1)
+              & (points1[:, 0] >= 0) & (points1[:, 0] <= width - 1)
+              & (points1[:, 1] >= 0) & (points1[:, 1] <= height - 1))
+    return points0[inside], points1[inside], confidence[inside]
+
+
+def fit_affine_ransac(points0: np.ndarray, points1: np.ndarray, *,
+                      seed: int, iterations: int = 1000,
+                      threshold_px: float = 5.0) -> tuple[np.ndarray | None, int]:
+    """Fit VI->IR affine using only predicted correspondences.
+
+    A broad non-collinear support is required; otherwise a plausible local fit
+    can extrapolate arbitrarily across the 480x640 field of view.
+    """
+    source = np.asarray(points0, dtype=np.float64)
+    target = np.asarray(points1, dtype=np.float64)
+    if source.ndim != 2 or source.shape[1] != 2 or target.shape != source.shape:
+        raise ValueError("correspondences must have matching [N,2] shapes")
+    if len(source) < 6:
+        return None, 0
+    design = np.column_stack((source, np.ones(len(source))))
+    rng = np.random.default_rng(seed)
+    best_inliers = np.zeros(len(source), dtype=bool)
+    best_error = np.inf
+    for _ in range(iterations):
+        subset = rng.choice(len(source), size=3, replace=False)
+        three = design[subset]
+        if abs(np.linalg.det(three)) < 1000.0:
+            continue
+        candidate = np.linalg.solve(three, target[subset])
+        error = np.linalg.norm(design @ candidate - target, axis=1)
+        inliers = error <= threshold_px
+        count = int(inliers.sum())
+        mean_error = float(error[inliers].mean()) if count else np.inf
+        if count > best_inliers.sum() or (count == best_inliers.sum()
+                                          and mean_error < best_error):
+            best_inliers, best_error = inliers, mean_error
+            if count == len(source):
+                break
+    if best_inliers.sum() < 6:
+        return None, int(best_inliers.sum())
+    # Require support over a meaningful part of the image, not a tiny patch.
+    support = source[best_inliers]
+    if np.ptp(support[:, 0]) < 40 or np.ptp(support[:, 1]) < 40:
+        return None, int(best_inliers.sum())
+    affine, *_ = np.linalg.lstsq(design[best_inliers], target[best_inliers], rcond=None)
+    if np.linalg.matrix_rank(design[best_inliers]) < 3 or not np.isfinite(affine).all():
+        return None, int(best_inliers.sum())
+    final_inliers = np.linalg.norm(design @ affine - target, axis=1) <= threshold_px
+    return affine.T, int(final_inliers.sum())  # [2,3], maps VI [x,y,1] to IR [x,y]
+
+
+def affine_to_flow(affine: np.ndarray, height: int, width: int,
+                   device: torch.device) -> torch.Tensor:
+    """Return a dense [1,2,H,W] VTMOT flow in [dy,dx] order."""
+    matrix = torch.as_tensor(affine, dtype=torch.float32, device=device)
+    if matrix.shape != (2, 3):
+        raise ValueError("affine transform must be [2,3]")
+    yy, xx = torch.meshgrid(torch.arange(height, device=device),
+                            torch.arange(width, device=device), indexing="ij")
+    dx = (matrix[0, 0] - 1) * xx + matrix[0, 1] * yy + matrix[0, 2]
+    dy = matrix[1, 0] * xx + (matrix[1, 1] - 1) * yy + matrix[1, 2]
+    return torch.stack((dy, dx), dim=0)[None]
+
+
+def match_gt_error(points0: np.ndarray, points1: np.ndarray,
+                   gt_flow: torch.Tensor,
+                   valid_mask: torch.Tensor) -> np.ndarray:
+    """Return error for matches whose VI point has valid bilinear GT support."""
+    if len(points0) == 0:
+        return np.empty(0, dtype=np.float32)
+    height, width = gt_flow.shape[-2:]
+    coords = torch.as_tensor(points0.copy(), device=gt_flow.device, dtype=torch.float32)
+    grid = torch.stack((coords[:, 0] * (2 / (width - 1)) - 1,
+                        coords[:, 1] * (2 / (height - 1)) - 1), dim=-1)
+    grid = grid.view(1, 1, -1, 2)
+    sampled_flow = F.grid_sample(gt_flow, grid, mode="bilinear",
+                                 align_corners=True).reshape(2, -1).T[:, [1, 0]]
+    sampled_valid = F.grid_sample(valid_mask, grid, mode="bilinear",
+                                  align_corners=True).flatten()
+    predicted = torch.as_tensor(points1.copy(), device=gt_flow.device,
+                                dtype=torch.float32)
+    errors = torch.linalg.vector_norm(predicted - coords - sampled_flow, dim=-1)
+    return errors[sampled_valid >= 0.999].cpu().numpy()
+
+
+@torch.no_grad()
+def evaluate_xoftr(model: torch.nn.Module, loader, device: torch.device,
+                   *, ransac_iterations: int = 1000,
+                   ransac_threshold_px: float = 5.0) -> dict[str, object]:
+    """Report raw match quality and full-frame affine EPE with failure coverage."""
+    model.eval()
+    total_valid = total_epe = total_zero = 0.0
+    fit_valid = fit_epe = 0.0
+    pixel_hits = {threshold: 0.0 for threshold in (1, 3, 5)}
+    raw_errors: list[np.ndarray] = []
+    samples = matches = inliers = successes = 0
+    for batch in loader:
+        ir, vi = batch["ir"].to(device), batch["vi"].to(device)
+        target, valid = batch["gt_flow"].to(device), batch["valid_mask"].to(device)
+        points0, points1, _ = run_xoftr(model, ir, vi)
+        errors = match_gt_error(points0, points1, target, valid)
+        raw_errors.append(errors)
+        matches += len(points0)
+        affine, count = fit_affine_ransac(points0, points1, seed=samples,
+                                         iterations=ransac_iterations,
+                                         threshold_px=ransac_threshold_px)
+        inliers += count
+        height, width = target.shape[-2:]
+        prediction = (affine_to_flow(affine, height, width, device)
+                      if affine is not None else torch.zeros_like(target))
+        mask_count = float(valid.sum())
+        pixel_error = torch.linalg.vector_norm(prediction - target, dim=1, keepdim=True)
+        zero_error = torch.linalg.vector_norm(target, dim=1, keepdim=True)
+        frame_epe = float((pixel_error * valid).sum())
+        total_valid += mask_count
+        total_epe += frame_epe
+        total_zero += float((zero_error * valid).sum())
+        for threshold in pixel_hits:
+            pixel_hits[threshold] += float(((pixel_error <= threshold) * valid).sum())
+        if affine is not None:
+            successes += 1
+            fit_valid += mask_count
+            fit_epe += frame_epe
+        samples += 1
+    if total_valid <= 0:
+        raise ValueError("VTMOT evaluation has no valid pixels")
+    all_errors = np.concatenate(raw_errors) if raw_errors else np.empty(0)
+    report: dict[str, object] = {
+        "epe_px": total_epe / total_valid,
+        "zero_flow_epe_px": total_zero / total_valid,
+        "relative_epe": total_epe / total_zero,
+        "valid_pixels": total_valid,
+        "samples": samples,
+        "fit_success_frames": successes,
+        "fit_success_fraction": successes / samples,
+        "fit_only_epe_px": fit_epe / fit_valid if fit_valid else None,
+        "fit_failure_fallback": "zero_flow",
+        "matches_total": matches,
+        "matches_gt_valid": int(len(all_errors)),
+        "ransac_inlier_matches": inliers,
+        "match_epe_px": float(all_errors.mean()) if len(all_errors) else None,
+        "match_median_epe_px": float(np.median(all_errors)) if len(all_errors) else None,
+    }
+    report.update({f"match_pck_{threshold}px": float((all_errors <= threshold).mean())
+                   if len(all_errors) else None for threshold in (1, 3, 5)})
+    report.update({f"pck_{threshold}px": count / total_valid
+                   for threshold, count in pixel_hits.items()})
+    report["beats_zero_flow"] = report["relative_epe"] < 1.0
+    report["fusion_ready"] = (successes == samples and report["epe_px"] <= 2.0
+                              and report["pck_3px"] >= 0.90)
+    return report

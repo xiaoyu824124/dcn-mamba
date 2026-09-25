@@ -558,6 +558,33 @@ EPE 6.760 px、粗场 EPE 6.843 px、全局 argmax EPE 149.558 px、
 局部 soft EPE 7.051 px 和 PCK@3px 0.169。若粗场和最终 EPE
 均未改善，就停止此适配路线；如有明确改善，再看局部指标是否同步改善。
 
+### 官方 XoFTR 预训练权重探针
+
+上面的 IR 特征适配消融在 A4000 上未改善：300 步后 80 帧最终 EPE
+为 6.862 px，粗场 6.942 px；原权重对应为 6.760/6.843 px。因此先检查
+现成跨模态预训练表征的匹配质量，再决定是否替换前端。探针使用[官方 XoFTR
+源码及其 640 预训练权重](https://github.com/OnderT/XoFTR)，不更改当前
+`res` 模型，也不重新训练。权重从官方 README 的
+[下载目录](https://drive.google.com/drive/folders/1RAI243OHuyZ4Weo1NiTy280bCE_82s4q?usp=drive_link)
+取得，保存为 `G:\cxj\regfus\third_party\XoFTR\weights\weights_xoftr_640.ckpt`。
+源码根目录须包含 `src\xoftr\xoftr.py` 和 `src\config\default.py`；没有源码
+时可将官方仓库单独克隆到 `third_party\XoFTR`。若环境缺依赖，在 A4000 环境
+安装 `yacs`、`einops`；无需安装官方旧版训练依赖全集。
+
+```bat
+python -B -m res.evaluate_xoftr_vtmot --xoftr-root third_party\XoFTR --checkpoint third_party\XoFTR\weights\weights_xoftr_640.ckpt --device cuda --split eval --frame-stride 10 --max-samples 2 --output res_runs\xoftr_probe\smoke2.json
+python -B -m res.evaluate_xoftr_vtmot --xoftr-root third_party\XoFTR --checkpoint third_party\XoFTR\weights\weights_xoftr_640.ckpt --device cuda --split eval --frame-stride 10 --output res_runs\xoftr_probe\eval_stride10.json
+```
+
+首步只验证加载、显存和 2 帧指标；通过后才运行完整 80 帧。输入是原分辨率
+480×640，image0 为 VI 灰度图，image1 为 IR，均不使用 MIND。输出先报告原始
+匹配的 `match_pck_3px` / `match_median_epe_px`，再用预测匹配的 RANSAC
+仿射场报告全图 `epe_px` / `pck_3px`。拟合失败帧以零场计入全图指标，
+同时显式报告 `fit_success_fraction` 和仅成功帧的 `fit_only_epe_px`；比较旧
+模型 EPE 6.760 px 时要同时看覆盖率。GT 只用于评估匹配和流场，不参与拟合。
+
+当前未取得官方权重，因此这里没有 XoFTR 的实测数值。
+
 当前 `res` 分支实现如下：
 
 ```text
