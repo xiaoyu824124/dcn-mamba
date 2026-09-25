@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 from pathlib import Path
 from typing import Dict
 
@@ -19,7 +20,7 @@ from .matching import matching_diagnostics, windowed_diagnostics
 from .local_matcher import local_matching_diagnostics
 from .mind import paired_mind
 from .vtmot import VTMOTSingleFrameDataset
-from .warp import warp
+from .warp import upsample_feature_flow, warp
 
 
 def _threshold_hits(predicted: torch.Tensor, target: torch.Tensor, valid: torch.Tensor) -> Dict[str, float]:
@@ -27,6 +28,31 @@ def _threshold_hits(predicted: torch.Tensor, target: torch.Tensor, valid: torch.
     denominator = valid.sum().clamp_min(1)
     return {f"pck_{threshold}px": float(((error <= threshold) * valid).sum() / denominator)
             for threshold in (1, 3, 5)}
+
+
+def _top_confidence_gate(probability: torch.Tensor, valid_candidates: torch.Tensor,
+                         image_hw: tuple[int, int], fraction: float) -> torch.Tensor:
+    """Select the most confident sampled 1/4 queries, then lift to image size.
+
+    Selection uses only model outputs; ground-truth flow and its validity mask
+    are never consulted. The returned mask is [B,1,H,W].
+    """
+    if not 0 < fraction <= 1:
+        raise ValueError("fraction must be in (0, 1]")
+    batch, _, height, width = probability.shape
+    if valid_candidates.shape != probability.shape:
+        raise ValueError("valid_candidates must match probability shape")
+    low_valid = valid_candidates.any(dim=1)
+    confidence = probability.amax(dim=1)
+    chosen = torch.zeros_like(low_valid)
+    for batch_index in range(batch):
+        indices = low_valid[batch_index].flatten().nonzero(as_tuple=True)[0]
+        if indices.numel() == 0:
+            continue
+        count = max(1, math.ceil(indices.numel() * fraction))
+        ranking = confidence[batch_index].flatten()[indices].topk(count).indices
+        chosen[batch_index].flatten()[indices[ranking]] = True
+    return F.interpolate(chosen[:, None].float(), size=image_hw, mode="nearest")
 
 
 @torch.no_grad()
@@ -50,11 +76,13 @@ def check_gt_direction(loader: DataLoader, device: torch.device, preview_dir: Pa
 
 @torch.no_grad()
 def evaluate(model: torch.nn.Module, loader: DataLoader, device: torch.device,
-             diagnose_local_mind: bool = False) -> Dict[str, float]:
+             diagnose_local_mind: bool = False,
+             diagnose_confidence_gate: bool = False) -> Dict[str, float]:
     total_epe = total_coarse_epe = total_baseline = total_valid = total_samples = 0.0
     total_corner_epe = total_cycle_epe = 0.0
     hit_sums = {f"pck_{threshold}px": 0.0 for threshold in (1, 3, 5)}
     diagnostic_sums: Dict[str, float] = {}
+    gate_sums: Dict[str, float] = {}
     coarse_grid_hw = None
     model.eval()
     for batch in loader:
@@ -96,6 +124,23 @@ def evaluate(model: torch.nn.Module, loader: DataLoader, device: torch.device,
         if output.local_match is not None:
             for name, value in local_matching_diagnostics(output.local_match, target, valid).items():
                 diagnostic_sums[name] = diagnostic_sums.get(name, 0.0) + value * float(predicted.shape[0])
+            if diagnose_confidence_gate:
+                local = output.local_match
+                feature_hw = local.coarse_flow.shape[-2:]
+                stride = (target.shape[-2] / feature_hw[0], target.shape[-1] / feature_hw[1])
+                soft_flow = upsample_feature_flow(local.coarse_flow + local.matched_residual,
+                                                  target.shape[-2:], stride)
+                for percent in (10, 25, 50):
+                    gate = _top_confidence_gate(local.probability, local.valid_candidates,
+                                                target.shape[-2:], percent / 100)
+                    for kind, candidate in (("head", predicted), ("soft", soft_flow)):
+                        gated = output.coarse_flow + gate * (candidate - output.coarse_flow)
+                        name = f"local_gate_top{percent}_{kind}_epe_px"
+                        gate_sums[name] = gate_sums.get(name, 0.0) + float(
+                            endpoint_error(gated, target, valid)) * count
+                    name = f"local_gate_top{percent}_valid_fraction"
+                    gate_sums[name] = gate_sums.get(name, 0.0) + float(
+                        (gate * valid).sum())
             if diagnose_local_mind:
                 mind_ir, mind_vi = paired_mind(ir, vi, model.mind)
                 mind_ir_4 = F.avg_pool2d(mind_ir.float(), kernel_size=4, stride=4)
@@ -123,6 +168,9 @@ def evaluate(model: torch.nn.Module, loader: DataLoader, device: torch.device,
     if diagnostic_sums:
         report.update({name: value / max(total_samples, 1.0)
                        for name, value in diagnostic_sums.items()})
+    if gate_sums:
+        report.update({name: value / max(total_valid, 1.0)
+                       for name, value in gate_sums.items()})
     report.update({name: value / max(total_valid, 1.0) for name, value in hit_sums.items()})
     return report
 
@@ -140,6 +188,8 @@ def main() -> None:
                         help="also rank raw cosine matches, before dual softmax or spatial prior")
     parser.add_argument("--diagnose-local-mind", action="store_true",
                         help="compare 1/4 Encoder features with pooled raw MIND descriptors at the same coarse field")
+    parser.add_argument("--diagnose-confidence-gate", action="store_true",
+                        help="evaluate top-confidence local corrections without changing the checkpoint")
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--frame-stride", type=int, default=10)
@@ -175,10 +225,13 @@ def main() -> None:
         model.load_state_dict(checkpoint["model"], strict=True)
         if args.diagnose_local_mind and model.local_matcher is None:
             raise ValueError("--diagnose-local-mind requires an enabled local matcher")
+        if args.diagnose_confidence_gate and model.local_matcher is None:
+            raise ValueError("--diagnose-confidence-gate requires an enabled local matcher")
         if args.diagnose_appearance:
             model.matcher.return_correlation = True
         report = evaluate(model, loader, device,
-                          diagnose_local_mind=args.diagnose_local_mind)
+                          diagnose_local_mind=args.diagnose_local_mind,
+                          diagnose_confidence_gate=args.diagnose_confidence_gate)
         if args.overlay:
             report["evaluation_overlays"] = [str(path) for path in args.overlay]
         report["field_of_view_hw"] = list(fov)

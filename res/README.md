@@ -423,6 +423,28 @@ python -B -m res.evaluate_vtmot --device cuda --split eval --frame-stride 10 --c
 实际改善的比例。若高置信区域也无法优于粗场，后续应重做 1/4 特征；
 若这部分明显更准，再试按置信度选择性修正。
 
+近年工作的可借鉴点与当前试验顺序：
+
+- [XoFTR（2024）](https://arxiv.org/abs/2404.09692) 在可见光–热红外匹配中使用跨模态预训练、伪热红外增强和细尺度重匹配；
+  [MINIMA（2025）](https://arxiv.org/abs/2412.19412) 更强调先用充足的配对数据学习匹配先验，再做跨模态微调。两者说明仅延长现有小规模训练不一定能解决表征问题。
+- [RoMa（2024）](https://arxiv.org/abs/2305.15404) 区分粗级多峰匹配分布与细级局部回归，并显式估计匹配概率；
+  [Efficient LoFTR（2024）](https://arxiv.org/abs/2403.04765) 使用两阶段细尺度相关来提高亚像素定位。
+  对本模型最便宜的第一步是验证局部概率能否识别可靠修正。
+- [XoFTR++（2026）](https://www.nature.com/articles/s41598-026-68975-9) 在细级使用双向窗口跨模态交互。
+  当前 `fine_interaction.py` 只有共享投影和跨尺度融合，还没有 1/4 局部 IR–VI 交互；若置信度筛选仍无效，这一模块比继续扩大局部头更值得单独消融。
+
+同一权重运行置信度门控诊断，不改训练和默认推理。报告中的
+`local_gate_top{10,25,50}_{head,soft}_epe_px` 是只在置信度最高的相应比例
+1/4 查询处采用局部头或 soft 位移后，在**完整有效像素**上计算的 EPE；
+`local_gate_top*_valid_fraction` 是这些查询覆盖的有效像素比例。比较它们
+与 `coarse_epe_px` 和 `epe_px`，即可判断是否值得把选择性细化变成正式推理选项。
+查询的选择只看预测概率和候选采样是否落在图像内，不看 GT 流场或 GT
+有效区掩码；GT 仅用于最终 EPE。
+
+```bat
+python -B -m res.evaluate_vtmot --device cuda --split eval --frame-stride 10 --checkpoint res_runs/local_head_from_descriptor_pilot/last.pt --diagnose-confidence-gate --output res_runs/local_head_from_descriptor_pilot/eval_confidence_gate_stride10.json
+```
+
 当前 `res` 分支实现如下：
 
 ```text
