@@ -1,0 +1,8 @@
+# Train the same registration architecture on visible_gt -> visible_mis pairs.
+# Both images use the original VTMOT homography and valid-pixel mask.
+# Evaluation and IR--VI fine-tuning remain separate, explicit runs.
+fine_interaction:
+  enabled: true
+
+vtmot_train:
+  moving_source: visible_gt

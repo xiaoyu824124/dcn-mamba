@@ -475,6 +475,37 @@ python -B -m res.evaluate_vtmot --device cuda --split eval --frame-stride 10 --c
 soft 位移都没有改善，就停止这一模块；若明显改善，再解冻局部残差头
 做第二阶段训练。
 
+实测 80 帧：细级交互训练 300 步后，最终 EPE 从 6.760476 到
+6.760311 px，局部 argmax 从 15.939 到 15.882 px，局部 soft 从
+7.0505 到 7.0431 px；粗场保持 6.8426 px。变化很小，停止继续训练
+该模块，也不把它设为默认。
+
+## 同模态几何热身：检验可迁移的匹配表征
+
+[MINIMA](https://arxiv.org/abs/2412.19412) 的可借鉴点是先学习匹配几何，
+再微调跨模态特征。本试验只使用现有 VTMOT：`visible_gt` 作移动图像，
+`visible_mis` 作固定图像，仍用原 `gt_h`、有效像素掩码和相同模型结构。
+移动可见光转灰度后进入原 MIND 前端；它不是大规模跨模态预训练，
+用途是检验本模型能否先学会同模态对应，并观察该表示能否迁移到 IR–VI。
+训练 checkpoint 记录 `moving_source=visible_gt`；评测必须显式指定输入源。
+
+先检查 `visible_gt` 与真值方向，再做一步和 300 步。不同运行使用不同
+输出目录；300 步训练结束后不要再次用 `--init` 写入同一目录。
+
+```bat
+python -B -m res.evaluate_vtmot --device cuda --split eval --frame-stride 10 --check-gt
+python -B -m res.train_vtmot --device cuda --steps 1 --num-workers 0 --overlay res/configs/ab_visible_warmup.yaml --output-dir res_runs/visible_warmup_smoke
+python -B -m res.train_vtmot --device cuda --run pilot --num-workers 0 --overlay res/configs/ab_visible_warmup.yaml --output-dir res_runs/visible_warmup_pilot
+python -B -m res.evaluate_vtmot --device cuda --split eval --frame-stride 10 --moving-source visible_gt --checkpoint res_runs/visible_warmup_pilot/last.pt --output res_runs/visible_warmup_pilot/eval_visible_stride10.json
+python -B -m res.evaluate_vtmot --device cuda --split eval --frame-stride 10 --moving-source ir --checkpoint res_runs/visible_warmup_pilot/last.pt --output res_runs/visible_warmup_pilot/eval_ir_stride10.json
+```
+
+先看同模态 `match_epe_argmax_px`、局部 soft 与最终 EPE 是否随训练明显
+改善；再看零微调 IR–VI 指标。只有同模态对应学得清楚，才从
+`visible_warmup_pilot/last.pt` 以 `--init` 切回默认 IR 输入继续训练，
+并与旧 IR–VI 80 帧 EPE 6.760 px 比较。`--resume` 只能续同一输入源；
+`--init` 可以做 `visible_gt → ir` 的阶段切换。
+
 当前 `res` 分支实现如下：
 
 ```text

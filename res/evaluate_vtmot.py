@@ -19,7 +19,7 @@ from .affine import affine_corner_errors
 from .matching import matching_diagnostics, windowed_diagnostics
 from .local_matcher import local_matching_diagnostics
 from .mind import paired_mind
-from .vtmot import VTMOTSingleFrameDataset
+from .vtmot import VTMOTSingleFrameDataset, registration_moving_image
 from .warp import upsample_feature_flow, warp
 
 
@@ -77,7 +77,8 @@ def check_gt_direction(loader: DataLoader, device: torch.device, preview_dir: Pa
 @torch.no_grad()
 def evaluate(model: torch.nn.Module, loader: DataLoader, device: torch.device,
              diagnose_local_mind: bool = False,
-             diagnose_confidence_gate: bool = False) -> Dict[str, float]:
+             diagnose_confidence_gate: bool = False,
+             moving_source: str = "ir") -> Dict[str, float]:
     total_epe = total_coarse_epe = total_baseline = total_valid = total_samples = 0.0
     total_corner_epe = total_cycle_epe = 0.0
     hit_sums = {f"pck_{threshold}px": 0.0 for threshold in (1, 3, 5)}
@@ -86,7 +87,8 @@ def evaluate(model: torch.nn.Module, loader: DataLoader, device: torch.device,
     coarse_grid_hw = None
     model.eval()
     for batch in loader:
-        ir, vi = batch["ir"].to(device), batch["vi"].to(device)
+        ir = registration_moving_image(batch, moving_source).to(device)
+        vi = batch["vi"].to(device)
         target, valid = batch["gt_flow"].to(device), batch["valid_mask"].to(device)
         output = model(ir, vi)
         if output.match is not None:
@@ -191,6 +193,8 @@ def main() -> None:
     parser.add_argument("--diagnose-confidence-gate", action="store_true",
                         help="evaluate top-confidence local corrections without changing the checkpoint")
     parser.add_argument("--device", default="cuda")
+    parser.add_argument("--moving-source", choices=("ir", "visible_gt"), default="ir",
+                        help="evaluate infrared (default) or aligned visible grayscale")
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--frame-stride", type=int, default=10)
     parser.add_argument("--max-samples", type=int, default=0)
@@ -204,13 +208,15 @@ def main() -> None:
         raise ValueError("batch-size must be positive")
     device = torch.device(args.device if args.device != "cuda" or torch.cuda.is_available() else "cpu")
     dataset = VTMOTSingleFrameDataset(args.data_root, split=args.split, split_file=args.split_file,
-                                      frame_stride=args.frame_stride, include_rgb_gt=args.check_gt,
+                                      frame_stride=args.frame_stride,
+                                      include_rgb_gt=args.check_gt or args.moving_source == "visible_gt",
                                       crop_hw=tuple(args.crop_hw) if args.crop_hw is not None else None,
                                       max_samples=args.max_samples)
     loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False,
                         num_workers=0, pin_memory=device.type == "cuda")
     fov = tuple(args.crop_hw) if args.crop_hw is not None else (480, 640)
-    print(f"split={args.split} samples={len(dataset)} stride={args.frame_stride} fov={fov} device={device}")
+    print(f"split={args.split} samples={len(dataset)} stride={args.frame_stride} "
+          f"fov={fov} device={device} moving_source={args.moving_source}")
     if args.check_gt:
         report = check_gt_direction(loader, device)
         print(json.dumps(report, indent=2))
@@ -231,7 +237,9 @@ def main() -> None:
             model.matcher.return_correlation = True
         report = evaluate(model, loader, device,
                           diagnose_local_mind=args.diagnose_local_mind,
-                          diagnose_confidence_gate=args.diagnose_confidence_gate)
+                          diagnose_confidence_gate=args.diagnose_confidence_gate,
+                          moving_source=args.moving_source)
+        report["moving_source"] = args.moving_source
         if args.overlay:
             report["evaluation_overlays"] = [str(path) for path in args.overlay]
         report["field_of_view_hw"] = list(fov)

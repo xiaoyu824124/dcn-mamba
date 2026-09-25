@@ -18,6 +18,8 @@ import torch
 from PIL import Image
 from torch.utils.data import Dataset
 
+from .mind import rgb_to_gray
+
 
 def aspect_resize_affine(source_hw: Tuple[int, int], target_hw: Tuple[int, int]) -> np.ndarray:
     """Original ``[x,y,1]`` pixels -> centred-crop/resized pixels.
@@ -84,6 +86,18 @@ def _image_tensor(path: Path, mode: str, target_hw: Tuple[int, int]) -> torch.Te
     if array.ndim == 2:
         return torch.from_numpy(array[None])
     return torch.from_numpy(np.transpose(array, (2, 0, 1)).copy())
+
+
+def registration_moving_image(batch: Dict[str, torch.Tensor | str],
+                              source: str = "ir") -> torch.Tensor:
+    """Choose the moving raster for cross-modal training or visible warmup."""
+    if source == "ir":
+        return batch["ir"]
+    if source == "visible_gt":
+        if "rgb_gt" not in batch:
+            raise ValueError("visible_gt source requires include_rgb_gt=True")
+        return rgb_to_gray(batch["rgb_gt"])
+    raise ValueError(f"unknown moving source: {source}")
 
 
 class VTMOTSingleFrameDataset(Dataset):

@@ -19,7 +19,7 @@ from .losses import RegistrationLoss
 from .matching import matching_diagnostics
 from .metrics import endpoint_error
 from .model_factory import build_global_registration
-from .vtmot import VTMOTSingleFrameDataset
+from .vtmot import VTMOTSingleFrameDataset, registration_moving_image
 
 
 def freeze_coarse_parameters(model: torch.nn.Module) -> None:
@@ -73,6 +73,8 @@ def main() -> None:
                         help="override the configured learning rate")
     parser.add_argument("--num-workers", type=int, default=None,
                         help="override data-loader workers; use 0 for Windows debugging")
+    parser.add_argument("--moving-source", choices=("ir", "visible_gt"), default=None,
+                        help="moving image: infrared (default) or aligned visible grayscale for warmup")
     parser.add_argument("--init", type=Path, default=None,
                         help="optional compatible registration checkpoint; does not resume optimiser state")
     parser.add_argument("--resume", type=Path, default=None,
@@ -83,6 +85,11 @@ def main() -> None:
     config = OmegaConf.merge(OmegaConf.load(args.config),
                              *(OmegaConf.load(path) for path in args.overlay))
     data_config, train_config = config.vtmot_data, config.vtmot_train
+    moving_source = args.moving_source or str(train_config.get("moving_source", "ir"))
+    if moving_source not in ("ir", "visible_gt"):
+        raise ValueError(f"unknown moving source: {moving_source}")
+    # Persist the actual source so a checkpoint cannot silently mislabel its run.
+    train_config.moving_source = moving_source
     steps = int(args.steps if args.steps is not None else
                 (train_config.pilot_steps if args.run == "pilot" else train_config.full_steps))
     if steps < 1:
@@ -106,10 +113,12 @@ def main() -> None:
         raise ValueError("batch size must be positive and num-workers must be non-negative")
     train_dataset = VTMOTSingleFrameDataset(
         args.data_root, split="train", split_file=args.split_file, target_hw=target_hw,
-        crop_hw=crop_hw, random_crop=True, frame_stride=int(data_config.train_frame_stride))
+        crop_hw=crop_hw, random_crop=True, frame_stride=int(data_config.train_frame_stride),
+        include_rgb_gt=moving_source == "visible_gt")
     eval_dataset = VTMOTSingleFrameDataset(
         args.data_root, split="eval", split_file=args.split_file, target_hw=target_hw,
-        crop_hw=crop_hw, random_crop=False, frame_stride=int(data_config.eval_frame_stride))
+        crop_hw=crop_hw, random_crop=False, frame_stride=int(data_config.eval_frame_stride),
+        include_rgb_gt=moving_source == "visible_gt")
     # Keep sample order independent of the model's parameter count, so the
     # coarse-only and SA-CA runs see the same images in a controlled ablation.
     train_generator = torch.Generator().manual_seed(int(train_config.seed))
@@ -143,11 +152,20 @@ def main() -> None:
     start_step = 0
     if args.resume is not None:
         checkpoint = torch.load(args.resume, map_location=device, weights_only=True)
+        saved_source = str(checkpoint.get("config", {}).get("vtmot_train", {}).get(
+            "moving_source", "ir"))
+        if saved_source != moving_source:
+            raise ValueError(f"resume moving source is {saved_source}, but this run uses "
+                             f"{moving_source}; pass the original overlay or use --init")
         model.load_state_dict(checkpoint["model"], strict=True)
         optimizer.load_state_dict(checkpoint["optimizer"])
         start_step = int(checkpoint["step"])
     elif args.init is not None:
         checkpoint = torch.load(args.init, map_location=device, weights_only=True)
+        saved_source = str(checkpoint.get("config", {}).get("vtmot_train", {}).get(
+            "moving_source", "ir"))
+        if saved_source != moving_source:
+            print(f"init: moving source {saved_source} -> {moving_source}")
         # Warm start: architecture knobs (width, key scale, ...) may add or
         # resize tensors, so keep every tensor whose shape still matches and
         # report the rest instead of refusing to start.  ``--resume`` stays
@@ -180,7 +198,7 @@ def main() -> None:
     device_name = torch.cuda.get_device_name(device) if device.type == "cuda" else "CPU"
     print(f"device={device} ({device_name}) run={args.run} steps={steps} train={len(train_dataset)} "
           f"eval={len(eval_dataset)} crop={crop_hw} batch={batch_size} workers={num_workers} "
-          f"lr={learning_rate:g} freeze_coarse={freeze_coarse} "
+          f"lr={learning_rate:g} moving_source={moving_source} freeze_coarse={freeze_coarse} "
           f"freeze_local_refinement={freeze_local_refinement} "
           f"freeze_fine_interaction={freeze_fine_interaction}")
     best_ratio = float("inf")
@@ -199,12 +217,14 @@ def main() -> None:
                         and "val_relative_epe" in previous):
                     best_ratio = min(best_ratio, float(previous["val_relative_epe"]))
         if best_ratio == float("inf"):
-            best_ratio = float(evaluate(model, eval_loader, device)["relative_epe"])
+            best_ratio = float(evaluate(model, eval_loader, device,
+                                        moving_source=moving_source)["relative_epe"])
         print(f"resume: step={start_step} prior best relative EPE={best_ratio:.4f}")
     elif args.init is not None:
         # A fine-tuning run must not discard a better warm-start checkpoint
         # merely because every subsequent validation becomes worse.
-        initial_validation = evaluate(model, eval_loader, device)
+        initial_validation = evaluate(model, eval_loader, device,
+                                      moving_source=moving_source)
         best_ratio = float(initial_validation["relative_epe"])
         _save(output_dir / "best.pt", 0, model, optimizer, config, best_ratio)
         with metrics_file.open("a", encoding="utf-8") as file:
@@ -224,7 +244,8 @@ def main() -> None:
         except StopIteration:
             iterator = iter(train_loader)
             batch = next(iterator)
-        ir, vi = batch["ir"].to(device, non_blocking=True), batch["vi"].to(device, non_blocking=True)
+        ir = registration_moving_image(batch, moving_source).to(device, non_blocking=True)
+        vi = batch["vi"].to(device, non_blocking=True)
         target, valid = batch["gt_flow"].to(device, non_blocking=True), batch["valid_mask"].to(device, non_blocking=True)
         gt_h = batch["gt_h"].to(device, non_blocking=True)
         optimizer.zero_grad(set_to_none=True)
@@ -262,7 +283,8 @@ def main() -> None:
                                                tuple(output.match.coarse_flow.shape[-2:]),
                                                target, valid))
         if step % int(train_config.validation_every) == 0 or step == steps:
-            validation = evaluate(model, eval_loader, device)
+            validation = evaluate(model, eval_loader, device,
+                                  moving_source=moving_source)
             record.update({f"val_{name}": value for name, value in validation.items()})
             print("  eval epe={epe_px:.3f} coarse={coarse_epe_px:.3f} "
                   "zero={zero_flow_epe_px:.3f} ratio={relative_epe:.3f} "

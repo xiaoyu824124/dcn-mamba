@@ -8,8 +8,13 @@ from unittest.mock import patch
 
 import numpy as np
 import torch
+from omegaconf import OmegaConf
 
-from res.vtmot import VTMOTSingleFrameDataset, aspect_resize_affine, homography_to_flow
+from res.evaluate_vtmot import evaluate
+from res.mind import rgb_to_gray
+from res.model_factory import build_global_registration
+from res.vtmot import (VTMOTSingleFrameDataset, aspect_resize_affine,
+                       homography_to_flow, registration_moving_image)
 from res.warp import warp
 
 
@@ -38,6 +43,36 @@ class VTMOTGeometryTest(unittest.TestCase):
 
 
 class VTMOTSplitTest(unittest.TestCase):
+    def test_same_modal_evaluation_uses_visible_gt_without_infrared(self):
+        config = OmegaConf.merge(OmegaConf.load("res/configs/registration.yaml"),
+                                 OmegaConf.load("res/configs/ab_visible_warmup.yaml"))
+        config.encoder.base_channels = 8
+        config.encoder.out_channels = 16
+        config.encoder.blocks_per_scale = 1
+        config.local_matcher.radius = 2
+        model = build_global_registration(config)
+        batch = {"vi": torch.rand(1, 3, 32, 40),
+                 "rgb_gt": torch.rand(1, 3, 32, 40),
+                 "gt_flow": torch.zeros(1, 2, 32, 40),
+                 "valid_mask": torch.ones(1, 1, 32, 40),
+                 "gt_h": torch.eye(3).unsqueeze(0)}
+        report = evaluate(model, [batch], torch.device("cpu"),
+                          moving_source="visible_gt")
+        self.assertTrue(np.isfinite(report["epe_px"]))
+        self.assertEqual(report["zero_flow_epe_px"], 0.0)
+
+    def test_same_modal_warmup_uses_aligned_visible_as_moving_image(self):
+        infrared = torch.full((2, 1, 16, 24), 0.2)
+        aligned_visible = torch.rand(2, 3, 16, 24)
+        batch = {"ir": infrared, "rgb_gt": aligned_visible}
+        self.assertIs(registration_moving_image(batch, "ir"), infrared)
+        self.assertTrue(torch.allclose(registration_moving_image(batch, "visible_gt"),
+                                       rgb_to_gray(aligned_visible)))
+        with self.assertRaisesRegex(ValueError, "include_rgb_gt"):
+            registration_moving_image({"ir": infrared}, "visible_gt")
+        with self.assertRaisesRegex(ValueError, "unknown moving source"):
+            registration_moving_image(batch, "visible_mis")
+
     def test_ignores_unlisted_raw_frames_but_checks_listed_pairs(self):
         split_file = Path("lists/split.json")
         manifest = "ir,rgb,rgb_gt\ninfrared/000002.jpg,visible_mis/000002.png,visible_gt/000002.png\n"
