@@ -8,14 +8,15 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .encoder import MINDFeatureEncoder
+from .encoder import MINDFeatureEncoder, SharedPyramidEncoder
 from .coarse_transformer import CoarseSACATransformer
 from .fine_interaction import FineScaleInteraction
 from .fine_cross_attention import FineCrossModalAttention
 from .ir_feature_adapter import IRFeatureAdapter
 from .global_matcher import GlobalMatchOutput, GlobalMatcher
 from .local_matcher import LocalMatchOutput, LocalMatcher
-from .mind import MINDDescriptor, paired_mind
+from .mind import MINDDescriptor, paired_mind, rgb_to_gray
+from .glu_crft_coarse import GlobalCostDecoder, fit_affine_flow, standardize_image
 from .warp import upsample_feature_flow, warp
 
 
@@ -37,6 +38,8 @@ class CoarseRegistrationOutput:
     final_aligned_ir: torch.Tensor | None = None
     final_flow: torch.Tensor | None = None
     local_match: LocalMatchOutput | None = None
+    global_flow: torch.Tensor | None = None
+    coarse_local_match: LocalMatchOutput | None = None
 
 
 class MINDGlobalRegistration(nn.Module):
@@ -158,3 +161,103 @@ class MINDGlobalRegistration(nn.Module):
             final_flow=final_flow,
             local_match=local_match,
         )
+
+
+class GLUCRFTRegistration(nn.Module):
+    """Z-scored shared features, small global cost volume, then local updates.
+
+    The 16x16 global stage follows GLU-Net's fixed candidate count. SA/CA
+    adapts cross-modal features before correlation as in CRFT. Decoded global
+    flow, rather than diffuse soft-argmax matches, is projected to 6-DoF.
+    An optional 1/8 local stage updates that field before 1/4 fine matching.
+    """
+
+    def __init__(self, *, encoder: SharedPyramidEncoder, matcher: GlobalMatcher,
+                 coarse_decoder: GlobalCostDecoder,
+                 coarse_transformer: CoarseSACATransformer | None = None,
+                 coarse_refiner: LocalMatcher | None = None,
+                 local_matcher: LocalMatcher | None = None,
+                 fine_interaction: FineScaleInteraction | None = None,
+                 fine_cross_attention: FineCrossModalAttention | None = None,
+                 mind: MINDDescriptor | None = None) -> None:
+        super().__init__()
+        if encoder.in_channels != 1 or not encoder.extra_coarse_scale:
+            raise ValueError("GLUCRFTRegistration needs a 1-channel 1/16 encoder")
+        if matcher.affine_projection:
+            raise ValueError("the global matcher must leave affine fitting to decoded flow")
+        self.encoder = encoder
+        self.matcher = matcher
+        self.coarse_decoder = coarse_decoder
+        self.coarse_transformer = coarse_transformer
+        self.coarse_refiner = coarse_refiner
+        self.local_matcher = local_matcher
+        self.fine_interaction = fine_interaction
+        self.fine_cross_attention = fine_cross_attention
+        # This descriptor is only used by optional diagnostics, never by the
+        # forward input path of the new architecture.
+        self.mind = mind if mind is not None else MINDDescriptor()
+        self.ir_feature_adapter = None
+
+    def forward(self, ir: torch.Tensor, vi: torch.Tensor) -> CoarseRegistrationOutput:
+        MINDGlobalRegistration._validate_inputs(ir, vi)
+        height, width = ir.shape[-2:]
+        if height % 16 or width % 16:
+            raise ValueError("GLU-CRFT input must be divisible by 16")
+        features_ir, features_vi = self.encoder.encode_pair(
+            standardize_image(ir), standardize_image(rgb_to_gray(vi)))
+        match_ir = F.adaptive_avg_pool2d(features_ir["1/16"], self.coarse_decoder.grid_hw)
+        match_vi = F.adaptive_avg_pool2d(features_vi["1/16"], self.coarse_decoder.grid_hw)
+        if self.coarse_transformer is not None:
+            match_ir, match_vi = self.coarse_transformer(match_ir, match_vi)
+        match = self.matcher(match_ir, match_vi)
+        decoded = self.coarse_decoder(match.matching_probability, match_vi,
+                                      match.raw_flow)
+        global_feature_flow, global_affine = fit_affine_flow(decoded)
+        match.coarse_flow = global_feature_flow
+        match.affine_yx = global_affine
+        grid_h, grid_w = self.coarse_decoder.grid_hw
+        global_flow = upsample_feature_flow(global_feature_flow, (height, width),
+                                            (height / grid_h, width / grid_w))
+        coarse_flow = global_flow
+        affine_yx = global_affine
+        confidence = match.confidence
+        coarse_local_match = None
+        if self.coarse_refiner is not None:
+            feature_8 = features_ir["1/8"].shape[-2:]
+            stride_8 = global_flow.new_tensor((height / feature_8[0],
+                                               width / feature_8[1])).view(1, 2, 1, 1)
+            flow_8 = F.interpolate(global_flow, size=feature_8,
+                                    mode="bilinear", align_corners=False) / stride_8
+            coarse_local_match = self.coarse_refiner(
+                features_ir["1/8"], features_vi["1/8"], flow_8)
+            fitted_8, affine_yx = fit_affine_flow(coarse_local_match.refined_flow)
+            coarse_flow = upsample_feature_flow(fitted_8, (height, width),
+                                                 (height / feature_8[0],
+                                                  width / feature_8[1]))
+            confidence = coarse_local_match.probability.amax(dim=1, keepdim=True)
+
+        coarse_aligned_ir = warp(ir, coarse_flow)
+        local_match = None
+        final_flow = final_aligned_ir = None
+        if self.local_matcher is not None:
+            fine_ir, fine_vi = features_ir["1/4"], features_vi["1/4"]
+            if self.fine_interaction is not None:
+                fine_ir, fine_vi = self.fine_interaction(
+                    fine_ir, fine_vi, features_ir["1/8"], features_vi["1/8"])
+            feature_4 = fine_ir.shape[-2:]
+            stride_4 = coarse_flow.new_tensor((height / feature_4[0],
+                                               width / feature_4[1])).view(1, 2, 1, 1)
+            flow_4 = F.interpolate(coarse_flow, size=feature_4,
+                                    mode="bilinear", align_corners=False) / stride_4
+            if self.fine_cross_attention is not None:
+                fine_ir, fine_vi = self.fine_cross_attention(fine_ir, fine_vi, flow_4)
+            local_match = self.local_matcher(fine_ir, fine_vi, flow_4)
+            final_flow = upsample_feature_flow(local_match.refined_flow, (height, width),
+                                               (height / feature_4[0], width / feature_4[1]))
+            final_aligned_ir = warp(ir, final_flow)
+        return CoarseRegistrationOutput(
+            coarse_aligned_ir=coarse_aligned_ir, coarse_flow=coarse_flow,
+            confidence_1_8=confidence, affine_yx=affine_yx, match=match,
+            final_aligned_ir=final_aligned_ir, final_flow=final_flow,
+            local_match=local_match, global_flow=global_flow,
+            coarse_local_match=coarse_local_match)

@@ -99,7 +99,7 @@ def evaluate(model: torch.nn.Module, loader: DataLoader, device: torch.device,
              diagnose_local_mind: bool = False,
              diagnose_confidence_gate: bool = False,
              moving_source: str = "ir") -> Dict[str, float]:
-    total_epe = total_coarse_epe = total_baseline = total_valid = total_samples = 0.0
+    total_epe = total_coarse_epe = total_global_epe = total_baseline = total_valid = total_samples = 0.0
     total_corner_epe = total_cycle_epe = 0.0
     hit_sums = {f"pck_{threshold}px": 0.0 for threshold in (1, 3, 5)}
     diagnostic_sums: Dict[str, float] = {}
@@ -120,6 +120,8 @@ def evaluate(model: torch.nn.Module, loader: DataLoader, device: torch.device,
         count = float(valid.sum())
         total_epe += float(epe) * count
         total_coarse_epe += float(coarse_epe) * count
+        if output.global_flow is not None:
+            total_global_epe += float(endpoint_error(output.global_flow, target, valid)) * count
         total_baseline += float(baseline) * count
         total_valid += count
         corner_epe, cycle_epe = affine_corner_errors(
@@ -136,13 +138,29 @@ def evaluate(model: torch.nn.Module, loader: DataLoader, device: torch.device,
                 affine_confidence_power=model.matcher.affine_confidence_power,
                 affine_border_margin=model.matcher.affine_border_margin)
             for radius in (2, 4):
-                diagnostics.update(windowed_diagnostics(
+                window_diagnostics = windowed_diagnostics(
                     output.match.matching_probability,
                     tuple(output.match.coarse_flow.shape[-2:]),
                     output.match.coarse_flow, target, valid, radius=radius,
-                    appearance_scores=output.match.correlation))
+                    appearance_scores=output.match.correlation)
+                if output.global_flow is not None:
+                    diagnostics.update({"global_" + name: value
+                                        for name, value in window_diagnostics.items()})
+                else:
+                    diagnostics.update(window_diagnostics)
+            if output.global_flow is not None:
+                # This architecture fits affine to a learned cost-volume
+                # decoder, not to probability-peak weighted soft matches.
+                diagnostics = {name: value for name, value in diagnostics.items()
+                               if not name.startswith("affine_weight")}
             for name, value in diagnostics.items():
                 diagnostic_sums[name] = diagnostic_sums.get(name, 0.0) + value * float(predicted.shape[0])
+        if output.coarse_local_match is not None:
+            for name, value in local_matching_diagnostics(
+                    output.coarse_local_match, target, valid).items():
+                diagnostic_sums["coarse_" + name] = (
+                    diagnostic_sums.get("coarse_" + name, 0.0)
+                    + value * float(predicted.shape[0]))
         if output.local_match is not None:
             for name, value in local_matching_diagnostics(output.local_match, target, valid).items():
                 diagnostic_sums[name] = diagnostic_sums.get(name, 0.0) + value * float(predicted.shape[0])
@@ -184,6 +202,9 @@ def evaluate(model: torch.nn.Module, loader: DataLoader, device: torch.device,
     if coarse_grid_hw is not None:
         report["coarse_match_grid_hw"] = list(coarse_grid_hw)
         report["coarse_match_candidates"] = coarse_grid_hw[0] * coarse_grid_hw[1]
+    if getattr(model, "coarse_decoder", None) is not None:
+        report["global_epe_px"] = total_global_epe / max(total_valid, 1.0)
+        report["architecture"] = "glu_crft"
     report["relative_epe"] = report["epe_px"] / max(report["zero_flow_epe_px"], 1e-8)
     report["affine_corner_epe_px"] = total_corner_epe / max(total_samples, 1.0)
     report["affine_gt_inverse_cycle_px"] = total_cycle_epe / max(total_samples, 1.0)

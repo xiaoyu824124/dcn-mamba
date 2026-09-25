@@ -1,0 +1,16 @@
+# Apply after stage0_glu_crft_coarse.yaml. The 1/8 local search refines the
+# learned global field; a second affine fit supplies the 1/4 search centre.
+coarse_refiner:
+  enabled: true
+  radius: 4
+  temperature: 0.07
+  candidate_chunk: 9
+  refinement_channels: 32
+
+loss:
+  weights:
+    coarse_local: 1.0
+    global_flow: 0.5
+
+vtmot_train:
+  lr: 5.0e-5

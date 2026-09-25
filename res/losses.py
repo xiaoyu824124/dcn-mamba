@@ -29,12 +29,18 @@ class RegistrationLossOutput:
     match: torch.Tensor
     local: torch.Tensor
     appearance: torch.Tensor
+    coarse_flow: torch.Tensor | None = None
+    global_flow: torch.Tensor | None = None
+    coarse_local: torch.Tensor | None = None
 
     def as_dict(self) -> Dict[str, torch.Tensor]:
         return {"loss": self.total, "loss_flow": self.flow, "loss_mind": self.mind,
                 "loss_edge": self.edge, "loss_smooth": self.smooth,
                 "loss_affine": self.affine, "loss_match": self.match,
-                "loss_local": self.local, "loss_appearance": self.appearance}
+                "loss_local": self.local, "loss_appearance": self.appearance,
+                "loss_coarse_flow": self.coarse_flow,
+                "loss_global_flow": self.global_flow,
+                "loss_coarse_local": self.coarse_local}
 
 
 class RegistrationLoss(nn.Module):
@@ -74,6 +80,8 @@ class RegistrationLoss(nn.Module):
         self.weights = {key: float(weights[key]) for key in self.REQUIRED_WEIGHTS}
         self.weights["local"] = float(weights.get("local", 0.0))
         self.weights["appearance"] = float(weights.get("appearance", 0.0))
+        for name in ("coarse_flow", "global_flow", "coarse_local"):
+            self.weights[name] = float(weights.get(name, 0.0))
         if self.weights["appearance"] < 0:
             raise ValueError("appearance weight must be non-negative")
         if float(match_focal_gamma) < 0:
@@ -113,12 +121,15 @@ class RegistrationLoss(nn.Module):
 
     def forward(self, *, aligned_ir: torch.Tensor, visible: torch.Tensor,
                 coarse_flow: torch.Tensor, final_flow: Optional[torch.Tensor] = None,
+                global_flow: Optional[torch.Tensor] = None,
                 gt_flow: Optional[torch.Tensor] = None,
                 valid_mask: Optional[torch.Tensor] = None,
                 predicted_affine_yx: Optional[torch.Tensor] = None,
+                affine_feature_hw: Optional[tuple[int, int]] = None,
                 gt_h: Optional[torch.Tensor] = None,
                 match: Optional[GlobalMatchOutput] = None,
-                local_match: Optional[LocalMatchOutput] = None) -> RegistrationLossOutput:
+                local_match: Optional[LocalMatchOutput] = None,
+                coarse_local_match: Optional[LocalMatchOutput] = None) -> RegistrationLossOutput:
         if aligned_ir.ndim != 4 or aligned_ir.shape[1] != 1:
             raise ValueError("aligned_ir must be [B,1,H,W]")
         if visible.ndim != 4 or visible.shape[1] != 3:
@@ -135,25 +146,32 @@ class RegistrationLoss(nn.Module):
                 raise ValueError("valid_mask must be [B,1,H,W] on the aligned image grid")
             valid_mask = valid_mask.to(dtype=active_flow.dtype).clamp(0, 1)
 
-        if gt_flow is None:
-            loss_flow = zero
-        else:
-            if gt_flow.shape != active_flow.shape:
-                raise ValueError("gt_flow must match active flow shape")
-            flow_error = torch.sqrt((active_flow - gt_flow.to(active_flow)).square()
+        def flow_loss(predicted: torch.Tensor) -> torch.Tensor:
+            if gt_flow is None:
+                return zero
+            if gt_flow.shape != predicted.shape:
+                raise ValueError("gt_flow must match predicted flow shape")
+            flow_error = torch.sqrt((predicted - gt_flow.to(predicted)).square()
                                     + self.charbonnier_eps * self.charbonnier_eps)
             if valid_mask is None:
-                loss_flow = flow_error.mean()
-            else:
-                loss_flow = (flow_error * valid_mask).sum() / (
-                    valid_mask.sum().clamp_min(1) * active_flow.shape[1])
+                return flow_error.mean()
+            return (flow_error * valid_mask).sum() / (
+                valid_mask.sum().clamp_min(1) * predicted.shape[1])
+
+        loss_flow = flow_loss(active_flow)
+        loss_coarse_flow = (flow_loss(coarse_flow)
+                            if self.weights["coarse_flow"] > 0 else zero)
+        loss_global_flow = (flow_loss(global_flow)
+                            if self.weights["global_flow"] > 0 and global_flow is not None
+                            else zero)
 
         if predicted_affine_yx is None and gt_h is None:
             loss_affine = zero
         elif predicted_affine_yx is None or gt_h is None:
             raise ValueError("predicted_affine_yx and gt_h must be supplied together")
         else:
-            feature_hw = (active_flow.shape[-2] // 8, active_flow.shape[-1] // 8)
+            feature_hw = (affine_feature_hw if affine_feature_hw is not None else
+                          (active_flow.shape[-2] // 8, active_flow.shape[-1] // 8))
             if predicted_affine_yx.shape != (active_flow.shape[0], 3, 2):
                 raise ValueError("predicted_affine_yx must be [B,3,2]")
             target_affine_yx = homography_to_normalised_affine_yx(
@@ -175,6 +193,10 @@ class RegistrationLoss(nn.Module):
                 focal_gamma=self.match_focal_gamma)
         loss_local = (local_matching_loss(local_match, gt_flow, valid_mask)
                       if local_match is not None and gt_flow is not None else zero)
+        loss_coarse_local = (
+            local_matching_loss(coarse_local_match, gt_flow, valid_mask)
+            if (self.weights["coarse_local"] > 0 and coarse_local_match is not None
+                and gt_flow is not None) else zero)
         loss_appearance = zero
         if self.weights["appearance"] > 0 and match is not None and gt_flow is not None:
             if match.correlation is None:
@@ -185,18 +207,24 @@ class RegistrationLoss(nn.Module):
                 temperature=self.appearance_temperature)
 
         # MIND compares self-similarity patterns, not raw IR/RGB intensities.
-        loss_mind = F.l1_loss(self.mind_descriptor(aligned_ir),
-                              self.mind_descriptor(rgb_to_gray(visible)))
+        loss_mind = (F.l1_loss(self.mind_descriptor(aligned_ir),
+                               self.mind_descriptor(rgb_to_gray(visible)))
+                     if self.weights["mind"] > 0 else zero)
         loss_edge = F.l1_loss(self.edge_magnitude(aligned_ir),
                               self.edge_magnitude(visible))
         loss_smooth = self.edge_aware_smoothness(active_flow, visible)
         total = (self.weights["flow"] * loss_flow
+                 + self.weights["coarse_flow"] * loss_coarse_flow
+                 + self.weights["global_flow"] * loss_global_flow
                  + self.weights["match"] * loss_match
                  + self.weights["appearance"] * loss_appearance
                  + self.weights["local"] * loss_local
+                 + self.weights["coarse_local"] * loss_coarse_local
                  + self.weights["mind"] * loss_mind
                  + self.weights["edge"] * loss_edge
                  + self.weights["smooth"] * loss_smooth
                  + self.weights["affine"] * loss_affine)
         return RegistrationLossOutput(total, loss_flow, loss_mind, loss_edge, loss_smooth,
-                                      loss_affine, loss_match, loss_local, loss_appearance)
+                                      loss_affine, loss_match, loss_local, loss_appearance,
+                                      loss_coarse_flow, loss_global_flow,
+                                      loss_coarse_local)

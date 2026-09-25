@@ -1,9 +1,9 @@
-"""Shared multi-scale encoder for MIND descriptors.
+"""Shared multi-scale encoder for MIND or standardized grayscale inputs.
 
-The same :class:`MINDFeatureEncoder` instance encodes IR and visible MIND
-descriptors. Weight sharing is intentional: after MIND removes much of the
-intensity-domain gap, both modalities should occupy one structural feature
-space before global cosine matching.
+The same :class:`SharedPyramidEncoder` instance encodes IR and visible MIND
+descriptors in the legacy path. The new GLU-CRFT path feeds independently
+standardized grayscale frames to the same encoder. Both paths learn a shared
+feature space before cross-modal correlation.
 """
 
 from __future__ import annotations
@@ -51,17 +51,17 @@ class ResidualBlock(nn.Module):
         return self.activation(x + self.body(x))
 
 
-class MINDFeatureEncoder(nn.Module):
-    """One shared CNN encoder returning L2-normalised 1/2, 1/4 and 1/8 maps.
+class SharedPyramidEncoder(nn.Module):
+    """One shared CNN encoder returning 1/2, 1/4, 1/8 and optional 1/16 maps.
 
     Args:
-        in_channels: Number of MIND descriptor channels (eight for radius one).
+        in_channels: Number of input channels (eight for MIND, one for gray).
         base_channels: Width at the 1/2 scale.
         out_channels: Feature channels at the 1/8 scale used by global matching.
         blocks_per_scale: Number of residual blocks after each downsampling step.
 
     Input:
-        descriptor: ``[B, C_mind, H, W]``.
+        descriptor: ``[B, C, H, W]``.
     Output:
         A dictionary with feature tensors:
 
@@ -69,14 +69,14 @@ class MINDFeatureEncoder(nn.Module):
         - ``"1/4"``: ``[B, 2*base_channels, H/4, W/4]``;
         - ``"1/8"``: ``[B, out_channels, H/8, W/8]``.
 
-    Each feature is L2-normalised on the channel axis. Inputs must have height
-    and width divisible by eight so every feature coordinate maps exactly back to
-    an input-pixel region in the future flow/warp modules.
+    Features are L2-normalised when ``normalise=True``. Inputs must have height
+    and width divisible by eight (by sixteen with ``extra_coarse_scale``).
     """
 
     def __init__(self, in_channels: int = 8, base_channels: int = 24,
                  out_channels: int = 64, blocks_per_scale: int = 2,
-                 eps: float = 1e-6, normalise: bool = True):
+                 eps: float = 1e-6, normalise: bool = True,
+                 extra_coarse_scale: bool = False):
         super().__init__()
         if in_channels < 1 or base_channels < 1 or out_channels < 1:
             raise ValueError("channel counts must be positive")
@@ -92,11 +92,14 @@ class MINDFeatureEncoder(nn.Module):
         # Disabling it lets magnitude travel through the hierarchy; the matcher
         # still normalises before correlating.
         self.normalise = bool(normalise)
+        self.extra_coarse_scale = bool(extra_coarse_scale)
 
         channels_4 = base_channels * 2
         self.stage_2 = self._stage(in_channels, base_channels, blocks_per_scale)
         self.stage_4 = self._stage(base_channels, channels_4, blocks_per_scale)
         self.stage_8 = self._stage(channels_4, out_channels, blocks_per_scale)
+        if self.extra_coarse_scale:
+            self.stage_16 = self._stage(out_channels, out_channels, blocks_per_scale)
 
     @staticmethod
     def _stage(in_channels: int, out_channels: int,
@@ -122,7 +125,12 @@ class MINDFeatureEncoder(nn.Module):
         feature_2 = self._normalise(self.stage_2(descriptor))
         feature_4 = self._normalise(self.stage_4(feature_2))
         feature_8 = self._normalise(self.stage_8(feature_4))
-        return {"1/2": feature_2, "1/4": feature_4, "1/8": feature_8}
+        features = {"1/2": feature_2, "1/4": feature_4, "1/8": feature_8}
+        if self.extra_coarse_scale:
+            if height % 16 or width % 16:
+                raise ValueError("1/16 encoder requires H and W divisible by 16")
+            features["1/16"] = self._normalise(self.stage_16(feature_8))
+        return features
 
     def encode_pair(self, descriptor_ir: torch.Tensor,
                     descriptor_vi: torch.Tensor) -> Tuple[Dict[str, torch.Tensor],
@@ -133,3 +141,9 @@ class MINDFeatureEncoder(nn.Module):
                 "shared encoder needs equal IR/VI descriptor shapes, got "
                 f"{tuple(descriptor_ir.shape)} and {tuple(descriptor_vi.shape)}")
         return self(descriptor_ir), self(descriptor_vi)
+
+
+# Existing checkpoints store only tensor names, and older callers import this
+# public name. Keep it as an alias while the new grayscale path uses the
+# representation-neutral name.
+MINDFeatureEncoder = SharedPyramidEncoder

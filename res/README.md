@@ -663,3 +663,57 @@ GT 落在搜索窗口内的像素计算。`res/configs/registration.yaml` 是默
 最终流场，在后续帧做运动传播，以当前帧的局部匹配修正，并按置信度更新
 关键帧。验证时分开报告关键帧与非关键帧的 EPE/PCK、相邻帧流场一致性和
 遮挡区域表现。不要把单帧结果当作时序结果。
+
+## 新粗场实验：GLU-Net 分辨率设计 + CRFT 跨模态特征
+
+旧路径在 480×640 图像的 1/8 层直接做 4800 候选全局匹配；A4000 上旧权重
+的全局 argmax EPE 约 149 px，最终粗场 EPE 约 6.84 px。因此新增独立的
+`glu_crft` 路径，旧权重和默认配置仍可作为同一数据划分的对照：
+
+```text
+IR、VI → 各自灰度 z-score → 共享可训练 1/2、1/4、1/8、1/16 编码器
+       → 16×16 SA–CA → 256 候选双向相关 → 可学习 cost-volume 解码
+       → 6DoF 仿射拟合 → 1/8 按粗场中心局部搜索、更新仿射粗场
+       → 预对齐 IR → 原有 1/4 局部搜索与跨尺度特征融合
+```
+
+MIND 不进入新路径的编码器；新路径的结构损失权重也设为零。这里借鉴的是
+[SmoothFusion](https://www.sciencedirect.com/science/article/abs/pii/S0030399226010431)
+所用 [GLU-Net](https://openaccess.thecvf.com/content_CVPR_2020/html/Truong_GLU-Net_Global-Local_Universal_Network_for_Dense_Flow_and_Correspondences_CVPR_2020_paper.html)
+的“小网格全局相关，再逐级局部修正”和
+[CRFT](https://github.com/NEU-Liuxuecong/CRFT) 的逐图标准化、共享编码器、
+相关前 SA–CA。当前实现是新的组合实验，不是这两篇论文的官方复现；
+没有加载它们的预训练权重。CRFT 官方训练使用跨模态预训练初始化；因此本实验
+先准备同模态几何预热作为本地可复现的初始化，再比较 IR–VI 迁移。6DoF 拟合
+用于解码后的粗场，不再直接拟合
+旧路径中的弥散 softargmax 对应。关键帧选择与时序平滑要等单帧粗场通过验证后再接。
+
+在 A4000 仓库根目录依次验证，每个训练命令使用新的输出目录。先运行
+`python -B -m unittest discover -s res/tests -t .`，再做第 0 阶段一步前后向试跑。
+接着用同模态可见光对训练全局几何表征，再把该权重迁移到 IR–VI：
+
+```bat
+python -B -m res.train_vtmot --device cuda --steps 1 --num-workers 0 --overlay res/configs/stage0_glu_crft_coarse.yaml --output-dir res_runs/glu_crft_stage0_smoke
+python -B -m res.train_vtmot --device cuda --run full --num-workers 0 --moving-source visible_gt --overlay res/configs/stage0_glu_crft_coarse.yaml --output-dir res_runs/glu_crft_visible_warmup
+python -B -m res.evaluate_vtmot --device cuda --split eval --frame-stride 10 --moving-source visible_gt --checkpoint res_runs/glu_crft_visible_warmup/best.pt --output res_runs/glu_crft_visible_warmup/eval_stride10.json
+python -B -m res.train_vtmot --device cuda --run pilot --num-workers 0 --moving-source ir --init res_runs/glu_crft_visible_warmup/best.pt --overlay res/configs/stage0_glu_crft_coarse.yaml --output-dir res_runs/glu_crft_stage0_ir_pilot
+python -B -m res.evaluate_vtmot --device cuda --split eval --frame-stride 10 --checkpoint res_runs/glu_crft_stage0_ir_pilot/best.pt --output res_runs/glu_crft_stage0_ir_pilot/eval_stride10.json
+```
+
+先看 `coarse_match_candidates=256`、`global_epe_px`、`coarse_epe_px`、
+`match_epe_argmax_px`、`pck_3px`。同模态预热若不能明显低于零场，先排查
+训练和几何方向；IR–VI 第 0 阶段若只学到接近零场（EPE 约
+8.98 px），或 80 帧 EPE 未接近旧粗场 6.84 px，就先分析全局特征与
+cost-volume 解码，不向 1/8 或 1/4 继续堆模块。若粗场明显改善，再从
+第 0 阶段权重开启 1/8 局部更新；该阶段记录 `coarse_local_*` 窗口覆盖、
+oracle、soft 误差，并比较 `global_epe_px` 与 `coarse_epe_px`：
+
+```bat
+python -B -m res.train_vtmot --device cuda --run pilot --num-workers 0 --init res_runs/glu_crft_stage0_ir_pilot/best.pt --overlay res/configs/stage0_glu_crft_coarse.yaml --overlay res/configs/stage1_glu_crft_coarse_local.yaml --output-dir res_runs/glu_crft_stage1_pilot
+python -B -m res.evaluate_vtmot --device cuda --split eval --frame-stride 10 --checkpoint res_runs/glu_crft_stage1_pilot/best.pt --output res_runs/glu_crft_stage1_pilot/eval_stride10.json
+```
+
+只有 1/8 修正使 80 帧粗场 EPE 下降，才在同样的两个 overlay 后加
+`res/configs/stage2_glu_crft_fine.yaml`，用第 1 阶段 `best.pt` 做 `--init`
+训练 1/4 细化。正式训练可把 `--run pilot` 改成 `--run full` 并使用新的目录；
+300 步 pilot 只作结构筛选，不能据此宣称模型已充分收敛。

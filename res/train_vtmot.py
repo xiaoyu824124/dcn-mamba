@@ -30,6 +30,10 @@ def freeze_coarse_parameters(model: torch.nn.Module) -> None:
     model.matcher.requires_grad_(False)
     if model.coarse_transformer is not None:
         model.coarse_transformer.requires_grad_(False)
+    for name in ("coarse_decoder", "coarse_refiner"):
+        module = getattr(model, name, None)
+        if module is not None:
+            module.requires_grad_(False)
 
 
 def freeze_local_refinement_parameters(model: torch.nn.Module) -> None:
@@ -268,9 +272,12 @@ def main() -> None:
             losses = loss_fn(aligned_ir=(output.final_aligned_ir if output.final_aligned_ir is not None
                                          else output.coarse_aligned_ir), visible=vi,
                              coarse_flow=output.coarse_flow, final_flow=output.final_flow,
+                             global_flow=output.global_flow,
                              gt_flow=target, valid_mask=valid,
                              predicted_affine_yx=output.affine_yx, gt_h=gt_h,
-                             match=output.match, local_match=output.local_match)
+                             affine_feature_hw=tuple(output.confidence_1_8.shape[-2:]),
+                             match=output.match, local_match=output.local_match,
+                             coarse_local_match=output.coarse_local_match)
         scaler.scale(losses.total).backward()
         scaler.unscale_(optimizer)
         torch.nn.utils.clip_grad_norm_(model.parameters(), float(train_config.grad_clip_norm))
@@ -284,6 +291,8 @@ def main() -> None:
                   "match": float(losses.match.detach()),
                   "appearance": float(losses.appearance.detach()),
                   "local": float(losses.local.detach()),
+                  "coarse_local": float(losses.coarse_local.detach()),
+                  "global_flow": float(losses.global_flow.detach()),
                   "temperature": float(model.matcher.temperature.detach()),
                   "peak_mem_mib": (torch.cuda.max_memory_allocated() / 2 ** 20
                                    if device.type == "cuda" else 0.0),
@@ -291,7 +300,8 @@ def main() -> None:
         if step == 1 or step % int(train_config.log_every) == 0:
             print("step={step:5d} loss={train_loss:.5f} train_epe={train_epe:.3f} "
                   "match={match:.4f} appearance={appearance:.4f} "
-                  "local={local:.4f} affine={affine:.4f}".format(**record))
+                  "local={local:.4f} coarse_local={coarse_local:.4f} "
+                  "global_flow={global_flow:.4f} affine={affine:.4f}".format(**record))
             # Localisation view of the same batch: does the correct key rank first?
             record.update(matching_diagnostics(output.match.matching_probability,
                                                tuple(output.match.coarse_flow.shape[-2:]),
@@ -304,6 +314,9 @@ def main() -> None:
                   "zero={zero_flow_epe_px:.3f} ratio={relative_epe:.3f} "
                   "gt_rank_frac={match_frac_keys_beating_gt:.3f} "
                   "argmax_epe={match_epe_argmax_px:.1f}px".format(**validation))
+            if "global_epe_px" in validation:
+                print(f"  global epe={validation['global_epe_px']:.3f}px "
+                      f"candidates={validation['coarse_match_candidates']}")
             if "local_soft_epe_px" in validation:
                 print("  local soft_epe={local_soft_epe_px:.3f}px "
                       "argmax_epe={local_argmax_epe_px:.1f}px "
