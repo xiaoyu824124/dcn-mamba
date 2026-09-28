@@ -216,6 +216,20 @@ class IterativeRefinementTest(unittest.TestCase):
             self.assertIn(f"refine_round{index}_applied_mean_alignment", report)
             self.assertGreaterEqual(
                 report[f"refine_round{index}_applied_std_px"], 0.0)
+            self.assertGreaterEqual(
+                report[f"refine_round{index}_applied_mean_norm_px"], 0.0)
+            self.assertGreaterEqual(
+                report[f"refine_round{index}_required_mean_norm_px"], 0.0)
+            self.assertLessEqual(
+                report[f"refine_round{index}_applied_mean_alignment"], 1.0 + 1e-5)
+            # Confidence is at most one and the update is tanh-bounded, so no
+            # per-frame mean or spatial spread can exceed one full step.  This
+            # pins the cells-to-pixels factor: applying the stride twice, or not
+            # at all, would put these past the bound.
+            bound = model.iterative_refinement.max_step_cells * (64 / 16)
+            for suffix in ("applied_mean_norm_px", "applied_std_px"):
+                self.assertLessEqual(report[f"refine_round{index}_{suffix}"],
+                                     bound + 1e-4)
         self.assertIn("coarse_epe_px", report)
         self.assertTrue(all(value == value                        # not NaN
                             for name, value in report.items()
