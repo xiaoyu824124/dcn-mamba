@@ -680,8 +680,14 @@ def main() -> None:
                   f"{sorted({name.split('.')[0] for name in load_report['untrained']})}")
         if args.diagnose_local_mind and model.local_matcher is None:
             raise ValueError("--diagnose-local-mind requires an enabled local matcher")
-        if args.diagnose_confidence_gate and model.local_matcher is None:
-            raise ValueError("--diagnose-confidence-gate requires an enabled local matcher")
+        # The gate diagnostic applies to whichever 1/4 stage owns a confidence:
+        # the single-shot local matcher, or the iterative loop, which is re-run
+        # once per gate rather than filtered after the fact.
+        if args.diagnose_confidence_gate and model.local_matcher is None \
+                and getattr(model, "iterative_refinement", None) is None:
+            raise ValueError(
+                "--diagnose-confidence-gate requires an enabled local matcher or "
+                "an enabled iterative refinement loop")
         if args.diagnose_local_centre and not getattr(model, "supports_local_centre",
                                                       False):
             # The centre override is what the truth-centred diagnostic needs; a
