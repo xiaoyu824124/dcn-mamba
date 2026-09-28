@@ -80,6 +80,8 @@ class SpatialFrequencyTest(unittest.TestCase):
                     report = evaluate(model.eval(), [batch], torch.device("cpu"))
                     self.assertEqual(report["coarse_match_candidates"], 80)
                     self.assertEqual(report["representation"], "fused")
+                    self.assertIn("affine_weight_effective_queries_ratio", report)
+                    self.assertIn("affine_weighted_raw_epe_px", report)
 
     def test_common_branches_start_from_the_same_weights(self):
         config = OmegaConf.merge(

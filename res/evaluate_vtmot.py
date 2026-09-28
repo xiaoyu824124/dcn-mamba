@@ -148,9 +148,12 @@ def evaluate(model: torch.nn.Module, loader: DataLoader, device: torch.device,
                                         for name, value in window_diagnostics.items()})
                 else:
                     diagnostics.update(window_diagnostics)
-            if output.global_flow is not None:
-                # This architecture fits affine to a learned cost-volume
-                # decoder, not to probability-peak weighted soft matches.
+            if not model.matcher.affine_projection:
+                # GLU-CRFT fits affine to a learned cost-volume decoder, not
+                # to probability-peak weighted soft matches.  A model may
+                # expose global_flow while still using WLS (the 1/8
+                # spatial-frequency ablation does), so that field alone must
+                # not suppress its actual WLS diagnostics.
                 diagnostics = {name: value for name, value in diagnostics.items()
                                if not name.startswith("affine_weight")}
             for name, value in diagnostics.items():
