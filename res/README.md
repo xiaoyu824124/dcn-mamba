@@ -824,3 +824,12 @@ python -B -m res.visualize_structural_prior --device cuda --split eval --frame-s
 `affine_weight_effective_queries_ratio` 和粗场 EPE。如果学习器改善对应
 但仍无法改善粗场，下一步检查 WLS 支撑点与仿射读出；如果对应排名本身
 不改善，先修表征，不接 1/4、1/2 或 DCN。保留 `test` 划分作最终评估。
+
+手工基线和学习版也可使用**同一个** 32 px 软位置先验评测，
+以判断改善来自编码器还是位置先验。先验只用于受控诊断，不能作为
+大位移场景的最终方案：
+
+```bat
+python -B -m res.evaluate_structural_direct --device cuda --split eval --frame-stride 10 --overlay res/configs/ab_spatial_prior32.yaml --output res_runs/structural_direct/eval_prior32_stride10.json
+python -B -m res.evaluate_vtmot --device cuda --split eval --frame-stride 10 --checkpoint res_runs/structural_learned_full/best.pt --overlay res/configs/ab_spatial_prior32.yaml --output res_runs/structural_learned_full/eval_best_prior32_stride10.json
+```

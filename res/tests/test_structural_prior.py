@@ -78,6 +78,10 @@ class StructuralPriorTest(unittest.TestCase):
                  "gt_h": torch.eye(3).unsqueeze(0)}
         report = evaluate(model.eval(), [batch], torch.device("cpu"))
         self.assertEqual(report["architecture"], "structural_prior_direct")
+        prior_config = OmegaConf.merge(
+            config, OmegaConf.load("res/configs/ab_spatial_prior32.yaml"))
+        prior_model = build_global_registration(prior_config)
+        self.assertEqual(prior_model.matcher.spatial_prior_sigma, 4.0)
 
 
 if __name__ == "__main__":

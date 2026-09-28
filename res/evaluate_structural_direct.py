@@ -23,13 +23,16 @@ def main() -> None:
     parser.add_argument("--frame-stride", type=int, default=10)
     parser.add_argument("--max-samples", type=int, default=0)
     parser.add_argument("--device", default="cuda")
+    parser.add_argument("--overlay", type=Path, action="append", default=[],
+                        help="parameter-free matcher overlay, for a same-prior comparison")
     parser.add_argument("--output", type=Path, default=None)
     args = parser.parse_args()
     device = torch.device(args.device)
     config = OmegaConf.merge(
         OmegaConf.load("res/configs/registration.yaml"),
         OmegaConf.load("res/configs/stage0_structural_prior.yaml"),
-        OmegaConf.load("res/configs/ab_structural_direct.yaml"))
+        OmegaConf.load("res/configs/ab_structural_direct.yaml"),
+        *(OmegaConf.load(path) for path in args.overlay))
     model = build_global_registration(config).to(device).eval()
     model.matcher.return_correlation = True
     dataset = VTMOTSingleFrameDataset(
@@ -42,6 +45,8 @@ def main() -> None:
     report["split"] = args.split
     report["frame_stride"] = args.frame_stride
     report["field_of_view_hw"] = [480, 640]
+    if args.overlay:
+        report["evaluation_overlays"] = [str(path) for path in args.overlay]
     beats_zero, fusion_ready, status = _registration_status(report, "ir")
     report["beats_zero_flow"] = beats_zero
     report["fusion_ready"] = fusion_ready
