@@ -373,6 +373,7 @@ def evaluate(model: torch.nn.Module, loader: DataLoader, device: torch.device,
             stride_hw = (target.shape[-2] / feature_hw[0],
                          target.shape[-1] / feature_hw[1])
             frame_covered = []
+            round_fields = []
             for index, (flow, applied, covered_cell, benefit, confidence_pixel) in enumerate(
                     zip(output.refinement.flows, output.refinement.applied,
                         reports["covered"], reports["benefit"],
@@ -383,6 +384,7 @@ def evaluate(model: torch.nn.Module, loader: DataLoader, device: torch.device,
                 field = upsample_feature_flow(flow, target.shape[-2:], stride_hw)
                 incoming = upsample_feature_flow(flow - applied, target.shape[-2:],
                                                  stride_hw)
+                round_fields.append((field, incoming))
                 for name, value, mask in (
                         (f"refine_round{index}_epe_allvalid_px", field, valid),
                         (f"refine_round{index}_epe_noupdate_px", incoming, valid),
@@ -438,11 +440,18 @@ def evaluate(model: torch.nn.Module, loader: DataLoader, device: torch.device,
             region_counts["refine_common_pixels"] = (
                 region_counts.get("refine_common_pixels", 0.0) + float(common.sum()))
             for index in range(1, len(frame_covered) + 1):
-                field = upsample_feature_flow(output.refinement.flows[index - 1],
-                                              target.shape[-2:], stride_hw)
-                _pool(region_sums, f"refine_round{index}_epe_common_px",
-                      float(endpoint_error(field, target, common)),
-                      float(common.sum()))
+                field, incoming = round_fields[index - 1]
+                common_pixels = float(common.sum())
+                # Without these two the fixed subset cannot answer its own
+                # question: whether the rounds beat doing nothing, and whether
+                # they beat the coarse field, on exactly the same pixels.
+                for name, value in (
+                        (f"refine_round{index}_epe_common_px", field),
+                        (f"refine_round{index}_epe_common_noupdate_px", incoming),
+                        (f"refine_round{index}_epe_common_coarse_px",
+                         output.coarse_flow)):
+                    _pool(region_sums, name,
+                          float(endpoint_error(value, target, common)), common_pixels)
         if output.local_match is not None:
             for name, value in local_matching_diagnostics(output.local_match, target, valid).items():
                 diagnostic_sums[name] = diagnostic_sums.get(name, 0.0) + value * float(predicted.shape[0])

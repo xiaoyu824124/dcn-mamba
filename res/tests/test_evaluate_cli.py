@@ -88,6 +88,8 @@ class EvaluateCliTest(unittest.TestCase):
                 + report[f"refine_round{index}_outside_coverage"], 1.0, places=5)
             self.assertIn(f"refine_round{index}_epe_allvalid_px", report)
             self.assertIn(f"refine_round{index}_epe_noupdate_px", report)
+            self.assertIn(f"refine_round{index}_epe_common_noupdate_px", report)
+            self.assertIn(f"refine_round{index}_epe_common_coarse_px", report)
             self.assertIn(f"refine_round{index}_confidence_auc", report)
         self.assertLessEqual(report["refine_common_coverage"],
                              report["refine_round1_coverage"] + 1e-6)
