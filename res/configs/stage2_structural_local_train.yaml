@@ -15,42 +15,49 @@
 # stage_2 and the shallow adapters, and stage_8 consumes stage_4's output.
 # freeze_coarse therefore holds the encoder, the SA-CA transformer and the global
 # matcher fixed, which leaves fine_interaction as the only trainable module: a
-# 1x1 shared 1/4 projection, a 1/8 top-down context projection and their fusion,
-# all behind a zero-initialised residual gain (so warm start reproduces the
-# encoder's 1/4 features exactly).
+# 1x1 shared 1/4 projection, a 1/8 top-down context projection and their fusion.
 #
 # freeze_local_refinement holds the residual head at zero, so the final field is
 # still the coarse field and every reported local_* number isolates the candidate
 # distribution rather than a learned correction.
 #
 # radius 4 (81 candidates, +/-16 px) instead of 8: the step-1 measurement put the
-# truth-centred argmax at 25.06 px against a 25.98 px random floor, i.e. no skill
-# at all, so a wider window only multiplies fruitless candidates -- and
-# global_window2_coverage was already 1.0 at +/-16 px.  Widen it again once the
-# truth-centred argmax falls clearly below the floor.
+# truth-centred argmax at 25.06 px against a 25.98 px random floor, so a wider
+# window only multiplies fruitless candidates, and global_window2_coverage was
+# already 1.0 at +/-16 px.
 #
 # The flow, edge and smoothness terms are constant here (the coarse field is
 # frozen and the head is held at zero), so ``local`` is the only loss that
-# produces a gradient.  Judge this stage by truthcentre_local_argmax_epe_px and
-# local_oracle_epe_px on the same 80 frames, never by the value of the total loss.
+# produces a gradient.  Judge this stage by the local NLL against its two
+# references -- ln(81) = 4.3944 for a uniform field and 1.7069 for the best field
+# a sigma=0.75 soft target allows -- and by truthcentre_local_argmax_epe_px
+# against the 13.70 px random floor on the same 80 frames, never by the total loss.
 local_matcher:
   enabled: true
   radius: 4
-  temperature: 0.07
+  # Logits are cos / T.  Holding the ~18% of the mass that a perfect field reaches
+  # needs a top-versus-rest logit gap near 2.9, i.e. a cosine gap near 0.20.  The
+  # trained 1/8 features have that -- match_p_max 0.129 over 4800 candidates at
+  # T=0.07 implies a cosine gap near 0.46 -- but the untrained 1/4 features reach
+  # only a few percent of the way from uniform, a cosine gap nearer 0.02.  At
+  # T=0.07 the softmax cannot form a peak at all and the local NLL pins to
+  # ln(81); T=0.01 supplies the missing order of magnitude and enlarges the
+  # gradient reaching the features roughly sevenfold.
+  temperature: 0.01
   candidate_chunk: 9
   refinement_channels: 32
 
 fine_interaction:
   enabled: true
-  # A zero residual gain would block the very thing this stage trains: gain *
-  # fused has zero derivative with respect to the projections while the gain is
-  # zero, so a 300-step run that measured local NLL stuck at ln(81) = 4.3944 (a
-  # uniform distribution over the 81 candidates) with every validation metric
-  # frozen had in fact only nudged the scalar.  Starting at 0.1 gives all of the
-  # module's parameters gradient from the first step; the module's default of 0.0
-  # is unchanged, so the frozen-coarse diagnostic stage still reproduces the
-  # encoder's 1/4 features exactly at warm start.
-  gain_init: 0.1
+  # The module computes fine + gain * fused.  Two runs at 300 steps bracket the
+  # effect: with the gain pinned at zero the local NLL ended 0.47% *worse* than a
+  # uniform field, because gain * fused has zero derivative with respect to the
+  # projections; with gain 0.1 it learned, staying below the zero-gain run at
+  # every logged step and reaching 4.4% of the way from uniform (4.3944) to the
+  # best soft-target value (1.7069), but only at about 1.5% per hundred steps.
+  # A gain of 0.1 still leaves 90% of the feature entering the matcher identical
+  # to the frozen stage_4 output, so start at 1.0 and let the adapter act fully.
+  gain_init: 1.0
 
 loss:
   weights:
@@ -59,4 +66,7 @@ loss:
 vtmot_train:
   freeze_coarse: true
   freeze_local_refinement: true
-  lr: 1.0e-4
+  # About 49k parameters are trainable and batch size is one, so 300 steps at
+  # 1e-4 left the trend buried in batch-to-batch noise (train_epe ranged 2.2 to
+  # 13.2).  Raise the rate and use --run full for 3000 steps.
+  lr: 3.0e-4

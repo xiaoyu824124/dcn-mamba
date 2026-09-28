@@ -183,9 +183,11 @@ class StructuralLocalWiringTest(unittest.TestCase):
         # so dropping this overlay would silently change the coarse field.
         self.assertEqual(model.matcher.spatial_prior_sigma, 4.0)
         self.assertEqual(model.local_matcher.radius, 4)
-        # The overlay must start the residual gain away from zero, otherwise the
-        # projections this stage exists to train receive no gradient at all.
-        self.assertAlmostEqual(float(model.fine_interaction.gain), 0.1, places=6)
+        # The overlay must let the adapter act fully and the softmax can only form
+        # a peak at a temperature matched to the 1/4 features' cosine contrast,
+        # otherwise the projections this stage exists to train stay ineffective.
+        self.assertAlmostEqual(float(model.fine_interaction.gain), 1.0, places=6)
+        self.assertAlmostEqual(float(model.local_matcher.temperature), 0.01, places=6)
 
         freeze_coarse_parameters(model)
         freeze_local_refinement_parameters(model)
