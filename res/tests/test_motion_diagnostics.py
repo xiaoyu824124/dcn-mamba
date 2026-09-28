@@ -4,10 +4,34 @@ import unittest
 
 import torch
 
-from res.motion_diagnostics import frame_motion_diagnostics, summarize_motion_frames
+from res.motion_diagnostics import (frame_motion_diagnostics,
+                                    summarize_motion_frames,
+                                    translate_moving_for_stress)
+from res.warp import warp
 
 
 class MotionDiagnosticsTest(unittest.TestCase):
+    def test_stress_translation_preserves_alignment_and_updates_homography(self):
+        source = torch.arange(12 * 16, dtype=torch.float32).reshape(1, 1, 12, 16)
+        flow = torch.zeros(1, 2, 12, 16)
+        flow[:, 0] = 1
+        flow[:, 1] = 2
+        valid = torch.ones(1, 1, 12, 16)
+        valid[:, :, 11:, :] = 0
+        valid[:, :, :, 14:] = 0
+        h = torch.tensor([[[1., 0., 2.], [0., 1., 1.], [0., 0., 1.]]])
+        shifted, new_flow, new_valid, new_h = translate_moving_for_stress(
+            source, flow, valid, h, (2, -1))
+        self.assertTrue(torch.allclose(new_flow[:, 0], torch.full((1, 12, 16), 3.)))
+        self.assertTrue(torch.allclose(new_flow[:, 1], torch.full((1, 12, 16), 1.)))
+        self.assertEqual(float(new_h[0, 0, 2]), 1.0)
+        self.assertEqual(float(new_h[0, 1, 2]), 3.0)
+        self.assertEqual(int(new_valid.sum()), 9 * 14)
+        original_aligned = warp(source, flow)
+        stressed_aligned = warp(shifted, new_flow)
+        self.assertTrue(torch.allclose(original_aligned * new_valid,
+                                       stressed_aligned * new_valid, atol=1e-5))
+
     def test_pixel_bins_and_match_distribution(self):
         target = torch.zeros(1, 2, 16, 16)
         target[:, 1, :, 8:] = 8

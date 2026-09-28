@@ -7,10 +7,50 @@ import math
 import torch
 
 from .matching import correspondence_targets, grid_coordinates
+from .warp import warp
 
 
 PIXEL_MOTION_EDGES = (0.0, 4.0, 8.0, 16.0, 32.0, math.inf)
 FRAME_MOTION_EDGES = (0.0, 4.0, 8.0, 12.0, 16.0, math.inf)
+MATCH_MOTION_EDGES = (0.0, 8.0, 16.0, 32.0, math.inf)
+
+
+def translate_moving_for_stress(
+        moving: torch.Tensor, gt_flow: torch.Tensor, valid: torch.Tensor,
+        gt_h: torch.Tensor, extra_dy_dx: tuple[float, float]
+        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Add a known fixed-to-moving translation with zero-padded borders.
+
+    The new moving image is ``moving'(q)=moving(q-extra)``. Its GT map is
+    therefore ``flow'(p)=flow(p)+extra``. The returned validity mask also
+    rejects fixed pixels whose new moving-image coordinate falls outside.
+    """
+    if moving.ndim != 4 or gt_flow.shape != (moving.shape[0], 2, *moving.shape[-2:]):
+        raise ValueError("moving and gt_flow shapes disagree")
+    batch, _, height, width = moving.shape
+    if valid.shape != (batch, 1, height, width) or gt_h.shape != (batch, 3, 3):
+        raise ValueError("valid or gt_h shape disagrees with moving image")
+    dy, dx = map(float, extra_dy_dx)
+    if not math.isfinite(dy) or not math.isfinite(dx):
+        raise ValueError("stress translation must be finite")
+    if abs(dy) >= height or abs(dx) >= width:
+        raise ValueError("stress translation must be smaller than the image")
+    delta = gt_flow.new_tensor((dy, dx)).view(1, 2, 1, 1).expand_as(gt_flow)
+    shifted_moving = warp(moving, -delta)
+    stressed_flow = gt_flow + delta
+    y = torch.arange(height, device=gt_flow.device, dtype=gt_flow.dtype).view(1, height, 1)
+    x = torch.arange(width, device=gt_flow.device, dtype=gt_flow.dtype).view(1, 1, width)
+    mapped_y = y + stressed_flow[:, 0]
+    mapped_x = x + stressed_flow[:, 1]
+    inside = ((mapped_y >= 0) & (mapped_y <= height - 1)
+              & (mapped_x >= 0) & (mapped_x <= width - 1))
+    stressed_valid = valid * inside.unsqueeze(1).to(valid.dtype)
+    translation = torch.eye(3, device=gt_h.device, dtype=gt_h.dtype).expand(
+        batch, -1, -1).clone()
+    translation[:, 0, 2] = dx
+    translation[:, 1, 2] = dy
+    stressed_h = translation @ gt_h
+    return shifted_moving, stressed_flow, stressed_valid, stressed_h
 
 
 def _bin_label(low: float, high: float) -> str:
@@ -140,7 +180,7 @@ def frame_motion_diagnostics(predicted: torch.Tensor, coarse: torch.Tensor,
     top_gt_motion = torch.linalg.vector_norm(
         (target_cells[0] - coordinates) * pixel_stride, dim=-1)
     motion_bins = {}
-    for low, high in zip(PIXEL_MOTION_EDGES[:-1], PIXEL_MOTION_EDGES[1:]):
+    for low, high in zip(MATCH_MOTION_EDGES[:-1], MATCH_MOTION_EDGES[1:]):
         name = _bin_label(low, high)
         motion_bins[name] = {
             "predicted_fraction": float(((top_predicted_motion >= low)

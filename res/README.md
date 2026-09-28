@@ -854,3 +854,24 @@ python -B -m res.evaluate_vtmot --device cuda --split eval --frame-stride 10 --c
 先比较最高位移四分位和 `>=16px`、`>=32px` 像素组，再检查高置信
 匹配是否集中在图像局部或偏向近零位移。软位置先验可能降低总体 EPE，
 但同时损害大位移组；这种情况不能作为大位移匹配已解决的证据。
+最高置信匹配的预测位移来自 1/8 网格 argmax，约以 8 px 为步长；
+`top10_conf_motion_bins` 因而使用 0–8、8–16、16–32、≥32 px 分组，
+不能将这些离散位移分组当成亚像素精度统计。
+
+当前 80 帧自然评测若没有 `>=32px` 的有效像素，可额外使用**可控平移压力测试**。
+`--stress-translation DY DX` 仅在评测时平移 IR，并同步更新固定图到移动图的
+GT 流场、仿射矩阵与有效区域；不改训练数据、模型或权重。
+移动后图像边缘会出现零填充，评测掩码排除无法对应的边界像素。
+正 `DX` 表示新真值中 IR 对应点向右移动。分别测试两个方向，避免单一方向的
+边界和场景结构误导判断：
+
+```bat
+python -B -m res.evaluate_vtmot --device cuda --split eval --frame-stride 10 --checkpoint res_runs/structural_learned_full/last.pt --overlay res/configs/ab_spatial_prior32.yaml --stress-translation 0 48 --diagnose-motion --output res_runs/structural_learned_full/motion_prior32_dx48.json
+python -B -m res.evaluate_vtmot --device cuda --split eval --frame-stride 10 --checkpoint res_runs/structural_learned_full/last.pt --overlay res/configs/ab_spatial_prior32.yaml --stress-translation 0 -48 --diagnose-motion --output res_runs/structural_learned_full/motion_prior32_dxminus48.json
+python -B -m res.evaluate_vtmot --device cuda --split eval --frame-stride 10 --checkpoint res_runs/control_warm_pilot/best.pt --stress-translation 0 48 --diagnose-motion --output res_runs/control_warm_pilot/motion_dx48.json
+python -B -m res.evaluate_vtmot --device cuda --split eval --frame-stride 10 --checkpoint res_runs/control_warm_pilot/best.pt --stress-translation 0 -48 --diagnose-motion --output res_runs/control_warm_pilot/motion_dxminus48.json
+```
+
+压力测试是诊断，不代表真实大位移数据集的最终成绩。必须在同一平移方向、
+相同有效区域下比较模型 EPE 和 `>=32px` 位移组，不能直接拿压力测试 EPE
+与未平移的 6–7 px 结果比较。

@@ -67,6 +67,11 @@ class StructuralPriorTest(unittest.TestCase):
         self.assertEqual(motion_report["motion_pixel_bins"]["0-4px"]["pixels"],
                          64 * 80)
         self.assertIsNotNone(motion_report["match_distribution_summary"])
+        stress_report = evaluate(model.eval(), [batch], torch.device("cpu"),
+                                 diagnose_motion=True, stress_translation=(0, 8))
+        self.assertEqual(stress_report["stress_translation_dy_dx"], [0, 8])
+        self.assertEqual(stress_report["motion_pixel_bins"]["8-16px"]["pixels"],
+                         64 * 72)
 
     def test_direct_baseline_has_no_feature_parameters(self):
         config = OmegaConf.merge(

@@ -19,7 +19,9 @@ from .affine import affine_corner_errors
 from .matching import matching_diagnostics, windowed_diagnostics
 from .local_matcher import local_matching_diagnostics
 from .mind import paired_mind
-from .motion_diagnostics import frame_motion_diagnostics, summarize_motion_frames
+from .motion_diagnostics import (frame_motion_diagnostics,
+                                 summarize_motion_frames,
+                                 translate_moving_for_stress)
 from .vtmot import VTMOTSingleFrameDataset, registration_moving_image
 from .warp import upsample_feature_flow, warp
 
@@ -100,6 +102,7 @@ def evaluate(model: torch.nn.Module, loader: DataLoader, device: torch.device,
              diagnose_local_mind: bool = False,
              diagnose_confidence_gate: bool = False,
              diagnose_motion: bool = False,
+             stress_translation: tuple[float, float] | None = None,
              moving_source: str = "ir") -> Dict[str, float]:
     total_epe = total_coarse_epe = total_global_epe = total_baseline = total_valid = total_samples = 0.0
     total_corner_epe = total_cycle_epe = 0.0
@@ -108,11 +111,17 @@ def evaluate(model: torch.nn.Module, loader: DataLoader, device: torch.device,
     gate_sums: Dict[str, float] = {}
     motion_rows: list[dict] = []
     coarse_grid_hw = None
+    if stress_translation is not None and moving_source != "ir":
+        raise ValueError("stress translation requires moving_source=ir")
     model.eval()
     for batch in loader:
         ir = registration_moving_image(batch, moving_source).to(device)
         vi = batch["vi"].to(device)
         target, valid = batch["gt_flow"].to(device), batch["valid_mask"].to(device)
+        gt_h = batch["gt_h"].to(device)
+        if stress_translation is not None:
+            ir, target, valid, gt_h = translate_moving_for_stress(
+                ir, target, valid, gt_h, stress_translation)
         output = model(ir, vi)
         if output.match is not None:
             coarse_grid_hw = tuple(output.match.coarse_flow.shape[-2:])
@@ -128,7 +137,7 @@ def evaluate(model: torch.nn.Module, loader: DataLoader, device: torch.device,
         total_baseline += float(baseline) * count
         total_valid += count
         corner_epe, cycle_epe = affine_corner_errors(
-            output.affine_yx, batch["gt_h"].to(device), predicted.shape[-2:],
+            output.affine_yx, gt_h, predicted.shape[-2:],
             output.confidence_1_8.shape[-2:])
         total_corner_epe += float(corner_epe.sum())
         total_cycle_epe += float(cycle_epe.sum())
@@ -242,6 +251,8 @@ def evaluate(model: torch.nn.Module, loader: DataLoader, device: torch.device,
     report.update({name: value / max(total_valid, 1.0) for name, value in hit_sums.items()})
     if diagnose_motion:
         report.update(summarize_motion_frames(motion_rows))
+    if stress_translation is not None:
+        report["stress_translation_dy_dx"] = list(stress_translation)
     return report
 
 
@@ -262,6 +273,9 @@ def main() -> None:
                         help="evaluate top-confidence local corrections without changing the checkpoint")
     parser.add_argument("--diagnose-motion", action="store_true",
                         help="report per-frame and per-pixel GT displacement bins plus coarse-match spatial distribution")
+    parser.add_argument("--stress-translation", type=float, nargs=2,
+                        metavar=("DY", "DX"), default=None,
+                        help="add known [dy,dx] displacement to IR GT by translating only the moving raster")
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--moving-source", choices=("ir", "visible_gt"), default="ir",
                         help="evaluate infrared (default) or aligned visible grayscale")
@@ -280,6 +294,10 @@ def main() -> None:
         raise ValueError("--diagnose-motion requires --batch-size 1")
     if args.diagnose_motion and args.output is None:
         raise ValueError("--diagnose-motion requires --output to save per-frame records")
+    if args.stress_translation is not None and args.moving_source != "ir":
+        raise ValueError("--stress-translation requires --moving-source ir")
+    if args.stress_translation is not None and args.check_gt:
+        raise ValueError("--stress-translation cannot be combined with --check-gt")
     device = torch.device(args.device if args.device != "cuda" or torch.cuda.is_available() else "cpu")
     dataset = VTMOTSingleFrameDataset(args.data_root, split=args.split, split_file=args.split_file,
                                       frame_stride=args.frame_stride,
@@ -313,6 +331,8 @@ def main() -> None:
                           diagnose_local_mind=args.diagnose_local_mind,
                           diagnose_confidence_gate=args.diagnose_confidence_gate,
                           diagnose_motion=args.diagnose_motion,
+                          stress_translation=(tuple(args.stress_translation)
+                                              if args.stress_translation is not None else None),
                           moving_source=args.moving_source)
         report["moving_source"] = args.moving_source
         if args.overlay:
