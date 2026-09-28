@@ -216,6 +216,27 @@ def evaluate(model: torch.nn.Module, loader: DataLoader, device: torch.device,
                 diagnostic_sums["truthcentre_" + name] = (
                     diagnostic_sums.get("truthcentre_" + name, 0.0)
                     + value * float(predicted.shape[0]))
+        if diagnose_local_centre and output.local_match is None \
+                and output.refinement is not None:
+            # The same idea for the iterative loop: start it from the truth and
+            # the per-round numbers lose the coarse-field error, so what remains
+            # is the loop's own ability to walk to the correspondence.
+            if not getattr(model, "supports_local_centre", False):
+                raise ValueError(
+                    "--diagnose-local-centre requires a 1/4 stage that accepts an "
+                    "init_flow override")
+            with torch.no_grad():
+                truth_centred = model(ir, vi, init_flow=target)
+                reports = refinement_losses(truth_centred.refinement, target, valid)
+            stride = target.shape[-2] / truth_centred.refinement.flows[0].shape[-2]
+            for index, (epe, match) in enumerate(zip(reports["epe"], reports["match"]),
+                                                 start=1):
+                for name, value in ((f"truthcentre_refine_round{index}_epe_px",
+                                     float(epe) * stride),
+                                    (f"truthcentre_refine_round{index}_match",
+                                     float(match))):
+                    diagnostic_sums[name] = (diagnostic_sums.get(name, 0.0)
+                                             + value * float(predicted.shape[0]))
             if diagnose_confidence_gate:
                 local = output.local_match
                 feature_hw = local.coarse_flow.shape[-2:]
@@ -372,8 +393,14 @@ def main() -> None:
             raise ValueError("--diagnose-local-mind requires an enabled local matcher")
         if args.diagnose_confidence_gate and model.local_matcher is None:
             raise ValueError("--diagnose-confidence-gate requires an enabled local matcher")
-        if args.diagnose_local_centre and model.local_matcher is None:
-            raise ValueError("--diagnose-local-centre requires an enabled local matcher")
+        if args.diagnose_local_centre and not getattr(model, "supports_local_centre",
+                                                      False):
+            # The centre override is what the truth-centred diagnostic needs; a
+            # model may expose it through init_flow without owning a single-shot
+            # local matcher, which is the case for the iterative loop.
+            raise ValueError(
+                "--diagnose-local-centre requires a 1/4 stage that accepts a centre "
+                "override (init_flow / local_centre)")
         if args.diagnose_appearance:
             model.matcher.return_correlation = True
         report = evaluate(model, loader, device,

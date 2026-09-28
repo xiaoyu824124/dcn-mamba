@@ -7,6 +7,7 @@ from omegaconf import OmegaConf
 
 from res.iterative_refinement import (DiscrepancyGuidedRefinement,
                                       refinement_losses)
+from res.evaluate_vtmot import evaluate
 from res.model_factory import build_global_registration
 from res.train_vtmot import freeze_coarse_parameters
 
@@ -165,6 +166,43 @@ class IterativeRefinementTest(unittest.TestCase):
         self.assertTrue(all(value == value                        # not NaN
                             for name, value in report.items()
                             if name.startswith("refine_round")))
+
+
+    def test_second_attempt_overlay_retunes_the_loop(self):
+        """The first run showed round three does not beat round one and that the
+        correspondence NLL is what drifts, so the second overlay cuts a round,
+        halves the step and drops that term's weight."""
+        overlay = OmegaConf.load("res/configs/stage3_structural_iterative_r2.yaml")
+        self.assertEqual(int(overlay.iterative_refinement.iterations), 2)
+        self.assertEqual(float(overlay.iterative_refinement.max_step_cells), 2.0)
+        self.assertEqual(float(overlay.loss.weights.refine_match), 0.1)
+        self.assertEqual(float(overlay.loss.weights.refine), 1.0)
+        config = OmegaConf.merge(
+            OmegaConf.load("res/configs/registration.yaml"),
+            OmegaConf.load("res/configs/stage0_structural_prior.yaml"),
+            OmegaConf.load("res/configs/ab_spatial_prior32.yaml"), overlay)
+        config.structural_prior.base_channels = 8
+        config.structural_prior.out_channels = 16
+        config.structural_prior.blocks_per_scale = 1
+        config.coarse_transformer.num_layers = 1
+        config.global_matcher.max_tokens = 80
+        torch.manual_seed(15)
+        model = build_global_registration(config)
+        self.assertEqual(model.iterative_refinement.iterations, 2)
+        # The evaluator's centre-override guard keys on this attribute, so the
+        # iterative model must advertise it even without a local matcher.
+        self.assertIsNone(model.local_matcher)
+        self.assertTrue(getattr(model, "supports_local_centre", False))
+        batch = {"ir": torch.rand(1, 1, 64, 80), "vi": torch.rand(1, 3, 64, 80),
+                 "gt_flow": torch.zeros(1, 2, 64, 80),
+                 "valid_mask": torch.ones(1, 1, 64, 80),
+                 "gt_h": torch.eye(3).unsqueeze(0)}
+        report = evaluate(model.eval(), [batch], torch.device("cpu"),
+                          diagnose_local_centre=True)
+        # The loop has no single-shot matcher, so the truth-centred diagnostic is
+        # reported per round instead of as local_* keys.
+        self.assertIn("truthcentre_refine_round1_epe_px", report)
+        self.assertIn("truthcentre_refine_round2_epe_px", report)
 
 
 if __name__ == "__main__":

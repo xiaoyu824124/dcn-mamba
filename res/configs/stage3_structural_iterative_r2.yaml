@@ -1,0 +1,70 @@
+# Step 3, second attempt: the loop helps, but more rounds do not, and the term
+# that drifts is the correspondence NLL.
+#
+# Measured on the first full run, 80 frames, with the coarse field bit-identical
+# at 6.922269719725016:
+#
+#            coarse     round 1   round 2   round 3    final
+#   natural  6.9223     6.6547    6.5334    6.5624     6.5519   pck@3px 0.1650 -> 0.1897
+#   +48 px   36.6134    19.2533   19.7077   20.0758    34.4253
+#
+# So it beats the frozen coarse field in both settings, but round three does not
+# beat round one, and the per-round correspondence NLL falls hard (11.08 -> 4.01
+# natural, 21.83 -> 7.20 stress) while the error does not follow.  That term's
+# gradient is p - w against a sigma=0.75 soft target, so it pushes the candidate
+# distribution toward a broader calibration rather than toward a sharper peak; at
+# weight 1.0 it steers the later rounds.  Note also that refine_round*_epe_px is
+# averaged over covered queries only, so on the stress set it is not comparable
+# with coarse_epe_px, which covers every valid pixel.
+#
+# Merge on top of the same stack as before:
+#   --config res/configs/registration.yaml
+#   --overlay res/configs/stage0_structural_prior.yaml
+#   --overlay res/configs/ab_spatial_prior32.yaml
+#   --overlay res/configs/stage3_structural_iterative_r2.yaml
+local_matcher:
+  enabled: false
+
+fine_interaction:
+  enabled: true
+  gain_init: 1.0
+
+fine_cross_attention:
+  enabled: true
+  gain_init: 1.0
+  window_size: 5
+  hidden_channels: 16
+
+iterative_refinement:
+  enabled: true
+  radius: 8
+  # Two rounds: round two was the best on the natural set and round one on the
+  # stress set, so a third only spends compute walking back.
+  iterations: 2
+  evidence_channels: 16
+  hidden_channels: 32
+  candidate_chunk: 9
+  temperature: 0.07
+  # Halved: each round is a smaller step, so a wrong early estimate is easier to
+  # walk back and the later rounds have less room to overshoot.
+  max_step_cells: 2.0
+
+loss:
+  weights:
+    local: 0.0
+    refine: 1.0
+    # Down from 1.0.  The candidate distribution still gets supervised and can
+    # still teach the features, but no longer enough to steer the loop away from
+    # localisation.
+    refine_match: 0.1
+    refine_confidence: 0.5
+    refine_smooth: 0.05
+
+vtmot_data:
+  eval_frame_stride: 10
+
+vtmot_train:
+  freeze_coarse: true
+  # relative EPE is meaningful again because the loop changes the final field.
+  selection_metric: relative_epe
+  lr: 3.0e-4
