@@ -205,6 +205,9 @@ def evaluate(model: torch.nn.Module, loader: DataLoader, device: torch.device,
     if getattr(model, "coarse_decoder", None) is not None:
         report["global_epe_px"] = total_global_epe / max(total_valid, 1.0)
         report["architecture"] = "glu_crft"
+    if getattr(model, "fusion", None) is not None:
+        report["architecture"] = "spatial_frequency"
+        report["representation"] = model.fusion.mode
     report["relative_epe"] = report["epe_px"] / max(report["zero_flow_epe_px"], 1e-8)
     report["affine_corner_epe_px"] = total_corner_epe / max(total_samples, 1.0)
     report["affine_gt_inverse_cycle_px"] = total_cycle_epe / max(total_samples, 1.0)

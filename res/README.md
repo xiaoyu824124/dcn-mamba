@@ -717,3 +717,58 @@ python -B -m res.evaluate_vtmot --device cuda --split eval --frame-stride 10 --c
 `res/configs/stage2_glu_crft_fine.yaml`，用第 1 阶段 `best.pt` 做 `--init`
 训练 1/4 细化。正式训练可把 `--run pilot` 改成 `--run full` 并使用新的目录；
 300 步 pilot 只作结构筛选，不能据此宣称模型已充分收敛。
+
+## 空间 + 局部频域的 1/8 粗匹配消融
+
+新 `spatial_frequency` 实验在 1/8 特征格上比较四种输入：`spatial`、
+`amplitude`、`phase`、`fused`。频域分支先把标准化灰度图降到 1/8，
+在每个位置的 5×5 局部窗口计算 Hann 加窗 FFT，再把 `log(1+A)` 与
+`sin(phase), cos(phase)` 分别送入**共享**可学习投影。这里使用局部频谱，
+因为整图 FFT 的一个频点不能直接对应图像中的某个位置。融合组在 1/8
+结合空间、幅度、相位特征；四组之后均用相同的 SA–CA、4800 候选
+全局相关与 6-DoF 仿射粗场。当前实验不启用局部修正和 DCN，
+MIND 不作匹配输入，结构损失权重设为零以隔离输入表征的效果。
+频域是否有帮助必须由下面的 VTMOT 结果决定，这不是已有论文方法的复现。
+
+仓库根目录的 Windows `cmd` 依次运行。先做融合组完整视场一步试跑：
+
+```bat
+python -B -m unittest discover -s res/tests -t .
+python -B -m res.train_vtmot --device cuda --steps 1 --num-workers 0 --overlay res/configs/stage0_spatial_frequency.yaml --overlay res/configs/ab_frequency_fused.yaml --output-dir res_runs/sf_fused_smoke
+```
+
+四组使用相同随机种子、训练集、视场、步数和损失；共同的空间 Encoder、
+SA–CA 初始权重也相同。**从头训练**，不要把旧同模态空间权重只给其中一组：
+
+```bat
+python -B -m res.train_vtmot --device cuda --run full --num-workers 0 --overlay res/configs/stage0_spatial_frequency.yaml --overlay res/configs/ab_frequency_spatial.yaml --output-dir res_runs/sf_spatial_full
+python -B -m res.train_vtmot --device cuda --run full --num-workers 0 --overlay res/configs/stage0_spatial_frequency.yaml --overlay res/configs/ab_frequency_amplitude.yaml --output-dir res_runs/sf_amplitude_full
+python -B -m res.train_vtmot --device cuda --run full --num-workers 0 --overlay res/configs/stage0_spatial_frequency.yaml --overlay res/configs/ab_frequency_phase.yaml --output-dir res_runs/sf_phase_full
+python -B -m res.train_vtmot --device cuda --run full --num-workers 0 --overlay res/configs/stage0_spatial_frequency.yaml --overlay res/configs/ab_frequency_fused.yaml --output-dir res_runs/sf_fused_full
+```
+
+对每组的 `best.pt` 使用**同一批 80 帧**评测。以下以融合组为例；
+将 `fused` 替换为另外三个名称即可。`best.pt` 由 16 帧开发集选出，
+因此也要比较 `last.pt`，避免少量验证帧的排序误导判断：
+
+```bat
+python -B -m res.evaluate_vtmot --device cuda --split eval --frame-stride 10 --checkpoint res_runs/sf_fused_full/best.pt --diagnose-appearance --output res_runs/sf_fused_full/eval_best_stride10.json
+python -B -m res.evaluate_vtmot --device cuda --split eval --frame-stride 10 --checkpoint res_runs/sf_fused_full/last.pt --diagnose-appearance --output res_runs/sf_fused_full/eval_last_stride10.json
+python -B -m res.visualize_spatial_frequency --device cuda --split eval --frame-stride 10 --max-samples 2 --checkpoint res_runs/sf_fused_full/best.pt --output-dir res_runs/sf_fused_full/visuals
+```
+
+图片包括 VI→IR 的稀疏匹配连线（绿色误差 <5 px、黄色 <15 px、
+红色 ≥15 px）、粗流、绝对刻度的匹配置信度与预对齐 IR。重点比较
+`match_epe_argmax_px`、`match_frac_keys_beating_gt`、`coarse_epe_px`、
+`pck_3px`，以及相同样本的图像；同时参考原方案 80 帧粗场 EPE 6.84 px
+和零场 8.98 px。只有融合组在真实 IR–VI 上持续优于空间组、粗场也明显
+改善，才继续接 1/4 局部相关与 DCN。`test` 划分留待方案固定后评估。
+选出粗匹配表征后，可另开一组实验叠加
+`res/configs/ab_mind_structural_loss.yaml`，只将 MIND 作为 warp 后的
+低权重结构损失（0.1），与不加该损失的同配置对照；它不会进入匹配特征。
+
+这个实验检验多线索表征是否能改善对应关系。ANCM-Net 的
+[IEEE 论文](https://ieeexplore.ieee.org/document/10491294/) 支持使用上下文多特征
+缓解可见光与红外的非线性差异，但它采用的不是这里的局部 FFT。
+[SFRF 预印本](https://arxiv.org/abs/2605.13049) 在 IR–VI 配准与融合中使用频域
+监督，其频域信号也不能直接当作本实验匹配描述子的效果证据。

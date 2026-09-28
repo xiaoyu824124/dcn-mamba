@@ -1,4 +1,4 @@
-"""Construct the MIND -> global coarse -> local fine registration model."""
+"""Construct the configured single-frame registration experiment."""
 
 from __future__ import annotations
 
@@ -13,11 +13,38 @@ from .global_matcher import GlobalMatcher
 from .local_matcher import LocalMatcher
 from .mind import MINDDescriptor
 from .registration_net import MINDGlobalRegistration
-from .registration_net import GLUCRFTRegistration
+from .registration_net import GLUCRFTRegistration, SpatialFrequencyRegistration
 from .glu_crft_coarse import GlobalCostDecoder
+from .spatial_frequency import SpatialFrequencyFusion
 
 
-def build_global_registration(config) -> MINDGlobalRegistration | GLUCRFTRegistration:
+def build_global_registration(config) -> (MINDGlobalRegistration |
+                                          GLUCRFTRegistration |
+                                          SpatialFrequencyRegistration):
+    if str(config.get("architecture", "mind_global")) == "spatial_frequency":
+        settings = OmegaConf.to_container(config.encoder, resolve=True)
+        settings["in_channels"] = 1
+        settings["extra_coarse_scale"] = False
+        encoder = SharedPyramidEncoder(**settings)
+        matcher_settings = OmegaConf.to_container(config.global_matcher, resolve=True)
+        matcher_settings["affine_projection"] = True
+        matcher = GlobalMatcher(**matcher_settings)
+        transformer_config = config.get("coarse_transformer")
+        transformer = None
+        if transformer_config is not None and bool(transformer_config.get("enabled", False)):
+            transformer = CoarseSACATransformer(
+                encoder.out_channels,
+                **{key: value for key, value in
+                   OmegaConf.to_container(transformer_config, resolve=True).items()
+                   if key != "enabled"})
+        # Construct common spatial/SA-CA weights before mode-specific branches
+        # so all four fixed-seed ablations start from identical common weights.
+        fusion = SpatialFrequencyFusion(
+            encoder.out_channels,
+            **OmegaConf.to_container(config.spatial_frequency, resolve=True))
+        return SpatialFrequencyRegistration(
+            encoder=encoder, fusion=fusion, matcher=matcher,
+            coarse_transformer=transformer)
     if str(config.get("architecture", "mind_global")) == "glu_crft":
         settings = OmegaConf.to_container(config.encoder, resolve=True)
         settings["in_channels"] = 1

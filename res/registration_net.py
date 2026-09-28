@@ -17,6 +17,7 @@ from .global_matcher import GlobalMatchOutput, GlobalMatcher
 from .local_matcher import LocalMatchOutput, LocalMatcher
 from .mind import MINDDescriptor, paired_mind, rgb_to_gray
 from .glu_crft_coarse import GlobalCostDecoder, fit_affine_flow, standardize_image
+from .spatial_frequency import SpatialFrequencyFusion
 from .warp import upsample_feature_flow, warp
 
 
@@ -261,3 +262,48 @@ class GLUCRFTRegistration(nn.Module):
             final_aligned_ir=final_aligned_ir, final_flow=final_flow,
             local_match=local_match, global_flow=global_flow,
             coarse_local_match=coarse_local_match)
+
+
+class SpatialFrequencyRegistration(nn.Module):
+    """Isolated 1/8 correspondence experiment with four input feature modes.
+
+    This stage uses the existing global matcher and 6-DoF projection, so the
+    only experimental variable is what reaches the matcher.  Fine refinement
+    and DCN deliberately remain outside this coarse-only experiment.
+    """
+
+    def __init__(self, *, encoder: SharedPyramidEncoder,
+                 fusion: SpatialFrequencyFusion, matcher: GlobalMatcher,
+                 coarse_transformer: CoarseSACATransformer | None = None) -> None:
+        super().__init__()
+        if encoder.in_channels != 1 or encoder.extra_coarse_scale:
+            raise ValueError("spatial-frequency registration needs a 1-channel 1/8 encoder")
+        if not matcher.affine_projection:
+            raise ValueError("spatial-frequency matcher must produce a 6-DoF coarse field")
+        self.encoder = encoder
+        self.fusion = fusion
+        self.matcher = matcher
+        self.coarse_transformer = coarse_transformer
+        self.local_matcher = None
+        self.ir_feature_adapter = None
+        self.mind = MINDDescriptor()
+
+    def forward(self, ir: torch.Tensor, vi: torch.Tensor) -> CoarseRegistrationOutput:
+        MINDGlobalRegistration._validate_inputs(ir, vi)
+        gray_ir = standardize_image(ir)
+        gray_vi = standardize_image(rgb_to_gray(vi))
+        features_ir, features_vi = self.encoder.encode_pair(gray_ir, gray_vi)
+        match_ir = self.fusion(gray_ir, features_ir["1/8"])
+        match_vi = self.fusion(gray_vi, features_vi["1/8"])
+        if self.coarse_transformer is not None:
+            match_ir, match_vi = self.coarse_transformer(match_ir, match_vi)
+        match = self.matcher(match_ir, match_vi)
+        height, width = ir.shape[-2:]
+        grid_h, grid_w = match.coarse_flow.shape[-2:]
+        coarse_flow = upsample_feature_flow(
+            match.coarse_flow, (height, width),
+            (height / grid_h, width / grid_w))
+        return CoarseRegistrationOutput(
+            coarse_aligned_ir=warp(ir, coarse_flow), coarse_flow=coarse_flow,
+            confidence_1_8=match.confidence, affine_yx=match.affine_yx,
+            match=match, global_flow=coarse_flow)

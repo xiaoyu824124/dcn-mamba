@@ -1,0 +1,4 @@
+# Optional follow-up after the representation ablation, never a matcher input.
+loss:
+  weights:
+    mind: 0.1
