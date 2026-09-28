@@ -190,7 +190,18 @@ def local_matching_diagnostics(match: LocalMatchOutput, gt_flow: torch.Tensor,
         "local_top10pct_soft_epe_px": top_soft / max(top_count, 1),
         "local_top10pct_argmax_epe_px": top_argmax / max(top_count, 1),
         "local_top10pct_soft_improved_fraction": top_improved / max(top_count, 1),
+        # ``local_gt_residual_px`` is kept for older reports, but the quantity is
+        # the *coarse* residual: the error the local stage has to remove, and the
+        # baseline that local_argmax_epe_px has to beat.
         "local_gt_residual_px": float((coarse_error * mask).sum() / valid_count),
+        "local_coarse_residual_px": float((coarse_error * mask).sum() / valid_count),
+        # Candidate availability shrinks as the coarse field degrades, which drags
+        # the masked means above even when matching itself is unchanged.  The
+        # covered variants use only queries that have at least one valid candidate.
+        "local_argmax_epe_covered_px": float(
+            (error * oracle_mask).sum() / oracle_mask.sum().clamp_min(1)),
+        "local_soft_epe_covered_px": float(
+            (soft_error * oracle_mask).sum() / oracle_mask.sum().clamp_min(1)),
         "local_pred_residual_px": float((torch.linalg.vector_norm(
             match.residual_flow.float() * stride, dim=1) * mask).sum() / valid_count),
         "local_refinement_improved_fraction": float(

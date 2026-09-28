@@ -17,7 +17,7 @@ from .encoder import ConvNormAct
 
 def local_spectrum(image: torch.Tensor, window_size: int = 5,
                    eps: float = 1e-6) -> tuple[torch.Tensor, torch.Tensor]:
-    """Return log amplitude and (sin phase, cos phase) at each 1/8 location.
+    """Return log amplitude and doubled phase (sin 2phi, cos 2phi) per 1/8 location.
 
     The DC bin is zeroed after patch mean subtraction.  A Hann window limits
     edge leakage.  FFT is evaluated in float32 because CUDA half precision FFT
@@ -47,6 +47,12 @@ def local_spectrum(image: torch.Tensor, window_size: int = 5,
     magnitude = spectrum.abs()
     amplitude = torch.log1p(magnitude)
     unit = spectrum / magnitude.clamp_min(eps)
+    # Subtracting the patch mean is not enough to clear the DC bin: the Hann
+    # window is applied afterwards, so the windowed patch mean is non-zero and
+    # DC keeps carrying the local brightness -- a purely photometric quantity
+    # that differs between sensors.  Clear it in both outputs explicitly.
+    amplitude[..., 0, 0] = 0.0
+    unit[..., 0, 0] = 0.0
     bins = window_size * (window_size // 2 + 1)
     batch = image.shape[0]
 
@@ -56,7 +62,17 @@ def local_spectrum(image: torch.Tensor, window_size: int = 5,
 
     # Phase of a zero-energy bin is undefined.  Dividing by clamped magnitude
     # maps it to zero, instead of claiming cos(phase)=1 at such locations.
-    return as_map(amplitude), torch.cat((as_map(unit.imag), as_map(unit.real)), dim=1)
+    #
+    # The phase is stored *doubled* as (sin 2phi, cos 2phi).  A contrast reversal
+    # -- an IR/VIS polarity flip, which is the common case cross-modally -- sends
+    # phi -> phi + pi and therefore negates plain (sin phi, cos phi), handing the
+    # shared encoder inputs of inconsistent sign.  Doubling is invariant to that
+    # shift and is the standard remedy (RIFT).  Raw grayscale measured a *negative*
+    # similarity at the true correspondence on VTMOT, so the flip is real here.
+    cos_phi, sin_phi = unit.real, unit.imag
+    phase = torch.cat((as_map(2.0 * sin_phi * cos_phi),
+                       as_map(cos_phi.square() - sin_phi.square())), dim=1)
+    return as_map(amplitude), phase
 
 
 class SpatialFrequencyFusion(nn.Module):

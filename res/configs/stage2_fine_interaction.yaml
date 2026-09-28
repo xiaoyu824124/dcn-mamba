@@ -1,4 +1,22 @@
 # 1/4 ablation: shared IR/VI projection and 1/8-to-1/4 context fusion.
-# The original local matcher and affine global matcher are unchanged.
+# Self-contained: this overlay means "stage1 + fine interaction" and must run on
+# top of registration.yaml *or* on top of stage1_saca.yaml.  stage1 turns the
+# local matcher off, so the local stage and its loss are re-enabled here, and the
+# SA-CA settings are repeated so the two overlays cannot disagree.  Without this,
+# stage1 + stage2 raised "fine_interaction requires local_matcher.enabled=true",
+# and stage2 alone silently dropped the SA-CA module it is supposed to build on.
+coarse_transformer:
+  enabled: true
+  num_layers: 2
+  num_heads: 4
+  ffn_ratio: 2
+
+local_matcher:
+  enabled: true
+
 fine_interaction:
   enabled: true
+
+loss:
+  weights:
+    local: 1.0

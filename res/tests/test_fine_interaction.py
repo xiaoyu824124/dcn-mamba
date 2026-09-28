@@ -41,9 +41,13 @@ class FineScaleInteractionTest(unittest.TestCase):
         self.assertTrue(torch.isfinite(output.final_flow).all())
 
     def test_adapter_requires_local_matcher(self):
+        # Ask for the adapter while the local matcher is off.  Build the
+        # inconsistent combination here instead of relying on a config file to
+        # contain it: stage2_fine_interaction.yaml now enables the local matcher
+        # itself, so it is a valid overlay rather than the thing under test.
         config = OmegaConf.merge(OmegaConf.load("res/configs/registration.yaml"),
-                                 OmegaConf.load("res/configs/stage0_coarse.yaml"),
-                                 OmegaConf.load("res/configs/stage2_fine_interaction.yaml"))
+                                 OmegaConf.load("res/configs/stage0_coarse.yaml"))
+        config.fine_interaction = OmegaConf.create({"enabled": True})
         with self.assertRaisesRegex(ValueError, "local_matcher"):
             build_global_registration(config)
 

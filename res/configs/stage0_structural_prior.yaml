@@ -35,7 +35,11 @@ loss:
     affine: 10.0
     mind: 0.0
     edge: 0.25
-    smooth: 0.05
+    # The coarse flow is an exact 6-DoF projection, whose finite differences are
+    # its linear part, so a |grad flow| penalty biases the fitted scale and shear
+    # toward zero -- the hardest free parameters of the misalignment.  With
+    # affine_projection the WLS ridge already regularises, so leave this at zero.
+    smooth: 0.0
     local: 0.0
     coarse_local: 0.0
     global_flow: 0.0

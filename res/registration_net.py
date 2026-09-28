@@ -107,13 +107,24 @@ class MINDGlobalRegistration(nn.Module):
         coarse_height, coarse_width = coarse_ir.shape[-2:]
         if (self.coarse_match_max_tokens
                 and coarse_height * coarse_width > self.coarse_match_max_tokens):
-            scale = math.sqrt(self.coarse_match_max_tokens / (coarse_height * coarse_width))
-            match_hw = (max(1, int(coarse_height * scale)),
-                        max(1, int(coarse_width * scale)))
+            # Reduce the candidate count with an *integer* stride.  Adaptive
+            # pooling to an arbitrary HxW splits e.g. 60 rows into alternating
+            # 5/4 bins, displacing cell centres by up to half a cell (four image
+            # pixels at 1/8) from the uniform stride that upsample_feature_flow
+            # assumes -- a periodic bias comparable to the misalignment itself.
+            # An integer factor keeps both the grid and the stride exact.
+            factor = max(1, int(math.sqrt(coarse_height * coarse_width
+                                          / self.coarse_match_max_tokens)))
+            while ((coarse_height // factor) * (coarse_width // factor)
+                   > self.coarse_match_max_tokens):
+                factor += 1
+            match_hw = (max(1, coarse_height // factor),
+                        max(1, coarse_width // factor))
             if min(match_hw) < 3 and self.matcher.affine_projection:
                 raise ValueError("coarse_match_max_tokens leaves fewer than 3 cells per axis for WLS")
-            match_ir = F.adaptive_avg_pool2d(coarse_ir, match_hw)
-            match_vi = F.adaptive_avg_pool2d(coarse_vi, match_hw)
+            if factor > 1:
+                match_ir = F.avg_pool2d(coarse_ir, factor, factor)
+                match_vi = F.avg_pool2d(coarse_vi, factor, factor)
         if self.coarse_transformer is not None:
             match_ir, match_vi = self.coarse_transformer(match_ir, match_vi)
         # The original 1/4 module expects full-size 1/8 context. In the

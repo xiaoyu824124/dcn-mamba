@@ -199,18 +199,28 @@ class GlobalMatcher(nn.Module):
             # up under AMP after a few hundred real VTMOT updates.
             weights = confidence.detach().flatten(1).clamp_min(1e-8).pow(
                 self.affine_confidence_power)
+            interior = None
             if self.affine_border_margin:
                 margin = self.affine_border_margin
                 interior = ((coordinates[:, 0] >= margin)
                             & (coordinates[:, 0] < height - margin)
                             & (coordinates[:, 1] >= margin)
-                            & (coordinates[:, 1] < width - margin))
-                weights = weights * interior.to(weights.dtype).unsqueeze(0)
-            # The interior ablation can remove the strongest border queries;
-            # keep the nonzero weights at the same mean scale as the baseline
-            # so the fixed ridge does not become a second changing variable.
+                            & (coordinates[:, 1] < width - margin)).to(weights.dtype)
+                weights = weights * interior.unsqueeze(0)
+            # The interior ablation removes the border queries, so scale the
+            # weights to mean one *over the queries that are actually fitted*.
+            # Dividing by the all-query mean instead inflates the interior
+            # weights by N/N_interior, which changes the fixed ridge's relative
+            # strength -- a second variable inside the border-margin ablation.
+            if interior is None:
+                denominator = weights.mean(dim=1, keepdim=True)
+            else:
+                # ``interior`` has no batch dimension: the query coordinates are
+                # shared by every image, so the fitted-query count is a scalar.
+                denominator = (weights.sum(dim=1, keepdim=True)
+                               / interior.sum().clamp_min(1.0))
             floor = 1e-20 if self.affine_border_margin else 1e-8
-            weights = weights / weights.mean(dim=1, keepdim=True).clamp_min(floor)
+            weights = weights / denominator.clamp_min(floor)
             # Solve in a [-1,1] coordinate system. Pixel coordinates make the
             # affine normal matrix unnecessarily ill-conditioned on large grids.
             center = coordinates.new_tensor(((height - 1) / 2, (width - 1) / 2))

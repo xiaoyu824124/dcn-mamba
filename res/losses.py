@@ -111,13 +111,18 @@ class RegistrationLoss(nn.Module):
 
     def edge_aware_smoothness(self, flow: torch.Tensor, visible: torch.Tensor) -> torch.Tensor:
         """First-order flow regularity, relaxed across visible-image boundaries."""
+        # ``gray`` is in [0,1], so |grad I| <= 1 and exp(-|grad I|) only falls to
+        # 0.37 even on the sharpest edge -- the "edge aware" relaxation was
+        # effectively inert.  A gain of ten gives it a usable dynamic range while
+        # keeping the term bounded.
+        gain = 10.0
         gray = rgb_to_gray(visible)
         edge_x = (gray[..., 1:] - gray[..., :-1]).abs()
         edge_y = (gray[..., 1:, :] - gray[..., :-1, :]).abs()
         flow_x = (flow[..., 1:] - flow[..., :-1]).abs()
         flow_y = (flow[..., 1:, :] - flow[..., :-1, :]).abs()
-        return ((flow_x * torch.exp(-edge_x)).mean()
-                + (flow_y * torch.exp(-edge_y)).mean())
+        return ((flow_x * torch.exp(-gain * edge_x)).mean()
+                + (flow_y * torch.exp(-gain * edge_y)).mean())
 
     def forward(self, *, aligned_ir: torch.Tensor, visible: torch.Tensor,
                 coarse_flow: torch.Tensor, final_flow: Optional[torch.Tensor] = None,

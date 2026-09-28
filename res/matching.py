@@ -221,6 +221,14 @@ def windowed_diagnostics(probability: torch.Tensor, feature_hw: Tuple[int, int],
 
     indices, weights = bilinear_target_cells(target, feature_hw)
     gt_probability = (dense.gather(2, indices) * weights).sum(dim=-1)
+    # The window cells are integer lattice points, so ranking the bilinear ground
+    # truth against them is not a like-for-like comparison: near a cell boundary
+    # the blend sits below its own largest tap and ``beating`` records a spurious
+    # win, which depresses window{r}_argmax_correct.  Keep a same-basis version.
+    nearest_y = target[..., 0].round().long().clamp(0, height - 1)
+    nearest_x = target[..., 1].round().long().clamp(0, width - 1)
+    nearest_index = (nearest_y * width + nearest_x).unsqueeze(-1)
+    gt_probability_nearest = dense.gather(2, nearest_index).squeeze(-1)
 
     delta = (target - predicted).abs()
     covered = (delta[..., 0] <= radius + 0.5) & (delta[..., 1] <= radius + 0.5)
@@ -238,12 +246,20 @@ def windowed_diagnostics(probability: torch.Tensor, feature_hw: Tuple[int, int],
         return float((value * mask).sum() / denominator)
 
     beating = (window_probability > gt_probability.unsqueeze(-1)).sum(dim=-1)
+    beating_nearest = (window_probability
+                       > gt_probability_nearest.unsqueeze(-1)).sum(dim=-1)
     report = {
         # Coverage is over every valid query.  The other window statistics are
         # conditional on the truth being inside the window.
         f"window{radius}_coverage": float(mask.sum() / valid_count),
         f"window{radius}_frac_cells_beating_gt": masked(beating.to(dense.dtype) / channels),
         f"window{radius}_argmax_correct": masked((beating == 0).to(dense.dtype)),
+        # Same-basis variant: the ground truth is the nearest lattice cell, i.e.
+        # comparable with the window cells it is ranked against.
+        f"window{radius}_frac_cells_beating_gt_nearest": masked(
+            beating_nearest.to(dense.dtype) / channels),
+        f"window{radius}_argmax_correct_nearest": masked(
+            (beating_nearest == 0).to(dense.dtype)),
         "coarse_error_median_px": float(
             torch.quantile(error_px[query_mask].flatten().float(), 0.5)) if bool(query_mask.any()) else float("nan"),
         "coarse_error_p90_px": float(

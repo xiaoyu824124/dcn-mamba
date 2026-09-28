@@ -2,9 +2,15 @@
 # Compare natural eval and held-out +/-48 px stress eval before adding fine stages.
 # Image-edge loss has no validity mask, so disable it when shifting creates
 # synthetic borders; flow, match and affine supervision remain active.
+# ``mind`` is disabled for the same reason: reflection fill manufactures fake
+# symmetric structure, and the MIND descriptor encodes exactly that kind of local
+# self-similarity.  The structural-prior stage already sets it to zero, but the
+# overlay must not depend on that coincidence -- it also has to be safe on
+# registration.yaml, where mind is 0.5.
 loss:
   weights:
     edge: 0.0
+    mind: 0.0
 
 vtmot_train:
   lr: 5.0e-5
