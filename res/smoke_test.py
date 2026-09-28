@@ -31,7 +31,7 @@ import torch
 from omegaconf import OmegaConf
 from torch.utils.data import default_collate
 
-from .checkpoint import load_registration_state
+from .checkpoint import split_state_dict
 from .evaluate_vtmot import evaluate
 from .losses import RegistrationLoss
 from .model_factory import build_global_registration
@@ -85,9 +85,14 @@ def main() -> int:
     model = build_global_registration(config).to(device)
     if args.checkpoint is not None:
         checkpoint = torch.load(args.checkpoint, map_location=device, weights_only=True)
-        loaded = load_registration_state(model, checkpoint["model"])
-        print(f"checkpoint kept={loaded['kept']} newly built={len(loaded['untrained'])}",
-              flush=True)
+        # The same lenient warm start as the trainer's --init: keep every tensor
+        # whose name and shape still match and report the rest.  The strict
+        # evaluation loader cannot be used here, because a checkpoint written
+        # before the loop existed still carries the single-shot matcher's head.
+        keep, dropped = split_state_dict(checkpoint["model"], model)
+        missing = model.load_state_dict(keep, strict=False).missing_keys
+        print(f"warm start: kept={len(keep)} dropped={len(dropped)} "
+              f"fresh={len(missing)}", flush=True)
 
     if args.real_data:
         dataset = VTMOTSingleFrameDataset(
