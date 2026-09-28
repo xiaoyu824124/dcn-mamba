@@ -33,26 +33,36 @@ class CheckpointProvenanceTest(unittest.TestCase):
         self.assertNotIn("iterative_refinement.update.weight", keys)
 
     def test_find_init_prefers_a_parent_over_a_later_run(self):
+        import json
         import tempfile
         from pathlib import Path
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            for name, model, steps, loop in (
-                    ("parent", _model(), 3000, False),
-                    ("child", _model(loop_value=1.0), 3000, True),
-                    ("unrelated", _model(encoder_value=5.0), 3000, False)):
+            for name, model, steps, loop, val in (
+                    ("parent", _model(), 3000, False, 6.111),
+                    ("child", _model(loop_value=1.0), 3000, True, 5.9),
+                    ("unrelated", _model(encoder_value=5.0), 3000, False, 7.0)):
                 (root / name).mkdir()
                 torch.save({"step": steps, "model": model,
                             "config": {"iterative_refinement": {"enabled": loop}}},
                            root / name / "last.pt")
+                # The child's step-0 validation is its parent's final one: the
+                # same weights scored on the same frames.
+                first = 6.111 if loop else val
+                (root / name / "metrics.jsonl").write_text(
+                    json.dumps({"step": 0, "val_epe_px": first}) + "\n"
+                    + json.dumps({"step": steps, "val_epe_px": val}) + "\n",
+                    encoding="utf-8")
             target, matches = find_init(root, root / "child" / "last.pt")
             self.assertEqual(target["step"], 3000)
+            self.assertAlmostEqual(target["warm_start_epe"], 6.111, places=6)
             digests = {row["path"] for row in matches}
             self.assertIn(str(root / "parent" / "last.pt"), digests)
             self.assertNotIn(str(root / "unrelated" / "last.pt"), digests)
-            parents = [row for row in matches if not row["loop"]]
-            self.assertEqual([row["path"] for row in parents],
-                             [str(root / "parent" / "last.pt")])
+            # The digest alone matches a whole chain, so the metrics decide:
+            # exactly one candidate reproduces the step-0 validation.
+            flagged = [row["path"] for row in matches if row["is_warm_start"]]
+            self.assertEqual(flagged, [str(root / "parent" / "last.pt")])
 
     def test_describe_reports_recorded_provenance(self):
         import tempfile

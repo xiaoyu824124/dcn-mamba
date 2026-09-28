@@ -3,9 +3,12 @@
 A checkpoint whose coarse stage was frozen shares those tensors bit for bit
 with whatever ``--init`` it was trained from, because freezing means they were
 never updated.  Hashing exactly the submodules that ``freeze_coarse`` holds
-fixed therefore identifies the parent from the artefacts alone, without any
-recorded metadata.  Checkpoints written since provenance recording exists also
-carry their own command line, which is reported when present.
+fixed therefore identifies the *coarse lineage* from the artefacts alone --
+note that a whole chain shares it, so this alone does not name the immediate
+parent.  For that, the trainer's own metrics are used: the step-0 validation of
+a run is the validation of its warm-start weights, so the parent's final
+``val_epe_px`` equals it exactly.  Checkpoints written since provenance
+recording exists also carry their own command line, which is reported too.
 
     python -m res.checkpoint_provenance --root res_runs
     python -m res.checkpoint_provenance --root res_runs --init-of res_runs/structural_iterative_r2/last.pt
@@ -15,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import json
 from pathlib import Path
 
 import torch
@@ -23,6 +27,30 @@ import torch
 TRAINABLE_PREFIXES = ("fine_interaction.", "fine_cross_attention.",
                       "iterative_refinement.", "local_matcher.",
                       "ir_feature_adapter.")
+
+
+def _metrics(path: Path) -> list[dict]:
+    """The per-step records a run wrote next to its checkpoints."""
+    metrics = Path(path).parent / "metrics.jsonl"
+    if not metrics.is_file():
+        return []
+    rows = []
+    for line in metrics.read_text(encoding="utf-8").splitlines():
+        if line.strip():
+            rows.append(json.loads(line))
+    return rows
+
+
+def warm_start_epe(path: Path) -> float | None:
+    """The validation EPE this run recorded for the weights it started from."""
+    rows = _metrics(path)
+    return rows[0].get("val_epe_px") if rows else None
+
+
+def final_epe(path: Path) -> float | None:
+    """The validation EPE of this checkpoint's own last recorded validation."""
+    rows = _metrics(path)
+    return rows[-1].get("val_epe_px") if rows else None
 
 
 def frozen_keys(model: dict) -> list[str]:
@@ -63,13 +91,27 @@ def candidates(root: Path, reference: Path | None = None) -> list[Path]:
 
 
 def find_init(root: Path, reference: Path) -> tuple[dict, list[dict]]:
-    """Every candidate whose frozen stage is identical to the reference's."""
+    """Candidates sharing the reference's frozen stage, the warm start first.
+
+    A whole chain inherits one frozen coarse stage, so the digest narrows the
+    field to that chain.  Within it, the run whose *final* validation equals the
+    reference's *step-0* validation is the immediate parent: those are the same
+    weights scored on the same frames.
+    """
     target = describe(reference)
-    rows = [describe(path) for path in candidates(root, reference)]
+    started_from = warm_start_epe(reference)
+    target["warm_start_epe"] = started_from
+    rows = []
+    for path in candidates(root, reference):
+        row = describe(path)
+        row["final_epe"] = final_epe(path)
+        row["is_warm_start"] = (
+            started_from is not None and row["final_epe"] is not None
+            and abs(row["final_epe"] - started_from) < 1e-6)
+        rows.append(row)
     matches = [row for row in rows if row["digest"] == target["digest"]]
-    # A descendant inherits the same frozen stage, so a match with its loop
-    # enabled is a later run, not the parent.
-    matches.sort(key=lambda row: (row["loop"], row["step"] or 0))
+    matches.sort(key=lambda row: (not row["is_warm_start"], row["loop"],
+                                 row["step"] or 0))
     return target, matches
 
 
@@ -83,17 +125,17 @@ def main() -> None:
         target, matches = find_init(args.root, args.init_of)
         print(f"reference {target['path']} step={target['step']} "
               f"loop={target['loop']} digest={target['digest']}")
-        parents = [row for row in matches if not row["loop"]]
-        descendants = [row for row in matches if row["loop"]]
-        for row in parents:
-            print(f"  parent? {row['path']} step={row['step']} "
-                  f"xattn={row['cross_attention']} recorded_init={row['init']}")
-        if not parents:
-            print("  no parent found: every match has the loop enabled, so the "
-                  "warm start is not among these checkpoints")
-        for row in descendants:
-            print(f"  shares this frozen stage (later run): {row['path']} "
-                  f"step={row['step']}")
+        print(f"  its step-0 validation (the warm-start weights): "
+              f"val_epe_px={target['warm_start_epe']}")
+        if not matches:
+            print("  no checkpoint here shares its frozen coarse stage, so the "
+                  "warm start came from outside --root")
+        for row in matches:
+            mark = "  <- WARM START" if row["is_warm_start"] else ""
+            print(f"  {row['path']} step={row['step']} loop={row['loop']} "
+                  f"xattn={row['cross_attention']} "
+                  f"final_val_epe={row['final_epe']} "
+                  f"recorded_init={row['init']}{mark}")
         return
     for path in candidates(args.root):
         row = describe(path)
