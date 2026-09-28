@@ -186,13 +186,27 @@ def evaluate(model: torch.nn.Module, loader: DataLoader, device: torch.device,
             with torch.no_grad():
                 reports = refinement_losses(output.refinement, target, valid)
             stride = target.shape[-2] / output.refinement.flows[0].shape[-2]
-            for index, (epe, match, target_rate) in enumerate(
+            for index, (epe, match, target_rate, mean_norm, applied_std,
+                        required_norm, alignment) in enumerate(
                     zip(reports["epe"], reports["match"],
-                        reports["confidence_target"]), start=1):
+                        reports["confidence_target"], reports["applied_mean_norm"],
+                        reports["applied_std"], reports["required_mean_norm"],
+                        reports["applied_mean_alignment"]), start=1):
+                # The structure terms are already a per-frame norm, a per-frame
+                # spatial std or a dimensionless alignment, so pooling them over
+                # a batch cancels nothing (a signed per-frame mean would).
                 for name, value in ((f"refine_round{index}_epe_px", float(epe) * stride),
                                     (f"refine_round{index}_match", float(match)),
                                     (f"refine_round{index}_improved_fraction",
-                                     float(target_rate))):
+                                     float(target_rate)),
+                                    (f"refine_round{index}_applied_mean_norm_px",
+                                     float(mean_norm.mean()) * stride),
+                                    (f"refine_round{index}_applied_std_px",
+                                     float(applied_std.mean()) * stride),
+                                    (f"refine_round{index}_required_mean_norm_px",
+                                     float(required_norm.mean()) * stride),
+                                    (f"refine_round{index}_applied_mean_alignment",
+                                     float(alignment.mean()))):
                     diagnostic_sums[name] = (diagnostic_sums.get(name, 0.0)
                                              + value * float(predicted.shape[0]))
         if output.local_match is not None:
@@ -229,12 +243,22 @@ def evaluate(model: torch.nn.Module, loader: DataLoader, device: torch.device,
                 truth_centred = model(ir, vi, init_flow=target)
                 reports = refinement_losses(truth_centred.refinement, target, valid)
             stride = target.shape[-2] / truth_centred.refinement.flows[0].shape[-2]
-            for index, (epe, match) in enumerate(zip(reports["epe"], reports["match"]),
-                                                 start=1):
+            for index, (epe, match, mean_norm, applied_std, required_norm) in enumerate(
+                    zip(reports["epe"], reports["match"],
+                        reports["applied_mean_norm"], reports["applied_std"],
+                        reports["required_mean_norm"]), start=1):
+                # Started from the truth, so ``required`` is ~0 and any applied
+                # mean is pure drift: its norm is the cleanest "bias" number.
                 for name, value in ((f"truthcentre_refine_round{index}_epe_px",
                                      float(epe) * stride),
                                     (f"truthcentre_refine_round{index}_match",
-                                     float(match))):
+                                     float(match)),
+                                    (f"truthcentre_refine_round{index}_applied_mean_norm_px",
+                                     float(mean_norm.mean()) * stride),
+                                    (f"truthcentre_refine_round{index}_applied_std_px",
+                                     float(applied_std.mean()) * stride),
+                                    (f"truthcentre_refine_round{index}_required_mean_norm_px",
+                                     float(required_norm.mean()) * stride)):
                     diagnostic_sums[name] = (diagnostic_sums.get(name, 0.0)
                                              + value * float(predicted.shape[0]))
             if diagnose_confidence_gate:

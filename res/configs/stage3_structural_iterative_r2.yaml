@@ -48,6 +48,12 @@ iterative_refinement:
   # Halved: each round is a smaller step, so a wrong early estimate is easier to
   # walk back and the later rounds have less room to overshoot.
   max_step_cells: 2.0
+  # Left off deliberately.  Removing the raw update's spatial mean closes the
+  # constant-correction loophole, but it also deletes the global-translation
+  # degree of freedom that the frozen coarse field still needs (its error is
+  # 36.6 px on the +48 px set).  With the flag absent, an unchanged config and
+  # unchanged weights reproduce the run recorded above exactly.
+  remove_mean: false
 
 loss:
   weights:

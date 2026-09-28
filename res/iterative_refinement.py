@@ -68,7 +68,8 @@ class DiscrepancyGuidedRefinement(nn.Module):
     def __init__(self, channels: int, radius: int = 8, iterations: int = 3,
                  evidence_channels: int = 16, hidden_channels: int = 32,
                  candidate_chunk: int = 9, temperature: float = 0.07,
-                 max_step_cells: float = 4.0, confidence_channels: int = 16) -> None:
+                 max_step_cells: float = 4.0, confidence_channels: int = 16,
+                 remove_mean: bool = False) -> None:
         super().__init__()
         if channels < 1 or hidden_channels < 1 or evidence_channels < 1:
             raise ValueError("channel counts must be positive")
@@ -85,6 +86,15 @@ class DiscrepancyGuidedRefinement(nn.Module):
         self.candidate_chunk = int(candidate_chunk)
         self.temperature = float(temperature)
         self.max_step_cells = float(max_step_cells)
+        # Off by default.  Forbidding a constant raw update also forbids the one
+        # correction a frozen coarse field still needs: if it is uniformly off by
+        # four pixels, the right answer is a four-pixel correction everywhere, and
+        # removing the mean turns that answer into zero.  It also only forbids the
+        # constant at the raw stage -- the tanh and the per-pixel confidence that
+        # follow can reintroduce a non-zero mean -- so it is a partial constraint,
+        # kept as an explicit switch for a controlled comparison rather than as a
+        # default.
+        self.remove_mean = bool(remove_mean)
         steps = torch.arange(-radius, radius + 1)
         yy, xx = torch.meshgrid(steps, steps, indexing="ij")
         self.register_buffer("offsets_yx", torch.stack((yy, xx), dim=-1).reshape(-1, 2),
@@ -193,7 +203,8 @@ class DiscrepancyGuidedRefinement(nn.Module):
             # output becomes exactly zero, whereas removing the mean *after* the
             # tanh would let a round exceed its step bound.
             raw_update = self.update(update_input)
-            raw_update = raw_update - raw_update.mean(dim=(-2, -1), keepdim=True)
+            if self.remove_mean:
+                raw_update = raw_update - raw_update.mean(dim=(-2, -1), keepdim=True)
             delta = self.max_step_cells * torch.tanh(
                 raw_update / self.max_step_cells)
             confidence = torch.sigmoid(self.confidence(update_input))
@@ -245,6 +256,12 @@ def refinement_losses(output: IterativeRefinementOutput, gt_flow: torch.Tensor,
     reports: dict[str, list[torch.Tensor]] = {
         "epe": [], "flow": [], "match": [], "confidence": [],
         "confidence_target": [], "smooth": [], "improved_fraction": [],
+        # Structure of the applied correction, per frame and in feature cells.
+        # A signed frame mean is deliberately kept per frame: averaging signed
+        # offsets across frames cancels opposite translations, so only its norm
+        # and its alignment with the required mean may be pooled.
+        "applied_mean_norm": [], "applied_std": [],
+        "required_mean_norm": [], "applied_mean_alignment": [],
     }
     for index, flow in enumerate(output.flows):
         before = (flow - output.applied[index]).detach()
@@ -271,8 +288,27 @@ def refinement_losses(output: IterativeRefinementOutput, gt_flow: torch.Tensor,
         reports["confidence_target"].append(masked_mean(improved, active))
         reports["improved_fraction"].append(masked_mean(
             ((error_after < error_before) & covered).to(flow.dtype), active))
+        # What this round actually applied, over the valid region, per frame.
+        # ``required`` is the correction that would land exactly on the target,
+        # i.e. the search residual the window was centred on.
+        applied = output.applied[index]
+        mask = active.unsqueeze(1)
+        weight = active.sum(dim=(-2, -1)).clamp_min(1.0)
+        required = search_residual * mask
+        mean_applied = (applied * mask).sum(dim=(-2, -1)) / weight[:, None]
+        mean_required = required.sum(dim=(-2, -1)) / weight[:, None]
+        centred = (applied - mean_applied[:, :, None, None]) * mask
+        reports["applied_mean_norm"].append(
+            torch.linalg.vector_norm(mean_applied, dim=-1))
+        reports["required_mean_norm"].append(
+            torch.linalg.vector_norm(mean_required, dim=-1))
+        reports["applied_std"].append(
+            torch.sqrt(centred.square().sum(dim=(1, 2, 3)) / (2 * weight)))
+        reports["applied_mean_alignment"].append(
+            (mean_applied * mean_required).sum(dim=-1)
+            / (torch.linalg.vector_norm(mean_applied, dim=-1)
+               * torch.linalg.vector_norm(mean_required, dim=-1)).clamp_min(1e-9))
         if smoothness_weight > 0:
-            applied = output.applied[index]
             reports["smooth"].append(
                 (applied[..., 1:] - applied[..., :-1]).abs().mean()
                 + (applied[..., 1:, :] - applied[..., :-1, :]).abs().mean())

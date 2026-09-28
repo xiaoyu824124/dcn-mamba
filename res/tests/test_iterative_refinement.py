@@ -1,6 +1,7 @@
 """Wiring and contract checks for the iterative discrepancy-guided refinement."""
 
 import unittest
+from unittest.mock import patch
 
 import torch
 from omegaconf import OmegaConf
@@ -26,6 +27,17 @@ def iterative_config(*, iterations: int = 3, radius: int = 2):
     config.iterative_refinement.radius = radius
     config.iterative_refinement.iterations = iterations
     return config
+
+
+class _ConstantUpdate(torch.nn.Module):
+    """A head whose output is the same value at every position."""
+
+    def __init__(self, value: float = 0.25) -> None:
+        super().__init__()
+        self.value = float(value)
+
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        return torch.full_like(inputs[:, :2], self.value)
 
 
 class IterativeRefinementTest(unittest.TestCase):
@@ -112,9 +124,8 @@ class IterativeRefinementTest(unittest.TestCase):
         # Zero initialised update, zero flow: nothing is displaced yet.
         self.assertAlmostEqual(float(centred["epe"][0]), 0.0, places=6)
         self.assertEqual(float(centred["confidence_target"][0]), 0.0)
-        # A constant head output now produces no correction at all -- that is the
-        # point of removing the spatial mean -- so the update has to be given
-        # spatial variation before the field can move.
+        # Mean removal is opt-in, so by default even a constant head output moves
+        # the field: a legitimate global translation must stay reachable.
         with torch.no_grad():
             for parameter in module.update.parameters():
                 parameter.normal_(0, 1.0)
@@ -127,6 +138,37 @@ class IterativeRefinementTest(unittest.TestCase):
         outside = refinement_losses(module(features, features.clone(), zeros + 12.0),
                                     gt, valid)
         self.assertEqual(float(outside["epe"][0]), 0.0)
+
+    def test_mean_removal_is_opt_in(self):
+        """The shipped behaviour must stay the pre-flag behaviour.
+
+        ``remove_mean`` defaults off, so an unmodified config and checkpoint
+        behave exactly as before the flag existed.  With it on, a constant raw
+        update produces no step at all, which is the only thing it is allowed to
+        delete: it must not touch the spatially varying part of the head output.
+        """
+        self.assertFalse(DiscrepancyGuidedRefinement(6).remove_mean)
+        height, width = 8, 10
+        features = torch.randn(1, 6, height, width)
+        zeros = torch.zeros(1, 2, height, width)
+        constant = _ConstantUpdate(0.25)
+        for remove_mean, expected in ((False, True), (True, False)):
+            module = DiscrepancyGuidedRefinement(
+                6, radius=2, iterations=1, max_step_cells=2.0,
+                remove_mean=remove_mean).eval()
+            with patch.object(module, "update", constant):
+                output = module(features, features.clone(), zeros)
+            moved = float(output.residuals[0].abs().max())
+            self.assertEqual(moved > 0.0, expected,
+                             msg=f"remove_mean={remove_mean} moved {moved}")
+            if not expected:
+                # tanh keeps its unit slope at zero, so the step is the raw
+                # constant itself and the confidence stays in (0, 1).
+                self.assertAlmostEqual(float(output.residuals[0][0, 0, 0, 0]), 0.0,
+                                       places=7)
+            else:
+                for delta in output.residuals:
+                    self.assertLessEqual(float(delta.abs().max()), 2.0 + 1e-5)
 
     def test_overlay_builds_the_loop_and_keeps_the_coarse_field(self):
         torch.manual_seed(7)
@@ -166,23 +208,32 @@ class IterativeRefinementTest(unittest.TestCase):
             self.assertIn(f"refine_round{index}_epe_px", report)
             self.assertIn(f"refine_round{index}_match", report)
             self.assertIn(f"refine_round{index}_improved_fraction", report)
+            # What the round actually applied, so a fixed bias can be told apart
+            # from a correction that tracks the required translation.
+            self.assertIn(f"refine_round{index}_applied_mean_norm_px", report)
+            self.assertIn(f"refine_round{index}_applied_std_px", report)
+            self.assertIn(f"refine_round{index}_required_mean_norm_px", report)
+            self.assertIn(f"refine_round{index}_applied_mean_alignment", report)
+            self.assertGreaterEqual(
+                report[f"refine_round{index}_applied_std_px"], 0.0)
         self.assertIn("coarse_epe_px", report)
         self.assertTrue(all(value == value                        # not NaN
                             for name, value in report.items()
                             if name.startswith("refine_round")))
 
 
-    def test_a_constant_update_is_impossible(self):
-        """The loop must not be able to answer with a constant correction.
+    def test_the_mean_removed_variant_forbids_a_constant_update(self):
+        """With ``remove_mean`` on, the loop cannot answer with a constant.
 
         A flow-magnitude loss has a degenerate optimum -- a constant field
         already reaches the mean displacement error -- and the first probe of
         this loop showed exactly that: started from the ground truth, one round
         moved 2.02 px away and a second 3.58 px, while the aggregate error barely
-        improved.  A head whose output is constant everywhere must therefore
-        produce no correction at all.
+        improved.  The flag is opt-in and off by default, so this variant is what
+        closes that door; the default keeps the global translation reachable.
         """
-        module = DiscrepancyGuidedRefinement(6, radius=2, iterations=1)
+        module = DiscrepancyGuidedRefinement(6, radius=2, iterations=1,
+                                             remove_mean=True)
         with torch.no_grad():
             for parameter in module.update.parameters():
                 parameter.zero_()
