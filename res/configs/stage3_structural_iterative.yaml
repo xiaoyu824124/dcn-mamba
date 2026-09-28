@@ -2,7 +2,8 @@
 # discrepancy-guided loop -- three shared-weight rounds, local correlation as the
 # candidate evidence, and a supervised confidence gate on every correction.
 #
-# Merge on top of the same stack as before:
+# For training, merge on top of the same stack as before (res.evaluate_vtmot
+# instead takes the base config from the checkpoint and needs no --config):
 #   --config res/configs/registration.yaml
 #   --overlay res/configs/stage0_structural_prior.yaml
 #   --overlay res/configs/ab_spatial_prior32.yaml

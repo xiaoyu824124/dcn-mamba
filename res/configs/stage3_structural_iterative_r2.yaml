@@ -17,11 +17,14 @@
 # averaged over covered queries only, so on the stress set it is not comparable
 # with coarse_epe_px, which covers every valid pixel.
 #
-# Merge on top of the same stack as before:
+# For training, merge on top of the same stack as before:
 #   --config res/configs/registration.yaml
 #   --overlay res/configs/stage0_structural_prior.yaml
 #   --overlay res/configs/ab_spatial_prior32.yaml
 #   --overlay res/configs/stage3_structural_iterative_r2.yaml
+# res.evaluate_vtmot has no --config: it rebuilds the base config from the
+# checkpoint, so an evaluation passes --checkpoint plus those three --overlay
+# files and nothing else.
 local_matcher:
   enabled: false
 
