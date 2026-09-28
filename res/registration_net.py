@@ -18,6 +18,7 @@ from .local_matcher import LocalMatchOutput, LocalMatcher
 from .mind import MINDDescriptor, paired_mind, rgb_to_gray
 from .glu_crft_coarse import GlobalCostDecoder, fit_affine_flow, standardize_image
 from .spatial_frequency import SpatialFrequencyFusion
+from .structural_prior import StructuralPriorEncoder, structural_prior_input
 from .warp import upsample_feature_flow, warp
 
 
@@ -298,6 +299,79 @@ class SpatialFrequencyRegistration(nn.Module):
         if self.coarse_transformer is not None:
             match_ir, match_vi = self.coarse_transformer(match_ir, match_vi)
         match = self.matcher(match_ir, match_vi)
+        height, width = ir.shape[-2:]
+        grid_h, grid_w = match.coarse_flow.shape[-2:]
+        coarse_flow = upsample_feature_flow(
+            match.coarse_flow, (height, width),
+            (height / grid_h, width / grid_w))
+        return CoarseRegistrationOutput(
+            coarse_aligned_ir=warp(ir, coarse_flow), coarse_flow=coarse_flow,
+            confidence_1_8=match.confidence, affine_yx=match.affine_yx,
+            match=match, global_flow=coarse_flow)
+
+
+class StructuralPriorRegistration(nn.Module):
+    """Modality-specific shallow encoders, shared 1/8 encoder and matching."""
+
+    def __init__(self, *, encoder: StructuralPriorEncoder,
+                 matcher: GlobalMatcher,
+                 coarse_transformer: CoarseSACATransformer | None = None) -> None:
+        super().__init__()
+        if not matcher.affine_projection:
+            raise ValueError("structural-prior matcher must fit the coarse affine")
+        self.encoder = encoder
+        self.matcher = matcher
+        self.coarse_transformer = coarse_transformer
+        self.local_matcher = None
+        self.ir_feature_adapter = None
+        self.mind = MINDDescriptor()
+
+    def forward(self, ir: torch.Tensor, vi: torch.Tensor) -> CoarseRegistrationOutput:
+        MINDGlobalRegistration._validate_inputs(ir, vi)
+        gray_ir = standardize_image(ir)
+        gray_vi = standardize_image(rgb_to_gray(vi))
+        feature_ir, feature_vi = self.encoder(gray_ir, gray_vi)
+        if self.coarse_transformer is not None:
+            feature_ir, feature_vi = self.coarse_transformer(feature_ir, feature_vi)
+        match = self.matcher(feature_ir, feature_vi)
+        height, width = ir.shape[-2:]
+        grid_h, grid_w = match.coarse_flow.shape[-2:]
+        coarse_flow = upsample_feature_flow(
+            match.coarse_flow, (height, width),
+            (height / grid_h, width / grid_w))
+        return CoarseRegistrationOutput(
+            coarse_aligned_ir=warp(ir, coarse_flow), coarse_flow=coarse_flow,
+            confidence_1_8=match.confidence, affine_yx=match.affine_yx,
+            match=match, global_flow=coarse_flow)
+
+
+class DirectStructuralPriorRegistration(nn.Module):
+    """Fixed prior directly matched at 1/8, with no trainable feature learner."""
+
+    def __init__(self, *, matcher: GlobalMatcher, prior_downsample: int = 4,
+                 orientations: int = 4,
+                 wavelengths: tuple[int, ...] = (3, 6, 12)) -> None:
+        super().__init__()
+        if not matcher.affine_projection:
+            raise ValueError("direct matcher must fit the coarse affine")
+        self.matcher = matcher
+        self.prior_downsample = int(prior_downsample)
+        self.orientations = int(orientations)
+        self.wavelengths = tuple(map(int, wavelengths))
+        self.local_matcher = None
+        self.ir_feature_adapter = None
+        self.mind = MINDDescriptor()
+
+    def forward(self, ir: torch.Tensor, vi: torch.Tensor) -> CoarseRegistrationOutput:
+        MINDGlobalRegistration._validate_inputs(ir, vi)
+        gray_ir = standardize_image(ir)
+        gray_vi = standardize_image(rgb_to_gray(vi))
+        settings = dict(downsample=self.prior_downsample,
+                        orientations=self.orientations,
+                        wavelengths=self.wavelengths)
+        feature_ir = F.avg_pool2d(structural_prior_input(gray_ir, **settings), 8, 8)
+        feature_vi = F.avg_pool2d(structural_prior_input(gray_vi, **settings), 8, 8)
+        match = self.matcher(feature_ir, feature_vi)
         height, width = ir.shape[-2:]
         grid_h, grid_w = match.coarse_flow.shape[-2:]
         coarse_flow = upsample_feature_flow(

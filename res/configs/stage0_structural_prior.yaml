@@ -1,0 +1,45 @@
+# Phase-congruency structural prior -> modality-specific shallow adapters ->
+# shared encoder -> SA/CA -> 1/8 global correspondence -> 6-DoF coarse field.
+architecture: structural_prior
+
+structural_prior:
+  base_channels: 24
+  out_channels: 64
+  blocks_per_scale: 2
+  prior_downsample: 4
+  orientations: 4
+  wavelengths: [3, 6, 12]
+
+coarse_transformer:
+  enabled: true
+  num_layers: 2
+  num_heads: 4
+  ffn_ratio: 2
+
+global_matcher:
+  temperature: 0.07
+  learnable_temperature: true
+  return_correlation: false
+  max_tokens: 4800
+  affine_projection: true
+  affine_ridge: 1.0e-3
+  dual_softmax: true
+
+local_matcher:
+  enabled: false
+
+loss:
+  weights:
+    match: 1.0
+    flow: 1.0
+    affine: 10.0
+    mind: 0.0
+    edge: 0.25
+    smooth: 0.05
+    local: 0.0
+    coarse_local: 0.0
+    global_flow: 0.0
+    coarse_flow: 0.0
+
+vtmot_train:
+  lr: 1.0e-4

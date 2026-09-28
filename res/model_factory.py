@@ -13,14 +13,44 @@ from .global_matcher import GlobalMatcher
 from .local_matcher import LocalMatcher
 from .mind import MINDDescriptor
 from .registration_net import MINDGlobalRegistration
-from .registration_net import GLUCRFTRegistration, SpatialFrequencyRegistration
+from .registration_net import (GLUCRFTRegistration, SpatialFrequencyRegistration,
+                               StructuralPriorRegistration,
+                               DirectStructuralPriorRegistration)
 from .glu_crft_coarse import GlobalCostDecoder
 from .spatial_frequency import SpatialFrequencyFusion
+from .structural_prior import StructuralPriorEncoder
 
 
 def build_global_registration(config) -> (MINDGlobalRegistration |
                                           GLUCRFTRegistration |
-                                          SpatialFrequencyRegistration):
+                                          SpatialFrequencyRegistration |
+                                          StructuralPriorRegistration |
+                                          DirectStructuralPriorRegistration):
+    if str(config.get("architecture", "mind_global")) == "structural_prior_direct":
+        prior = OmegaConf.to_container(config.structural_prior, resolve=True)
+        for name in ("base_channels", "out_channels", "blocks_per_scale"):
+            prior.pop(name, None)
+        matcher_settings = OmegaConf.to_container(config.global_matcher, resolve=True)
+        matcher_settings["affine_projection"] = True
+        matcher_settings["learnable_temperature"] = False
+        return DirectStructuralPriorRegistration(
+            matcher=GlobalMatcher(**matcher_settings), **prior)
+    if str(config.get("architecture", "mind_global")) == "structural_prior":
+        encoder = StructuralPriorEncoder(
+            **OmegaConf.to_container(config.structural_prior, resolve=True))
+        matcher_settings = OmegaConf.to_container(config.global_matcher, resolve=True)
+        matcher_settings["affine_projection"] = True
+        matcher = GlobalMatcher(**matcher_settings)
+        transformer_config = config.get("coarse_transformer")
+        transformer = None
+        if transformer_config is not None and bool(transformer_config.get("enabled", False)):
+            transformer = CoarseSACATransformer(
+                encoder.shared.out_channels,
+                **{key: value for key, value in
+                   OmegaConf.to_container(transformer_config, resolve=True).items()
+                   if key != "enabled"})
+        return StructuralPriorRegistration(
+            encoder=encoder, matcher=matcher, coarse_transformer=transformer)
     if str(config.get("architecture", "mind_global")) == "spatial_frequency":
         settings = OmegaConf.to_container(config.encoder, resolve=True)
         settings["in_channels"] = 1

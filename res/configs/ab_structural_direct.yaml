@@ -1,0 +1,5 @@
+# Handcrafted three-channel descriptor directly matched with the same 1/8
+# global matcher and affine projection; no learned encoder or SA/CA.
+architecture: structural_prior_direct
+coarse_transformer:
+  enabled: false

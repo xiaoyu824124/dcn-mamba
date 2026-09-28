@@ -82,8 +82,8 @@ def main() -> None:
     device = torch.device(args.device)
     checkpoint = torch.load(args.checkpoint, map_location=device, weights_only=True)
     config = OmegaConf.create(checkpoint["config"])
-    if str(config.get("architecture")) != "spatial_frequency":
-        raise ValueError("visualizer requires a spatial_frequency checkpoint")
+    if str(config.get("architecture")) not in ("spatial_frequency", "structural_prior"):
+        raise ValueError("visualizer requires a spatial_frequency or structural_prior checkpoint")
     model = build_global_registration(config).to(device)
     model.load_state_dict(checkpoint["model"], strict=True)
     model.eval()

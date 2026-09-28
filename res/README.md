@@ -772,3 +772,55 @@ python -B -m res.visualize_spatial_frequency --device cuda --split eval --frame-
 缓解可见光与红外的非线性差异，但它采用的不是这里的局部 FFT。
 [SFRF 预印本](https://arxiv.org/abs/2605.13049) 在 IR–VI 配准与融合中使用频域
 监督，其频域信号也不能直接当作本实验匹配描述子的效果证据。
+
+## 相位一致性先验 + 模态浅层编码器
+
+前面的四组并非纯手工描述子实验：空间组有共享 CNN，幅度/相位组有
+可训练投影，融合组还有可训练融合层。80 帧 IR–VI 上融合组的全局匹配
+argmax 从空间组的 216 px 降到 184 px，但粗场 EPE 从 8.90 px 升到
+9.13 px。原始输入仍没有形成足够可靠的对应，不能据此接 DCN。
+
+新 `structural_prior` 路径按如下顺序测试学习器本身的作用：
+
+```text
+标准化灰度图 + 固定相位一致性 + 归一化局部带通幅度
+  → IR 专用 / VI 专用浅层编码器
+  → 共享 1/2、1/4、1/8 CNN 编码器
+  → 1/8 SA–CA + 4800 候选全局匹配
+  → 6-DoF 仿射粗场 → 预对齐 IR
+```
+
+固定先验在原图的 1/4 尺度使用多方向、多尺度解析带通响应，按局部
+相位一致性公式合成位置相关的结构图，再上采样。它是轻量近似实现，
+不是现成论文代码或整图 FFT 相位。`structural_prior_direct` 用**相同三通道
+输入**直接降至 1/8 匹配，不含任何可训练特征提取器和 SA–CA；
+两个实验共用全局匹配、双向 softmax、6-DoF WLS 和评测划分。
+学习版使用对应损失训练编码器，用流场和仿射损失训练整体估计。
+本轮 MIND 结构损失仍关闭，避免它影响先验与学习器的比较。
+
+Windows `cmd` 仓库根目录先检查环境，并评测无需训练的手工基线：
+
+```bat
+python -B -m unittest discover -s res/tests -t .
+python -B -m res.evaluate_structural_direct --device cuda --split eval --frame-stride 10 --output res_runs/structural_direct/eval_stride10.json
+```
+
+然后对学习版做一步完整视场试跑及 3000 步训练；输出目录须为空：
+
+```bat
+python -B -m res.train_vtmot --device cuda --steps 1 --num-workers 0 --overlay res/configs/stage0_structural_prior.yaml --output-dir res_runs/structural_learned_smoke
+python -B -m res.train_vtmot --device cuda --run full --num-workers 0 --overlay res/configs/stage0_structural_prior.yaml --output-dir res_runs/structural_learned_full
+```
+
+同一批 80 帧评测 `best.pt` 与 `last.pt`，再导出两帧匹配图：
+
+```bat
+python -B -m res.evaluate_vtmot --device cuda --split eval --frame-stride 10 --checkpoint res_runs/structural_learned_full/best.pt --diagnose-appearance --output res_runs/structural_learned_full/eval_best_stride10.json
+python -B -m res.evaluate_vtmot --device cuda --split eval --frame-stride 10 --checkpoint res_runs/structural_learned_full/last.pt --diagnose-appearance --output res_runs/structural_learned_full/eval_last_stride10.json
+python -B -m res.visualize_structural_prior --device cuda --split eval --frame-stride 10 --max-samples 2 --checkpoint res_runs/structural_learned_full/best.pt --output-dir res_runs/structural_learned_full/visuals
+```
+
+同时看真值 key 的排名、argmax EPE、`affine_weighted_raw_epe_px`、
+`affine_weight_effective_queries_ratio` 和粗场 EPE。如果学习器改善对应
+但仍无法改善粗场，下一步检查 WLS 支撑点与仿射读出；如果对应排名本身
+不改善，先修表征，不接 1/4、1/2 或 DCN。保留 `test` 划分作最终评估。
