@@ -122,11 +122,23 @@ class StructuralPriorEncoder(nn.Module):
             image, downsample=self.prior_downsample,
             orientations=self.orientations, wavelengths=self.wavelengths)
 
-    def forward(self, ir: torch.Tensor,
-                vi: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def encode_scales(self, ir: torch.Tensor,
+                      vi: torch.Tensor) -> tuple[dict, dict]:
+        """Every shared-pyramid scale for both modalities (1/2, 1/4 and 1/8).
+
+        The coarse route only ever needed 1/8, so it was the only scale returned;
+        a 1/4 local stage has to reach the same pyramid without re-running the
+        shallow adapters, which would put the two stages in different feature
+        spaces.
+        """
         if ir.shape != vi.shape or ir.ndim != 4 or ir.shape[1] != 1:
             raise ValueError("encoder expects equal grayscale [B,1,H,W] images")
         ir_shallow = self.ir_shallow(self._input(ir))
         vi_shallow = self.vi_shallow(self._input(vi))
-        ir_features, vi_features = self.shared.encode_pair(ir_shallow, vi_shallow)
+        return self.shared.encode_pair(ir_shallow, vi_shallow)
+
+    def forward(self, ir: torch.Tensor,
+                vi: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Coarse 1/8 features only, kept for callers that need just that scale."""
+        ir_features, vi_features = self.encode_scales(ir, vi)
         return ir_features["1/8"], vi_features["1/8"]

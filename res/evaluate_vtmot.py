@@ -18,6 +18,7 @@ from .model_factory import build_global_registration
 from .affine import affine_corner_errors
 from .matching import matching_diagnostics, windowed_diagnostics
 from .local_matcher import local_matching_diagnostics
+from .checkpoint import load_registration_state
 from .mind import paired_mind
 from .motion_diagnostics import (frame_motion_diagnostics,
                                  summarize_motion_frames,
@@ -101,6 +102,7 @@ def check_gt_direction(loader: DataLoader, device: torch.device, preview_dir: Pa
 def evaluate(model: torch.nn.Module, loader: DataLoader, device: torch.device,
              diagnose_local_mind: bool = False,
              diagnose_confidence_gate: bool = False,
+             diagnose_local_centre: bool = False,
              diagnose_motion: bool = False,
              stress_translation: tuple[float, float] | None = None,
              moving_source: str = "ir") -> Dict[str, float]:
@@ -179,6 +181,24 @@ def evaluate(model: torch.nn.Module, loader: DataLoader, device: torch.device,
         if output.local_match is not None:
             for name, value in local_matching_diagnostics(output.local_match, target, valid).items():
                 diagnostic_sums[name] = diagnostic_sums.get(name, 0.0) + value * float(predicted.shape[0])
+        if diagnose_local_centre and output.local_match is not None:
+            # Re-run only the local stage with the *truth* as the window centre.
+            # This removes the coarse-field error from the measurement: if the
+            # truth-centred search still picks the wrong candidate, the 1/4
+            # features are not discriminative enough and no coarse improvement
+            # will help; if it picks correctly, the window content is fine and
+            # the coarse field (or the window size) is what to fix.
+            if not getattr(model, "supports_local_centre", False):
+                raise ValueError(
+                    "--diagnose-local-centre requires a registration model that accepts "
+                    "local_centre; currently only StructuralPriorRegistration does")
+            with torch.no_grad():
+                truth_centred = model(ir, vi, local_centre=target)
+            for name, value in local_matching_diagnostics(
+                    truth_centred.local_match, target, valid).items():
+                diagnostic_sums["truthcentre_" + name] = (
+                    diagnostic_sums.get("truthcentre_" + name, 0.0)
+                    + value * float(predicted.shape[0]))
             if diagnose_confidence_gate:
                 local = output.local_match
                 feature_hw = local.coarse_flow.shape[-2:]
@@ -271,6 +291,10 @@ def main() -> None:
                         help="compare 1/4 Encoder features with pooled raw MIND descriptors at the same coarse field")
     parser.add_argument("--diagnose-confidence-gate", action="store_true",
                         help="evaluate top-confidence local corrections without changing the checkpoint")
+    parser.add_argument("--diagnose-local-centre", action="store_true",
+                        help="re-run the 1/4 search with the ground truth as the window centre, "
+                             "separating 1/4 feature discriminability from coarse-field error "
+                             "(requires structural_prior with an enabled local matcher)")
     parser.add_argument("--diagnose-motion", action="store_true",
                         help="report per-frame and per-pixel GT displacement bins plus coarse-match spatial distribution")
     parser.add_argument("--stress-translation", type=float, nargs=2,
@@ -320,16 +344,25 @@ def main() -> None:
         config = OmegaConf.merge(OmegaConf.create(checkpoint["config"]),
                                  *(OmegaConf.load(path) for path in args.overlay))
         model = build_global_registration(config).to(device)
-        model.load_state_dict(checkpoint["model"], strict=True)
+        # Tolerant of submodules the checkpoint predates (a 1/4 local stage added
+        # after the coarse field was frozen), strict about everything else.
+        load_report = load_registration_state(model, checkpoint["model"])
+        if load_report["untrained"]:
+            print(f"checkpoint={args.checkpoint} kept={load_report['kept']} "
+                  f"newly built (untrained) modules: "
+                  f"{sorted({name.split('.')[0] for name in load_report['untrained']})}")
         if args.diagnose_local_mind and model.local_matcher is None:
             raise ValueError("--diagnose-local-mind requires an enabled local matcher")
         if args.diagnose_confidence_gate and model.local_matcher is None:
             raise ValueError("--diagnose-confidence-gate requires an enabled local matcher")
+        if args.diagnose_local_centre and model.local_matcher is None:
+            raise ValueError("--diagnose-local-centre requires an enabled local matcher")
         if args.diagnose_appearance:
             model.matcher.return_correlation = True
         report = evaluate(model, loader, device,
                           diagnose_local_mind=args.diagnose_local_mind,
                           diagnose_confidence_gate=args.diagnose_confidence_gate,
+                          diagnose_local_centre=args.diagnose_local_centre,
                           diagnose_motion=args.diagnose_motion,
                           stress_translation=(tuple(args.stress_translation)
                                               if args.stress_translation is not None else None),

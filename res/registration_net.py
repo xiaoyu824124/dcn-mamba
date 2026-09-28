@@ -311,26 +311,48 @@ class SpatialFrequencyRegistration(nn.Module):
 
 
 class StructuralPriorRegistration(nn.Module):
-    """Modality-specific shallow encoders, shared 1/8 encoder and matching."""
+    """Modality-specific shallow encoders, shared pyramid, coarse then 1/4 local.
+
+    The 1/8 route (SA-CA, global matcher, 6-DoF WLS projection) is unchanged and
+    runs first, so wiring the optional 1/4 stage cannot alter the coarse field.
+    ``local_matcher`` searches the shared encoder's 1/4 features in a window
+    centred on that coarse field; ``local_centre`` overrides the centre for
+    diagnostics, which is what separates "the 1/4 features cannot pick the right
+    point" from "the coarse field put the window in the wrong place".
+    """
+
+    supports_local_centre = True
 
     def __init__(self, *, encoder: StructuralPriorEncoder,
                  matcher: GlobalMatcher,
-                 coarse_transformer: CoarseSACATransformer | None = None) -> None:
+                 coarse_transformer: CoarseSACATransformer | None = None,
+                 local_matcher: LocalMatcher | None = None,
+                 fine_interaction: FineScaleInteraction | None = None,
+                 fine_cross_attention: FineCrossModalAttention | None = None) -> None:
         super().__init__()
         if not matcher.affine_projection:
             raise ValueError("structural-prior matcher must fit the coarse affine")
+        if fine_interaction is not None and local_matcher is None:
+            raise ValueError("fine_interaction requires an enabled local matcher")
+        if fine_cross_attention is not None and local_matcher is None:
+            raise ValueError("fine_cross_attention requires an enabled local matcher")
         self.encoder = encoder
         self.matcher = matcher
         self.coarse_transformer = coarse_transformer
-        self.local_matcher = None
+        self.local_matcher = local_matcher
+        self.fine_interaction = fine_interaction
+        self.fine_cross_attention = fine_cross_attention
         self.ir_feature_adapter = None
         self.mind = MINDDescriptor()
 
-    def forward(self, ir: torch.Tensor, vi: torch.Tensor) -> CoarseRegistrationOutput:
+    def forward(self, ir: torch.Tensor, vi: torch.Tensor, *,
+                local_centre: torch.Tensor | None = None
+                ) -> CoarseRegistrationOutput:
         MINDGlobalRegistration._validate_inputs(ir, vi)
         gray_ir = standardize_image(ir)
         gray_vi = standardize_image(rgb_to_gray(vi))
-        feature_ir, feature_vi = self.encoder(gray_ir, gray_vi)
+        features_ir, features_vi = self.encoder.encode_scales(gray_ir, gray_vi)
+        feature_ir, feature_vi = features_ir["1/8"], features_vi["1/8"]
         if self.coarse_transformer is not None:
             feature_ir, feature_vi = self.coarse_transformer(feature_ir, feature_vi)
         match = self.matcher(feature_ir, feature_vi)
@@ -339,10 +361,38 @@ class StructuralPriorRegistration(nn.Module):
         coarse_flow = upsample_feature_flow(
             match.coarse_flow, (height, width),
             (height / grid_h, width / grid_w))
+        coarse_aligned_ir = warp(ir, coarse_flow)
+
+        local_match = None
+        final_flow = None
+        final_aligned_ir = None
+        if self.local_matcher is not None:
+            fine_ir, fine_vi = features_ir["1/4"], features_vi["1/4"]
+            if self.fine_interaction is not None:
+                fine_ir, fine_vi = self.fine_interaction(fine_ir, fine_vi,
+                                                         feature_ir, feature_vi)
+            feature_hw = fine_ir.shape[-2:]
+            stride_4 = coarse_flow.new_tensor((height / feature_hw[0],
+                                               width / feature_hw[1])).view(1, 2, 1, 1)
+            centre = coarse_flow if local_centre is None else local_centre
+            if centre.shape != coarse_flow.shape:
+                raise ValueError(
+                    "local_centre must be an image-grid [B,2,H,W] flow like coarse_flow, "
+                    f"got {tuple(centre.shape)}")
+            centre_4 = F.interpolate(centre, size=feature_hw, mode="bilinear",
+                                     align_corners=False) / stride_4
+            if self.fine_cross_attention is not None:
+                fine_ir, fine_vi = self.fine_cross_attention(fine_ir, fine_vi, centre_4)
+            local_match = self.local_matcher(fine_ir, fine_vi, centre_4)
+            final_flow = upsample_feature_flow(local_match.refined_flow, (height, width),
+                                               (height / feature_hw[0],
+                                                width / feature_hw[1]))
+            final_aligned_ir = warp(ir, final_flow)
         return CoarseRegistrationOutput(
-            coarse_aligned_ir=warp(ir, coarse_flow), coarse_flow=coarse_flow,
+            coarse_aligned_ir=coarse_aligned_ir, coarse_flow=coarse_flow,
             confidence_1_8=match.confidence, affine_yx=match.affine_yx,
-            match=match, global_flow=coarse_flow)
+            match=match, final_aligned_ir=final_aligned_ir, final_flow=final_flow,
+            local_match=local_match, global_flow=coarse_flow)
 
 
 class DirectStructuralPriorRegistration(nn.Module):

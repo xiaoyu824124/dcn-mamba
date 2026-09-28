@@ -49,8 +49,40 @@ def build_global_registration(config) -> (MINDGlobalRegistration |
                 **{key: value for key, value in
                    OmegaConf.to_container(transformer_config, resolve=True).items()
                    if key != "enabled"})
+        # The 1/4 local stage is optional so that a coarse-only checkpoint still
+        # describes the same model: enabling it adds parameters, and
+        # res.checkpoint.load_registration_state is what lets an older file load.
+        local_config = config.get("local_matcher")
+        local_matcher = None
+        if local_config is not None and bool(local_config.get("enabled", False)):
+            local_matcher = LocalMatcher(**{
+                key: value for key, value in
+                OmegaConf.to_container(local_config, resolve=True).items()
+                if key != "enabled"})
+        fine_config = config.get("fine_interaction")
+        fine_interaction = None
+        if fine_config is not None and bool(fine_config.get("enabled", False)):
+            if local_matcher is None:
+                raise ValueError("fine_interaction requires local_matcher.enabled=true")
+            fine_interaction = FineScaleInteraction(
+                encoder.shared.base_channels * 2, encoder.shared.out_channels,
+                **{key: value for key, value in
+                   OmegaConf.to_container(fine_config, resolve=True).items()
+                   if key != "enabled"})
+        cross_config = config.get("fine_cross_attention")
+        fine_cross_attention = None
+        if cross_config is not None and bool(cross_config.get("enabled", False)):
+            if local_matcher is None:
+                raise ValueError("fine_cross_attention requires local_matcher.enabled=true")
+            fine_cross_attention = FineCrossModalAttention(
+                encoder.shared.base_channels * 2,
+                **{key: value for key, value in
+                   OmegaConf.to_container(cross_config, resolve=True).items()
+                   if key != "enabled"})
         return StructuralPriorRegistration(
-            encoder=encoder, matcher=matcher, coarse_transformer=transformer)
+            encoder=encoder, matcher=matcher, coarse_transformer=transformer,
+            local_matcher=local_matcher, fine_interaction=fine_interaction,
+            fine_cross_attention=fine_cross_attention)
     if str(config.get("architecture", "mind_global")) == "spatial_frequency":
         settings = OmegaConf.to_container(config.encoder, resolve=True)
         settings["in_channels"] = 1

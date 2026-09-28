@@ -1,0 +1,23 @@
+# Step 1 of the structural-prior route: expose the shared encoder's 1/4 scale and
+# search it locally, with the frozen coarse field as the window centre.
+#
+# radius 8 cells at 1/4 = +/-32 image pixels.  On the +/-48 px stress set the truth
+# lands inside +/-32 px for roughly 89-91% of covered queries, so a +/-24 px window
+# would drop noticeably more points; coverage is only a geometric condition and
+# says nothing about whether the features can pick the right candidate, which is
+# what --diagnose-local-centre measures.
+#
+# ``local: 0.0`` keeps this a wiring and diagnostic stage: no new supervision and
+# no correction, so the coarse field and the final flow stay exactly what the
+# existing checkpoint produces (the refinement head is zero-initialised, so
+# refined_flow == coarse_flow until it is trained).
+local_matcher:
+  enabled: true
+  radius: 8
+  temperature: 0.07
+  candidate_chunk: 9
+  refinement_channels: 32
+
+loss:
+  weights:
+    local: 0.0
