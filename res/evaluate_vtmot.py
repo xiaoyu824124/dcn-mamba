@@ -19,6 +19,7 @@ from .affine import affine_corner_errors
 from .matching import matching_diagnostics, windowed_diagnostics
 from .local_matcher import local_matching_diagnostics
 from .mind import paired_mind
+from .motion_diagnostics import frame_motion_diagnostics, summarize_motion_frames
 from .vtmot import VTMOTSingleFrameDataset, registration_moving_image
 from .warp import upsample_feature_flow, warp
 
@@ -98,12 +99,14 @@ def check_gt_direction(loader: DataLoader, device: torch.device, preview_dir: Pa
 def evaluate(model: torch.nn.Module, loader: DataLoader, device: torch.device,
              diagnose_local_mind: bool = False,
              diagnose_confidence_gate: bool = False,
+             diagnose_motion: bool = False,
              moving_source: str = "ir") -> Dict[str, float]:
     total_epe = total_coarse_epe = total_global_epe = total_baseline = total_valid = total_samples = 0.0
     total_corner_epe = total_cycle_epe = 0.0
     hit_sums = {f"pck_{threshold}px": 0.0 for threshold in (1, 3, 5)}
     diagnostic_sums: Dict[str, float] = {}
     gate_sums: Dict[str, float] = {}
+    motion_rows: list[dict] = []
     coarse_grid_hw = None
     model.eval()
     for batch in loader:
@@ -198,6 +201,18 @@ def evaluate(model: torch.nn.Module, loader: DataLoader, device: torch.device,
         hits = _threshold_hits(predicted, target, valid)
         for name, value in hits.items():
             hit_sums[name] += value * count
+        if diagnose_motion:
+            if predicted.shape[0] != 1:
+                raise ValueError("--diagnose-motion requires --batch-size 1")
+            match = output.match
+            motion_rows.append(frame_motion_diagnostics(
+                predicted, output.coarse_flow, target, valid,
+                match.matching_probability if match is not None else None,
+                tuple(match.coarse_flow.shape[-2:]) if match is not None else None,
+                affine_power=model.matcher.affine_confidence_power,
+                affine_border_margin=model.matcher.affine_border_margin,
+                sequence=str(batch["sequence"][0]) if "sequence" in batch else "",
+                stem=str(batch["stem"][0]) if "stem" in batch else ""))
     report = {"epe_px": total_epe / max(total_valid, 1.0),
               "coarse_epe_px": total_coarse_epe / max(total_valid, 1.0),
               "zero_flow_epe_px": total_baseline / max(total_valid, 1.0),
@@ -225,6 +240,8 @@ def evaluate(model: torch.nn.Module, loader: DataLoader, device: torch.device,
         report.update({name: value / max(total_valid, 1.0)
                        for name, value in gate_sums.items()})
     report.update({name: value / max(total_valid, 1.0) for name, value in hit_sums.items()})
+    if diagnose_motion:
+        report.update(summarize_motion_frames(motion_rows))
     return report
 
 
@@ -243,6 +260,8 @@ def main() -> None:
                         help="compare 1/4 Encoder features with pooled raw MIND descriptors at the same coarse field")
     parser.add_argument("--diagnose-confidence-gate", action="store_true",
                         help="evaluate top-confidence local corrections without changing the checkpoint")
+    parser.add_argument("--diagnose-motion", action="store_true",
+                        help="report per-frame and per-pixel GT displacement bins plus coarse-match spatial distribution")
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--moving-source", choices=("ir", "visible_gt"), default="ir",
                         help="evaluate infrared (default) or aligned visible grayscale")
@@ -257,6 +276,10 @@ def main() -> None:
     args = parser.parse_args()
     if args.batch_size < 1:
         raise ValueError("batch-size must be positive")
+    if args.diagnose_motion and args.batch_size != 1:
+        raise ValueError("--diagnose-motion requires --batch-size 1")
+    if args.diagnose_motion and args.output is None:
+        raise ValueError("--diagnose-motion requires --output to save per-frame records")
     device = torch.device(args.device if args.device != "cuda" or torch.cuda.is_available() else "cpu")
     dataset = VTMOTSingleFrameDataset(args.data_root, split=args.split, split_file=args.split_file,
                                       frame_stride=args.frame_stride,
@@ -289,6 +312,7 @@ def main() -> None:
         report = evaluate(model, loader, device,
                           diagnose_local_mind=args.diagnose_local_mind,
                           diagnose_confidence_gate=args.diagnose_confidence_gate,
+                          diagnose_motion=args.diagnose_motion,
                           moving_source=args.moving_source)
         report["moving_source"] = args.moving_source
         if args.overlay:
@@ -300,7 +324,11 @@ def main() -> None:
         beats_zero, fusion_ready, status = _registration_status(report, args.moving_source)
         report["beats_zero_flow"] = beats_zero
         report["fusion_ready"] = fusion_ready
-        print(json.dumps(report, indent=2))
+        # Keep the console readable; the requested JSON file retains all
+        # per-frame records for paired same-frame comparisons.
+        console_report = {name: value for name, value in report.items()
+                          if name != "motion_frames"}
+        print(json.dumps(console_report, indent=2))
         print(status)
     if args.output is not None:
         args.output.parent.mkdir(parents=True, exist_ok=True)

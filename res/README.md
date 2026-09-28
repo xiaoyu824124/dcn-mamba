@@ -833,3 +833,24 @@ python -B -m res.visualize_structural_prior --device cuda --split eval --frame-s
 python -B -m res.evaluate_structural_direct --device cuda --split eval --frame-stride 10 --overlay res/configs/ab_spatial_prior32.yaml --output res_runs/structural_direct/eval_prior32_stride10.json
 python -B -m res.evaluate_vtmot --device cuda --split eval --frame-stride 10 --checkpoint res_runs/structural_learned_full/best.pt --overlay res/configs/ab_spatial_prior32.yaml --output res_runs/structural_learned_full/eval_best_prior32_stride10.json
 ```
+
+### 按位移大小检查粗场和匹配点
+
+保持同一 `eval` 划分、帧间隔和视场，分别测新模型不加先验、加入 32 px
+软先验以及原 MIND 模型。`--diagnose-motion` 只增加评测统计，不修改网络或权重：
+
+```bat
+python -B -m res.evaluate_vtmot --device cuda --split eval --frame-stride 10 --checkpoint res_runs/structural_learned_full/last.pt --diagnose-motion --output res_runs/structural_learned_full/motion_last_plain.json
+python -B -m res.evaluate_vtmot --device cuda --split eval --frame-stride 10 --checkpoint res_runs/structural_learned_full/last.pt --overlay res/configs/ab_spatial_prior32.yaml --diagnose-motion --output res_runs/structural_learned_full/motion_last_prior32.json
+python -B -m res.evaluate_vtmot --device cuda --split eval --frame-stride 10 --checkpoint res_runs/control_warm_pilot/best.pt --diagnose-motion --output res_runs/control_warm_pilot/motion_best.json
+```
+
+控制台显示 `motion_frame_bins`（按**每帧**真值平均位移分组）、
+`motion_pixel_bins`（按**像素**真值位移分组）、最高/最低位移四分位
+及 `match_distribution_summary`。完整 JSON 的 `motion_frames` 逐帧记录
+`sequence`/`stem`、GT 位移、EPE、粗场 EPE、最高置信度 10% 查询点的
+匹配误差和预测/真值位移分布，以及 WLS 权重的四象限分布。
+各组若没有样本，其 EPE 为 `null`；不能把空组当作零误差。
+先比较最高位移四分位和 `>=16px`、`>=32px` 像素组，再检查高置信
+匹配是否集中在图像局部或偏向近零位移。软位置先验可能降低总体 EPE，
+但同时损害大位移组；这种情况不能作为大位移匹配已解决的证据。

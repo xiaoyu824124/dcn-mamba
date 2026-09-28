@@ -59,6 +59,14 @@ class StructuralPriorTest(unittest.TestCase):
         report = evaluate(model.eval(), [batch], torch.device("cpu"))
         self.assertEqual(report["architecture"], "structural_prior")
         self.assertIn("affine_weight_effective_queries_ratio", report)
+        batch["sequence"] = ["synthetic"]
+        batch["stem"] = ["one"]
+        motion_report = evaluate(model.eval(), [batch], torch.device("cpu"),
+                                 diagnose_motion=True)
+        self.assertEqual(motion_report["motion_frames"][0]["sequence"], "synthetic")
+        self.assertEqual(motion_report["motion_pixel_bins"]["0-4px"]["pixels"],
+                         64 * 80)
+        self.assertIsNotNone(motion_report["match_distribution_summary"])
 
     def test_direct_baseline_has_no_feature_parameters(self):
         config = OmegaConf.merge(
