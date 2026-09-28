@@ -221,6 +221,16 @@ class IterativeRefinementTest(unittest.TestCase):
         self.assertAlmostEqual(_ranking_auc(perfect, torch.ones(4, dtype=torch.bool)),
                                0.5, places=6)
 
+    @unittest.skipUnless(torch.cuda.is_available(), "device check needs CUDA")
+    def test_ranking_auc_keeps_the_input_device(self):
+        """Local runs are CPU-only, so a CPU-allocated rank buffer only ever
+        fails on the machine that matters: assert the CUDA path here."""
+        from res.evaluate_vtmot import _ranking_auc
+        scores = torch.tensor([0.9, 0.8, 0.2, 0.1], device="cuda")
+        labels = torch.tensor([True, True, False, False], device="cuda")
+        self.assertAlmostEqual(_ranking_auc(scores, labels), 1.0, places=6)
+        self.assertAlmostEqual(_ranking_auc(-scores, labels), 0.0, places=6)
+
     def test_overlay_builds_the_loop_and_keeps_the_coarse_field(self):
         torch.manual_seed(7)
         config = iterative_config(radius=2)

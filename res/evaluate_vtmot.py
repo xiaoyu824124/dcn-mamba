@@ -73,7 +73,9 @@ def _ranking_auc(scores: torch.Tensor, positive: torch.Tensor) -> float:
                                       return_counts=True)
     starts = torch.cumsum(counts, dim=0) - counts
     midrank = starts.to(torch.float64) + (counts.to(torch.float64) + 1.0) / 2.0
-    ranks = torch.empty(scores.numel(), dtype=torch.float64)
+    # Same device as the input: torch.unique returns its inverse there, and a
+    # CPU-allocated rank buffer only shows up as a mismatch on CUDA.
+    ranks = torch.empty(scores.numel(), dtype=torch.float64, device=scores.device)
     ranks[order] = midrank[inverse]
     return float((ranks[positive].sum() - n_pos * (n_pos + 1) / 2.0) / (n_pos * n_neg))
 
