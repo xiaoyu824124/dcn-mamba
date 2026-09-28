@@ -265,6 +265,10 @@ def refinement_losses(output: IterativeRefinementOutput, gt_flow: torch.Tensor,
     reports: dict[str, list[torch.Tensor]] = {
         "epe": [], "flow": [], "match": [], "confidence": [],
         "confidence_target": [], "smooth": [], "improved_fraction": [],
+        # The pre-gate proposal: what the round would apply at full confidence.
+        # Supervised separately from the gated field so a round cannot pass by
+        # learning to close the gate while its update head stays wrong.
+        "proposal": [],
         # Structure of the applied correction, per frame and in feature cells.
         # A signed frame mean is deliberately kept per frame: averaging signed
         # offsets across frames cancels opposite translations, so only its norm
@@ -303,6 +307,13 @@ def refinement_losses(output: IterativeRefinementOutput, gt_flow: torch.Tensor,
         reports["confidence_target"].append(masked_mean(improved, active))
         reports["improved_fraction"].append(masked_mean(
             ((error_after < error_before) & covered).to(flow.dtype), active))
+        # Same Charbonnier form as ``flow``, but on ``before + delta``: the
+        # confidence is deliberately left out, so the update head is asked for a
+        # correction that is right on its own terms.
+        error_proposal = torch.linalg.vector_norm(
+            target - base - (before + output.residuals[index]), dim=1)
+        reports["proposal"].append(masked_mean(
+            torch.sqrt(error_proposal.square() + charbonnier_eps ** 2), active))
         reports["covered"].append(covered.detach())
         reports["query"].append(query.detach())
         reports["benefit"].append((error_before - error_after).detach())

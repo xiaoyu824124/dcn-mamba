@@ -121,6 +121,19 @@ class EvaluateCliTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             self._run(("--diagnose-confidence-gate", "--gate-specs", "zero,bogus"))
 
+    def test_known_residual_pass_reports_every_probed_offset(self):
+        """The probe cycles offsets per frame, so with two frames only the first
+        two tags appear; the nominal magnitudes must come back exactly."""
+        report = self._run(("--diagnose-known-residual",))
+        self.assertIn("known_residual_start_px", report)
+        self.assertAlmostEqual(report["known_residual_start_px"], (4.0 + 4.0) / 2, places=6)
+        for index in (1, 2):
+            self.assertIn(f"known_residual_round{index}_epe_px", report)
+            self.assertIn(f"known_m4y_round{index}_epe_px", report)
+            self.assertIn(f"known_m4x_round{index}_epe_px", report)
+        self.assertAlmostEqual(report["known_m4y_start_px"], 4.0, places=6)
+        self.assertAlmostEqual(report["known_m4x_start_px"], 4.0, places=6)
+
 
 if __name__ == "__main__":
     unittest.main()

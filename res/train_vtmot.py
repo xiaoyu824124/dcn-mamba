@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import random
 from pathlib import Path
 
@@ -91,6 +92,71 @@ def sample_large_translation(settings, *, seed: int, step: int
     return (magnitude, 0) if rng.randrange(2) else (0, magnitude)
 
 
+def sample_init_flow(settings, gt_flow: torch.Tensor, *, seed: int, step: int
+                     ) -> tuple[torch.Tensor | None, str]:
+    """Mixed starting points for the 1/4 loop, used as residual supervision.
+
+    Training the loop only from the model's own coarse field cannot teach it what
+    to do when the input is already right, and evaluating it only from the ground
+    truth would be passed by a head that never moves.  So a fraction of steps start
+    from a *known* perturbation of the truth, and the per-round flow loss then
+    demands the matching correction back:
+
+    ``truth``        start on the truth, so the correct correction is zero;
+    ``translation``  truth plus one constant offset, so the correct correction is
+                     its negation everywhere -- exactly the case a frozen coarse
+                     field still needs when it is globally off;
+    ``local``        truth plus a smooth bounded field, so the correction varies
+                     spatially.
+
+    Returns ``(None, "coarse")`` for the remaining steps, which is what inference
+    always uses.  The choice is a deterministic function of ``seed`` and ``step``,
+    so a run stays reproducible.
+    """
+    if settings is None:
+        return None, "coarse"
+    probability = float(settings.get("probability", 0.0))
+    if not 0.0 <= probability <= 1.0:
+        raise ValueError("init_flow_mix probability must be in [0, 1]")
+    magnitudes = [float(value) for value in
+                  settings.get("translation_px", (4.0, 8.0, 16.0))]
+    if not magnitudes or min(magnitudes) <= 0.0:
+        raise ValueError("init_flow_mix translation_px must be positive magnitudes")
+    truth_weight = float(settings.get("truth_weight", 0.4))
+    if not 0.0 <= truth_weight <= 1.0:
+        raise ValueError("init_flow_mix truth_weight must be in [0, 1]")
+    local_px = float(settings.get("local_px", 8.0))
+    rng = random.Random(seed * 1_000_003 + step)
+    if rng.random() >= probability:
+        return None, "coarse"
+    roll = rng.random()
+    if roll < truth_weight:
+        return gt_flow, "truth"
+    if roll < truth_weight + (1.0 - truth_weight) / 2.0 or local_px <= 0.0:
+        # Eight unit directions, not just the diagonals: a correction the head
+        # only ever sees along one axis is a correction it cannot generalise,
+        # and the magnitude is the Euclidean residual in every direction.
+        magnitude = rng.choice(magnitudes)
+        direction = rng.choice(((1.0, 0.0), (-1.0, 0.0), (0.0, 1.0), (0.0, -1.0),
+                                (1.0, 1.0), (-1.0, -1.0), (1.0, -1.0), (-1.0, 1.0)))
+        norm = math.sqrt(direction[0] ** 2 + direction[1] ** 2)
+        offset = torch.tensor([direction[0] / norm * magnitude,
+                               direction[1] / norm * magnitude],
+                              device=gt_flow.device, dtype=gt_flow.dtype)
+        return gt_flow + offset.view(1, 2, 1, 1), "translation"
+    # Seeded from the same rng, so the whole choice stays a function of
+    # (seed, step) and a resumed run replays it exactly.
+    generator = torch.Generator(device=gt_flow.device).manual_seed(rng.randrange(2 ** 31))
+    blocks = torch.randn(1, 2, max(gt_flow.shape[-2] // 16, 1),
+                         max(gt_flow.shape[-1] // 16, 1),
+                         device=gt_flow.device, dtype=gt_flow.dtype, generator=generator)
+    smooth = blocks.repeat_interleave(16, dim=-2).repeat_interleave(16, dim=-1)
+    smooth = smooth[..., :gt_flow.shape[-2], :gt_flow.shape[-1]]
+    smooth = torch.nn.AvgPool2d(9, stride=1, padding=4)(smooth)
+    smooth = smooth / smooth.abs().amax().clamp_min(1e-6) * local_px
+    return gt_flow + smooth, "local"
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Real VTMOT single-frame coarse-to-fine registration")
     parser.add_argument("--config", default="res/configs/registration.yaml")
@@ -155,6 +221,26 @@ def main() -> None:
         sample_large_translation(large_translation, seed=int(train_config.seed), step=0)
         if int(large_translation.get("max_abs_px", 64)) >= min(crop_hw):
             raise ValueError("large_translation max_abs_px must be smaller than the crop")
+    init_flow_mix = train_config.get("init_flow_mix")
+    if init_flow_mix is not None:
+        if batch_size != 1:
+            raise ValueError("init_flow_mix requires batch-size=1")
+        # Validate the settings once here, so a typo fails at startup instead of
+        # on the first training step.
+        sample_init_flow(init_flow_mix, torch.zeros(1, 2, *crop_hw),
+                         seed=int(train_config.seed), step=0)
+        largest = max(float(value) for value in
+                      init_flow_mix.get("translation_px", (4.0, 8.0, 16.0)))
+        rounds = int(config.iterative_refinement.get("iterations", 3))
+        # The loop runs at 1/4 resolution, so one cell of its step bound is four
+        # input pixels.  A start further out than rounds * step cannot be reached
+        # within one run, which is worth saying out loud rather than assuming.
+        stride = crop_hw[0] / max(crop_hw[0] // 4, 1)
+        step_px = float(config.iterative_refinement.get("max_step_cells", 4.0)) * stride
+        if largest > step_px * rounds + 1e-6:
+            print(f"note: init_flow_mix samples up to {largest:.0f}px while "
+                  f"{rounds} rounds of {step_px:.0f}px cover {step_px * rounds:.0f}px; "
+                  f"the remainder is beyond one run's reach", flush=True)
     train_dataset = VTMOTSingleFrameDataset(
         args.data_root, split="train", split_file=args.split_file, target_hw=target_hw,
         crop_hw=crop_hw, random_crop=True, frame_stride=int(data_config.train_frame_stride),
@@ -212,6 +298,13 @@ def main() -> None:
                                if large_translation is not None else None)
         if saved_translation != current_translation:
             raise ValueError("resume large_translation settings differ from checkpoint")
+        # The starting-point mix is part of the experiment, so a resume must not
+        # silently switch it either.
+        saved_mix = checkpoint.get("config", {}).get("vtmot_train", {}).get("init_flow_mix")
+        current_mix = (OmegaConf.to_container(init_flow_mix, resolve=True)
+                       if init_flow_mix is not None else None)
+        if saved_mix != current_mix:
+            raise ValueError("resume init_flow_mix settings differ from checkpoint")
         model.load_state_dict(checkpoint["model"], strict=True)
         optimizer.load_state_dict(checkpoint["optimizer"])
         start_step = int(checkpoint["step"])
@@ -266,6 +359,8 @@ def main() -> None:
           f"freeze_fine_interaction={freeze_fine_interaction} "
           f"ir_adapter_only={ir_adapter_only} selection_metric={selection_metric} "
           f"large_translation={OmegaConf.to_container(large_translation, resolve=True) if large_translation is not None else None}")
+    print(f"init_flow_mix={OmegaConf.to_container(init_flow_mix, resolve=True) if init_flow_mix is not None else None} "
+          f"refine_proposal_weight={float(config.loss.weights.get('refine_proposal', 0.0))}")
     best_ratio = float("inf")
     if args.resume is not None:
         best_ratio = float(checkpoint.get("best_ratio", float("inf")))
@@ -322,9 +417,14 @@ def main() -> None:
                 ir, target, valid, gt_h = translate_moving_for_stress(
                     ir, target, valid, gt_h, extra_translation,
                     padding_mode=str(large_translation.get("padding_mode", "reflection")))
+        # A known, synthetic starting point for the 1/4 loop on some fraction of
+        # steps: only a start whose residual is known teaches the loop what to do
+        # about it, and only a start on the truth teaches it to stay put.
+        initial_flow, start_mode = sample_init_flow(init_flow_mix, target,
+                                                   seed=int(train_config.seed), step=step)
         optimizer.zero_grad(set_to_none=True)
         with torch.autocast(device_type=device.type, enabled=amp):
-            output = model(ir, vi)
+            output = model(ir, vi, init_flow=initial_flow)
             losses = loss_fn(aligned_ir=(output.final_aligned_ir if output.final_aligned_ir is not None
                                          else output.coarse_aligned_ir), visible=vi,
                              coarse_flow=output.coarse_flow, final_flow=output.final_flow,
@@ -353,7 +453,17 @@ def main() -> None:
                   "temperature": float(model.matcher.temperature.detach()),
                   "peak_mem_mib": (torch.cuda.max_memory_allocated() / 2 ** 20
                                    if device.type == "cuda" else 0.0),
-                  "affine": float(losses.affine.detach())}
+                  "affine": float(losses.affine.detach()),
+                  "refine": float(losses.refine.detach()) if losses.refine is not None else 0.0,
+                  "refine_proposal": (float(losses.refine_proposal.detach())
+                                      if losses.refine_proposal is not None else 0.0)}
+        if init_flow_mix is not None:
+            record["init_flow_mode"] = start_mode
+            if initial_flow is not None:
+                # How far the synthetic start sits from the truth, in pixels: the
+                # number the per-round losses have to walk back.
+                start_error = (initial_flow - target).abs().mean()
+                record["init_flow_error_px"] = float(start_error)
         if large_translation is not None:
             record["extra_translation_dy_dx"] = list(extra_translation or (0, 0))
             record["augmented_valid_fraction"] = float(valid.float().mean())
@@ -361,10 +471,15 @@ def main() -> None:
             print("step={step:5d} loss={train_loss:.5f} train_epe={train_epe:.3f} "
                   "match={match:.4f} appearance={appearance:.4f} "
                   "local={local:.4f} coarse_local={coarse_local:.4f} "
-                  "global_flow={global_flow:.4f} affine={affine:.4f}".format(**record))
+                  "global_flow={global_flow:.4f} affine={affine:.4f} "
+                  "refine={refine:.4f} refine_proposal={refine_proposal:.4f}"
+                  .format(**record))
             if large_translation is not None:
                 print(f"  train shift={record['extra_translation_dy_dx']} "
                       f"valid={record['augmented_valid_fraction']:.3f}")
+            if init_flow_mix is not None:
+                print(f"  init_flow={record['init_flow_mode']} "
+                      f"start_error_px={record.get('init_flow_error_px', 0.0):.2f}")
             # Localisation view of the same batch: does the correct key rank first?
             record.update(matching_diagnostics(output.match.matching_probability,
                                                tuple(output.match.coarse_flow.shape[-2:]),

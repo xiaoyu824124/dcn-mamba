@@ -187,6 +187,65 @@ def evaluate_refinement_gates(model, loader, device: torch.device, *,
     return _pooled(totals)
 
 
+def known_residual_offsets() -> tuple[tuple[str, tuple[float, float]], ...]:
+    """Known constant residuals to start the loop from: 4, 8 and 16 px along y,
+    x and both diagonals.
+
+    Sixteen pixels is the edge of what two rounds of an 8 px bound can walk back,
+    so the three magnitudes probe below, at and beyond one round's reach without
+    ever leaving the search window.  The sign symmetry of the sampler is checked
+    in its own unit test; here the four directions are what matters.
+    """
+    offsets = []
+    for magnitude in (4.0, 8.0, 16.0):
+        for name, (dy, dx) in (("y", (1.0, 0.0)), ("x", (0.0, 1.0)),
+                               ("d", (1.0, 1.0)), ("a", (1.0, -1.0))):
+            norm = math.hypot(dy, dx)
+            offsets.append((f"m{magnitude:.0f}{name}",
+                            (dy / norm * magnitude, dx / norm * magnitude)))
+    return tuple(offsets)
+
+
+def evaluate_known_residuals(model, loader, device: torch.device, *,
+                             moving_source: str = "ir",
+                             stress_translation: tuple[float, float] | None = None,
+                             offsets=None) -> Dict[str, float]:
+    """Start the loop from the truth plus a *known* offset and watch it walk back.
+
+    The offset varies frame by frame, so the whole grid costs one pass rather
+    than one pass per offset; each offset's numbers then come from a subset of
+    frames, which is enough to see whether a round moves the error down at all.
+    """
+    offsets = known_residual_offsets() if offsets is None else offsets
+    totals: Dict[str, list] = {}
+    model.eval()
+    for step, batch in enumerate(loader, start=1):
+        ir, vi, target, valid, _ = _batch_inputs(
+            batch, moving_source, stress_translation, device)
+        tag, (dy, dx) = offsets[(step - 1) % len(offsets)]
+        magnitude = math.hypot(dy, dx)
+        start = target + target.new_tensor((dy, dx)).view(1, 2, 1, 1)
+        with torch.no_grad():
+            output = model(ir, vi, init_flow=start)
+            if output.refinement is None:
+                raise ValueError("--diagnose-known-residual requires a refinement loop")
+            reports = refinement_losses(output.refinement, target, valid)
+            feature_hw = output.refinement.flows[0].shape[-2:]
+            stride_hw = (target.shape[-2] / feature_hw[0],
+                         target.shape[-1] / feature_hw[1])
+            count = float(valid.sum())
+            _pool(totals, "known_residual_start_px", magnitude, count)
+            _pool(totals, f"known_{tag}_start_px", magnitude, count)
+            for index, flow in enumerate(output.refinement.flows, start=1):
+                field = upsample_feature_flow(flow, target.shape[-2:], stride_hw)
+                reached = float(endpoint_error(field, target, valid))
+                _pool(totals, f"known_residual_round{index}_epe_px", reached, count)
+                _pool(totals, f"known_{tag}_round{index}_epe_px", reached, count)
+        if step % 20 == 0:
+            print(f"    {step} frames", flush=True)
+    return _pooled(totals)
+
+
 def _registration_status(report: Dict[str, float], moving_source: str
                          ) -> tuple[bool, bool, str]:
     """Keep same-modal warmup accuracy separate from IR--VI fusion readiness."""
@@ -259,7 +318,8 @@ def evaluate(model: torch.nn.Module, loader: DataLoader, device: torch.device,
              diagnose_motion: bool = False,
              stress_translation: tuple[float, float] | None = None,
              moving_source: str = "ir",
-             gate_specs=None) -> Dict[str, float]:
+             gate_specs=None,
+             diagnose_known_residual: bool = False) -> Dict[str, float]:
     total_epe = total_coarse_epe = total_global_epe = total_baseline = total_valid = total_samples = 0.0
     total_corner_epe = total_cycle_epe = 0.0
     hit_sums = {f"pck_{threshold}px": 0.0 for threshold in (1, 3, 5)}
@@ -603,6 +663,12 @@ def evaluate(model: torch.nn.Module, loader: DataLoader, device: torch.device,
                 gates[f"gate_{name}_relative_epe"] = (
                     gates[key] / max(report["zero_flow_epe_px"], 1e-8))
         report.update(gates)
+    if diagnose_known_residual:
+        # One pass with the offset cycling per frame: what the loop does when the
+        # residual is known, which is the only setting where "correct" is defined.
+        report.update(evaluate_known_residuals(
+            model, loader, device, moving_source=moving_source,
+            stress_translation=stress_translation))
     if diagnose_motion:
         report.update(summarize_motion_frames(motion_rows))
     if stress_translation is not None:
@@ -629,6 +695,9 @@ def main() -> None:
     parser.add_argument("--gate-specs", default=None, metavar="NAMES",
                         help="comma-separated subset of raw,zero,scale0.25,scale0.5,"
                              "scale0.75,thr0.3,thr0.5,thr0.7 for the gate sweep")
+    parser.add_argument("--diagnose-known-residual", action="store_true",
+                        help="start the loop from the truth plus a known 4/8/16 px "
+                             "offset along four directions, one pass")
     parser.add_argument("--diagnose-local-centre", action="store_true",
                         help="re-run the 1/4 search with the ground truth as the window centre, "
                              "separating 1/4 feature discriminability from coarse-field error "
@@ -717,7 +786,8 @@ def main() -> None:
                           stress_translation=(tuple(args.stress_translation)
                                               if args.stress_translation is not None else None),
                           moving_source=args.moving_source,
-                          gate_specs=_select_gate_specs(args.gate_specs))
+                          gate_specs=_select_gate_specs(args.gate_specs),
+                          diagnose_known_residual=args.diagnose_known_residual)
         report["moving_source"] = args.moving_source
         if args.overlay:
             report["evaluation_overlays"] = [str(path) for path in args.overlay]

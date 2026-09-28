@@ -37,6 +37,7 @@ class RegistrationLossOutput:
     refine: torch.Tensor | None = None
     refine_match: torch.Tensor | None = None
     refine_confidence: torch.Tensor | None = None
+    refine_proposal: torch.Tensor | None = None
 
     def as_dict(self) -> Dict[str, torch.Tensor]:
         return {"loss": self.total, "loss_flow": self.flow, "loss_mind": self.mind,
@@ -48,7 +49,8 @@ class RegistrationLossOutput:
                 "loss_coarse_local": self.coarse_local,
                 "loss_refine": self.refine,
                 "loss_refine_match": self.refine_match,
-                "loss_refine_confidence": self.refine_confidence}
+                "loss_refine_confidence": self.refine_confidence,
+                "loss_refine_proposal": self.refine_proposal}
 
 
 class RegistrationLoss(nn.Module):
@@ -89,7 +91,8 @@ class RegistrationLoss(nn.Module):
         self.weights["local"] = float(weights.get("local", 0.0))
         self.weights["appearance"] = float(weights.get("appearance", 0.0))
         for name in ("coarse_flow", "global_flow", "coarse_local", "refine",
-                     "refine_match", "refine_confidence", "refine_smooth"):
+                     "refine_match", "refine_confidence", "refine_smooth",
+                     "refine_proposal"):
             self.weights[name] = float(weights.get(name, 0.0))
         if self.weights["appearance"] < 0:
             raise ValueError("appearance weight must be non-negative")
@@ -234,10 +237,11 @@ class RegistrationLoss(nn.Module):
         # correction.  The confidence target is the ground-truth judgement of
         # whether that round actually reduced the error (see refinement_losses).
         loss_refine = loss_refine_match = loss_refine_confidence = zero
-        loss_refine_smooth = zero
+        loss_refine_smooth = loss_refine_proposal = zero
         if refinement is not None and gt_flow is not None and (
                 self.weights["refine"] or self.weights["refine_match"]
-                or self.weights["refine_confidence"] or self.weights["refine_smooth"]):
+                or self.weights["refine_confidence"] or self.weights["refine_smooth"]
+                or self.weights["refine_proposal"]):
             reports = refinement_losses(
                 refinement, gt_flow, valid_mask,
                 smoothness_weight=self.weights["refine_smooth"],
@@ -246,6 +250,8 @@ class RegistrationLoss(nn.Module):
             loss_refine_match = sum(reports["match"]) / len(reports["match"])
             loss_refine_confidence = (sum(reports["confidence"])
                                       / len(reports["confidence"]))
+            loss_refine_proposal = (sum(reports["proposal"])
+                                    / len(reports["proposal"]))
             if reports["smooth"]:
                 loss_refine_smooth = sum(reports["smooth"]) / len(reports["smooth"])
         total = (self.weights["flow"] * loss_flow
@@ -262,9 +268,10 @@ class RegistrationLoss(nn.Module):
                  + self.weights["refine"] * loss_refine
                  + self.weights["refine_match"] * loss_refine_match
                  + self.weights["refine_confidence"] * loss_refine_confidence
-                 + self.weights["refine_smooth"] * loss_refine_smooth)
+                 + self.weights["refine_smooth"] * loss_refine_smooth
+                 + self.weights["refine_proposal"] * loss_refine_proposal)
         return RegistrationLossOutput(total, loss_flow, loss_mind, loss_edge, loss_smooth,
                                       loss_affine, loss_match, loss_local, loss_appearance,
                                       loss_coarse_flow, loss_global_flow,
                                       loss_coarse_local, loss_refine, loss_refine_match,
-                                      loss_refine_confidence)
+                                      loss_refine_confidence, loss_refine_proposal)
