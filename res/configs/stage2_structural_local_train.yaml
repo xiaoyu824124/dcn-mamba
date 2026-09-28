@@ -1,0 +1,53 @@
+# Step 3 of the structural-prior route: train the 1/4 shared projection against
+# the frozen 600-step coarse field.
+#
+# Merge this on top of the *same* stack that produced the frozen field:
+#   --config res/configs/registration.yaml
+#   --overlay res/configs/stage0_structural_prior.yaml
+#   --overlay res/configs/ab_spatial_prior32.yaml
+#   --overlay res/configs/stage2_structural_local_train.yaml
+# train_vtmot builds the model from these files only, not from the checkpoint's
+# saved config, so leaving out ab_spatial_prior32.yaml would silently train
+# against a coarse field that is not the one that was measured.
+#
+# Why freezing the whole encoder is necessary: the shared pyramid is sequential
+# (1/2 -> 1/4 -> 1/8), so every gradient that reaches stage_4 also reaches
+# stage_2 and the shallow adapters, and stage_8 consumes stage_4's output.
+# freeze_coarse therefore holds the encoder, the SA-CA transformer and the global
+# matcher fixed, which leaves fine_interaction as the only trainable module: a
+# 1x1 shared 1/4 projection, a 1/8 top-down context projection and their fusion,
+# all behind a zero-initialised residual gain (so warm start reproduces the
+# encoder's 1/4 features exactly).
+#
+# freeze_local_refinement holds the residual head at zero, so the final field is
+# still the coarse field and every reported local_* number isolates the candidate
+# distribution rather than a learned correction.
+#
+# radius 4 (81 candidates, +/-16 px) instead of 8: the step-1 measurement put the
+# truth-centred argmax at 25.06 px against a 25.98 px random floor, i.e. no skill
+# at all, so a wider window only multiplies fruitless candidates -- and
+# global_window2_coverage was already 1.0 at +/-16 px.  Widen it again once the
+# truth-centred argmax falls clearly below the floor.
+#
+# The flow, edge and smoothness terms are constant here (the coarse field is
+# frozen and the head is held at zero), so ``local`` is the only loss that
+# produces a gradient.  Judge this stage by truthcentre_local_argmax_epe_px and
+# local_oracle_epe_px on the same 80 frames, never by the value of the total loss.
+local_matcher:
+  enabled: true
+  radius: 4
+  temperature: 0.07
+  candidate_chunk: 9
+  refinement_channels: 32
+
+fine_interaction:
+  enabled: true
+
+loss:
+  weights:
+    local: 1.0
+
+vtmot_train:
+  freeze_coarse: true
+  freeze_local_refinement: true
+  lr: 1.0e-4

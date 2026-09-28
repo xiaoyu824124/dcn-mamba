@@ -162,6 +162,61 @@ class StructuralLocalWiringTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "different shape"):
             load_registration_state(model, resized)
 
+    def test_step3_overlay_trains_only_the_fine_interaction(self):
+        from res.local_matcher import local_matching_loss
+        from res.train_vtmot import (freeze_coarse_parameters,
+                                     freeze_local_refinement_parameters)
+        config = OmegaConf.merge(
+            OmegaConf.load("res/configs/registration.yaml"),
+            OmegaConf.load("res/configs/stage0_structural_prior.yaml"),
+            OmegaConf.load("res/configs/ab_spatial_prior32.yaml"),
+            OmegaConf.load("res/configs/stage2_structural_local_train.yaml"))
+        config.structural_prior.base_channels = 8
+        config.structural_prior.out_channels = 16
+        config.structural_prior.blocks_per_scale = 1
+        config.coarse_transformer.num_layers = 1
+        config.global_matcher.max_tokens = 80
+        model = build_global_registration(config)
+        # The spatial prior is part of the stack that produced the frozen field;
+        # train_vtmot builds from these files and not from the checkpoint config,
+        # so dropping this overlay would silently change the coarse field.
+        self.assertEqual(model.matcher.spatial_prior_sigma, 4.0)
+        self.assertEqual(model.local_matcher.radius, 4)
+
+        freeze_coarse_parameters(model)
+        freeze_local_refinement_parameters(model)
+        trainable = sorted(name for name, parameter in model.named_parameters()
+                           if parameter.requires_grad)
+        self.assertTrue(trainable)
+        self.assertTrue(all(name.startswith("fine_interaction.") for name in trainable),
+                        trainable)
+        self.assertFalse(any(parameter.requires_grad
+                             for parameter in model.local_matcher.refinement.parameters()))
+
+        ir, vi = torch.rand(1, 1, 64, 80), torch.rand(1, 3, 64, 80)
+        target, valid = torch.zeros(1, 2, 64, 80), torch.ones(1, 1, 64, 80)
+        output = model(ir, vi)
+        local_matching_loss(output.local_match, target, valid).backward()
+        parameters = dict(model.named_parameters())
+        self.assertGreater(float(parameters["fine_interaction.gain"].grad.abs()), 0.0)
+        # The residual gain starts at zero, so gain * fused has zero gradient with
+        # respect to the projections: only the gain moves on the first steps.  A
+        # short trial therefore trains the projections only after the gain has
+        # grown, which is why the stage is judged on localisation diagnostics
+        # rather than on the loss, and why raising the initial gain is worth
+        # considering before extending the run.
+        for name, parameter in parameters.items():
+            if name.startswith("fine_interaction.") and not name.endswith("gain"):
+                self.assertEqual(float(parameter.grad.abs().sum()), 0.0, name)
+        self.assertIsNone(model.encoder.shared.stage_8[0][0].weight.grad)
+        # Once the gain is non-zero the projections do receive gradient.
+        model.zero_grad(set_to_none=True)
+        with torch.no_grad():
+            model.fine_interaction.gain.fill_(0.1)
+        local_matching_loss(model(ir, vi).local_match, target, valid).backward()
+        self.assertGreater(
+            float(model.fine_interaction.fine_projection.weight.grad.abs().sum()), 0.0)
+
     def test_evaluator_reports_truth_centred_local_diagnostics(self):
         torch.manual_seed(8)
         model = build_global_registration(structural_config(local_enabled=True))
