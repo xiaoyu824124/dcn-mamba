@@ -42,6 +42,15 @@ local_matcher:
 
 fine_interaction:
   enabled: true
+  # A zero residual gain would block the very thing this stage trains: gain *
+  # fused has zero derivative with respect to the projections while the gain is
+  # zero, so a 300-step run that measured local NLL stuck at ln(81) = 4.3944 (a
+  # uniform distribution over the 81 candidates) with every validation metric
+  # frozen had in fact only nudged the scalar.  Starting at 0.1 gives all of the
+  # module's parameters gradient from the first step; the module's default of 0.0
+  # is unchanged, so the frozen-coarse diagnostic stage still reproduces the
+  # encoder's 1/4 features exactly at warm start.
+  gain_init: 0.1
 
 loss:
   weights:

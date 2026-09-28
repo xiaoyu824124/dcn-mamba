@@ -15,16 +15,26 @@ class FineScaleInteraction(nn.Module):
     The same projections and fusion weights process IR and VI. A zero-initialized
     residual gain preserves an existing checkpoint's local matcher predictions
     exactly at warm start; the module learns only when fine-stage training helps.
+
+    The gain also *gates the gradient*: ``gain * fused`` has zero derivative with
+    respect to every projection while the gain is zero, so a stage that trains
+    only this module would move the scalar alone.  ``gain_init`` exists for that
+    case -- the 1/4 training stage starts from a small non-zero gain so all of its
+    parameters receive gradient from the first step, while the default of zero
+    keeps the warm-start property for inference and for the frozen-coarse stage.
     """
 
     def __init__(self, channels_4: int, channels_8: int,
-                 hidden_channels: int | None = None) -> None:
+                 hidden_channels: int | None = None,
+                 gain_init: float = 0.0) -> None:
         super().__init__()
         if channels_4 < 1 or channels_8 < 1:
             raise ValueError("feature channels must be positive")
         hidden = channels_4 if hidden_channels is None else int(hidden_channels)
         if hidden < 1:
             raise ValueError("hidden_channels must be positive")
+        if not math.isfinite(float(gain_init)):
+            raise ValueError("gain_init must be finite")
         self.channels_4 = int(channels_4)
         self.channels_8 = int(channels_8)
         self.fine_projection = nn.Conv2d(channels_4, hidden, 1, bias=False)
@@ -35,7 +45,7 @@ class FineScaleInteraction(nn.Module):
             nn.LeakyReLU(0.1, inplace=True),
             nn.Conv2d(hidden, channels_4, 1),
         )
-        self.gain = nn.Parameter(torch.zeros(()))
+        self.gain = nn.Parameter(torch.tensor(float(gain_init)))
 
     def _adapt(self, fine: torch.Tensor, coarse: torch.Tensor) -> torch.Tensor:
         coarse_up = F.interpolate(coarse, size=fine.shape[-2:],
