@@ -130,12 +130,18 @@ def main() -> None:
         if not matches:
             print("  no checkpoint here shares its frozen coarse stage, so the "
                   "warm start came from outside --root")
-        for row in matches:
-            mark = "  <- WARM START" if row["is_warm_start"] else ""
-            print(f"  {row['path']} step={row['step']} loop={row['loop']} "
-                  f"xattn={row['cross_attention']} "
-                  f"final_val_epe={row['final_epe']} "
-                  f"recorded_init={row['init']}{mark}")
+        # best.pt and last.pt of one run share its metrics.jsonl, so the
+        # comparison identifies the run, never which file of it was used.
+        for parent in dict.fromkeys(row["path"].rsplit("\\", 1)[0].rsplit("/", 1)[0]
+                                    for row in matches):
+            rows = [row for row in matches
+                    if row["path"].rsplit("\\", 1)[0].rsplit("/", 1)[0] == parent]
+            files = ", ".join(Path(row["path"]).name for row in rows)
+            mark = "  <- WARM START RUN" if any(row["is_warm_start"] for row in rows) else ""
+            print(f"  {parent} step={[row['step'] for row in rows]} "
+                  f"loop={rows[0]['loop']} xattn={rows[0]['cross_attention']} "
+                  f"final_val_epe={rows[0]['final_epe']} "
+                  f"recorded_init={rows[0]['init']} files=[{files}]{mark}")
         return
     for path in candidates(args.root):
         row = describe(path)
