@@ -20,7 +20,7 @@ OVERLAYS = ("res/configs/stage0_structural_prior.yaml",
 
 def _settings(**overrides):
     base = {"probability": 1.0, "truth_weight": 0.4,
-            "translation_px": [4.0, 8.0, 16.0], "local_px": 8.0}
+            "translation_px": [3.0, 6.0, 10.0], "local_px": 8.0}
     return OmegaConf.create({**base, **overrides})
 
 
@@ -35,8 +35,9 @@ class InitFlowMixTest(unittest.TestCase):
         # Only the two intended knobs may differ.
         self.assertIsNone(r2.vtmot_train.get("init_flow_mix"))
         self.assertEqual(mixed.vtmot_train.init_flow_mix.probability, 0.75)
+        # Sized from the natural residual (median 6.857 px, p90 10.224 px).
         self.assertEqual(list(mixed.vtmot_train.init_flow_mix.translation_px),
-                         [4.0, 8.0, 16.0])
+                         [3.0, 6.0, 10.0])
         self.assertEqual(float(r2.loss.weights.get("refine_proposal", 0.0)), 0.0)
         # The proposal term is off in this run: mixed starts are the only change,
         # so the r2 loss stands as the control.
@@ -82,7 +83,7 @@ class InitFlowMixTest(unittest.TestCase):
         self.assertEqual(mode, "translation")
         self.assertEqual(float(field.max() - field.min()), 0.0)
         magnitudes = {round((dy ** 2 + dx ** 2) ** 0.5, 3) for dy, dx in offsets}
-        self.assertEqual(magnitudes, {4.0, 8.0, 16.0})
+        self.assertEqual(magnitudes, {3.0, 6.0, 10.0})
         for axis, sign in ((0, 1), (0, -1), (1, 1), (1, -1)):
             self.assertTrue(any(
                 (offset[axis] > 0) == (sign > 0) and abs(offset[1 - axis]) < 1e-6

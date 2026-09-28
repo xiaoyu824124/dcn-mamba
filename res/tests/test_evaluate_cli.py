@@ -129,10 +129,14 @@ class EvaluateCliTest(unittest.TestCase):
         self.assertAlmostEqual(report["known_residual_start_px"], (4.0 + 4.0) / 2, places=6)
         for index in (1, 2):
             self.assertIn(f"known_residual_round{index}_epe_px", report)
-            self.assertIn(f"known_m4y_round{index}_epe_px", report)
-            self.assertIn(f"known_m4x_round{index}_epe_px", report)
-        self.assertAlmostEqual(report["known_m4y_start_px"], 4.0, places=6)
-        self.assertAlmostEqual(report["known_m4x_start_px"], 4.0, places=6)
+            # Both signs of the first magnitude, and the pooled row that does not
+            # depend on which frames a tag happened to land on.
+            self.assertIn(f"known_m4yp_round{index}_epe_px", report)
+            self.assertIn(f"known_m4yn_round{index}_epe_px", report)
+            self.assertIn(f"known_m4_round{index}_epe_px", report)
+        self.assertAlmostEqual(report["known_m4yp_start_px"], 4.0, places=6)
+        self.assertAlmostEqual(report["known_m4yn_start_px"], 4.0, places=6)
+        self.assertAlmostEqual(report["known_m4_start_px"], 4.0, places=6)
 
 
 if __name__ == "__main__":

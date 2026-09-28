@@ -25,21 +25,27 @@
 # original loss stands as the control: the start distribution is the only change.
 #
 # Reach: the loop runs at 1/4 and its step bound is 2 cells = 8 px per round, so
-# two rounds can walk back at most 16 px.  A 16 px sample therefore needs both
+# two rounds can walk back at most 16 px.  A 10 px sample therefore needs both
 # rounds, and the acceptance test asks for a monotone decrease rather than a
 # single-round fix.  Starting outside the search window means there is no
 # directly correct candidate there; the r2 coverage did grow between rounds
 # (0.32 -> 0.39 on +48), so some of it can be walked in rather than being out of
-# reach.  Starts beyond 16 px are still not sampled: they belong to the coarse
-# stage, not to two rounds of an 8 px bound.
+# reach.  What this run is *not* asked to do is fix a 48 px displacement: on the
+# natural set the residual is inside the window for 99.4% of pixels, and the two
+# open questions are how to get below 6.55 px on ordinary input and how to stay
+# put when the start is already right.
 #
-# Acceptance is checked on the trained checkpoint and needs both halves, because
-# either one alone is passable by a degenerate model: a loop that never updates
-# looks perfect from the truth and fixes no known offset, and a loop that always
-# slams the full step fixes offsets while drifting off a correct start.
+# Acceptance is checked on the trained checkpoint and needs all four of these,
+# because any one alone is passable by a degenerate model: a loop that never
+# updates looks perfect from the truth and fixes no known offset, and a loop
+# that always slams the full step fixes offsets while drifting off a correct
+# start.  The +-48 px sets are no longer part of the routine; their measured
+# numbers stay as a capability boundary.
 #
-#   python -m res.evaluate_vtmot --diagnose-local-centre   truth start, per round
-#   python -m res.evaluate_vtmot --diagnose-known-residual known +4/8/16 px, per round
+#   natural, every round       res.evaluate_vtmot                       (headline)
+#   truth start                res.evaluate_vtmot --diagnose-local-centre
+#   +-4 / +-8 / +-16 px        res.evaluate_vtmot --diagnose-known-residual
+#   +-48 px                    retired as a routine test
 #
 # Merge for training (evaluation rebuilds the base config from the checkpoint):
 #   --config res/configs/registration.yaml
@@ -97,6 +103,11 @@ vtmot_train:
     probability: 0.75
     # Truth first: the case the loop currently fails outright.
     truth_weight: 0.4
-    # Magnitudes at, below and at the edge of what two 8 px rounds can reach.
-    translation_px: [4.0, 8.0, 16.0]
+    # Sized from the natural set's own coarse error, not from the stress sets:
+    # median 6.857 px, p90 10.224 px, window coverage 99.4%.  So 3/6/10 px span
+    # just under the median to just past the p90, and 10 px needs both rounds of
+    # an 8 px bound -- the case that has to decrease over rounds rather than in
+    # one.  +-48 px is not sampled: it is a recorded capability boundary, and a
+    # start that far out is the coarse stage's problem, not two rounds'.
+    translation_px: [3.0, 6.0, 10.0]
     local_px: 8.0

@@ -188,21 +188,23 @@ def evaluate_refinement_gates(model, loader, device: torch.device, *,
 
 
 def known_residual_offsets() -> tuple[tuple[str, tuple[float, float]], ...]:
-    """Known constant residuals to start the loop from: 4, 8 and 16 px along y,
-    x and both diagonals.
+    """Known constant residuals: 4, 8 and 16 px along eight signed directions.
 
-    Sixteen pixels is the edge of what two rounds of an 8 px bound can walk back,
-    so the three magnitudes probe below, at and beyond one round's reach without
-    ever leaving the search window.  The sign symmetry of the sampler is checked
-    in its own unit test; here the four directions are what matters.
+    Sized against the natural set's own coarse error -- median 6.857 px, p90
+    10.224 px, window coverage 99.4% -- so 4 px sits below the median, 8 px
+    around it and 16 px beyond the p90 while still inside the search window.
+    Both signs are probed: the natural residual is not one-signed, and a head
+    that only ever sees one direction is a head that cannot generalise.
     """
     offsets = []
     for magnitude in (4.0, 8.0, 16.0):
         for name, (dy, dx) in (("y", (1.0, 0.0)), ("x", (0.0, 1.0)),
                                ("d", (1.0, 1.0)), ("a", (1.0, -1.0))):
             norm = math.hypot(dy, dx)
-            offsets.append((f"m{magnitude:.0f}{name}",
-                            (dy / norm * magnitude, dx / norm * magnitude)))
+            for sign, suffix in ((1.0, "p"), (-1.0, "n")):
+                offsets.append((f"m{magnitude:.0f}{name}{suffix}",
+                                (sign * dy / norm * magnitude,
+                                 sign * dx / norm * magnitude)))
     return tuple(offsets)
 
 
@@ -236,11 +238,16 @@ def evaluate_known_residuals(model, loader, device: torch.device, *,
             count = float(valid.sum())
             _pool(totals, "known_residual_start_px", magnitude, count)
             _pool(totals, f"known_{tag}_start_px", magnitude, count)
+            # One pooled row per magnitude as well, so a magnitude's verdict does
+            # not rest on the three or four frames a single tag happens to get.
+            _pool(totals, f"known_m{magnitude:.0f}_start_px", magnitude, count)
             for index, flow in enumerate(output.refinement.flows, start=1):
                 field = upsample_feature_flow(flow, target.shape[-2:], stride_hw)
                 reached = float(endpoint_error(field, target, valid))
                 _pool(totals, f"known_residual_round{index}_epe_px", reached, count)
                 _pool(totals, f"known_{tag}_round{index}_epe_px", reached, count)
+                _pool(totals, f"known_m{magnitude:.0f}_round{index}_epe_px",
+                      reached, count)
         if step % 20 == 0:
             print(f"    {step} frames", flush=True)
     return _pooled(totals)
