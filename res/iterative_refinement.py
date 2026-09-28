@@ -37,6 +37,7 @@ Design decisions that matter, all of them deliberate:
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Callable
 
 import torch
 import torch.nn as nn
@@ -143,7 +144,9 @@ class DiscrepancyGuidedRefinement(nn.Module):
         return samples.reshape(batch, channels, height, width, count)
 
     def forward(self, feature_ir: torch.Tensor, feature_vi: torch.Tensor,
-                coarse_flow: torch.Tensor) -> IterativeRefinementOutput:
+                coarse_flow: torch.Tensor,
+                applied_gate: Callable[[torch.Tensor], torch.Tensor] | None = None
+                ) -> IterativeRefinementOutput:
         if feature_ir.ndim != 4 or feature_ir.shape != feature_vi.shape:
             raise ValueError("IR and VI 1/4 features must have equal [B,C,H,W] shapes")
         batch, _, height, width = feature_ir.shape
@@ -208,7 +211,13 @@ class DiscrepancyGuidedRefinement(nn.Module):
             delta = self.max_step_cells * torch.tanh(
                 raw_update / self.max_step_cells)
             confidence = torch.sigmoid(self.confidence(update_input))
-            applied = confidence * delta
+            # A gate is a diagnosis hook, not a parameter: it reweights the
+            # field a round applies while leaving the head's own recurrence
+            # (``confidence_previous``) and the search centre untouched, so a
+            # re-run with a gate is a genuine re-run and not a re-weighting of
+            # the cached corrections.  ``None`` reproduces the raw behaviour.
+            weight = confidence if applied_gate is None else applied_gate(confidence)
+            applied = weight * delta
             flow = flow + applied
             flows.append(flow)
             residuals.append(delta)
@@ -262,6 +271,12 @@ def refinement_losses(output: IterativeRefinementOutput, gt_flow: torch.Tensor,
         # and its alignment with the required mean may be pooled.
         "applied_mean_norm": [], "applied_std": [],
         "required_mean_norm": [], "applied_mean_alignment": [],
+        # Per-pixel, detached, at feature resolution: the two regions a round
+        # works on, the gain it delivered, and the confidence it used, so the
+        # evaluator can compare rounds on one fixed region and ask whether the
+        # confidence separates beneficial corrections from harmful ones.  They
+        # are detached so a training step does not retain the graph twice.
+        "covered": [], "query": [], "benefit": [], "confidence_pixel": [],
     }
     for index, flow in enumerate(output.flows):
         before = (flow - output.applied[index]).detach()
@@ -288,6 +303,10 @@ def refinement_losses(output: IterativeRefinementOutput, gt_flow: torch.Tensor,
         reports["confidence_target"].append(masked_mean(improved, active))
         reports["improved_fraction"].append(masked_mean(
             ((error_after < error_before) & covered).to(flow.dtype), active))
+        reports["covered"].append(covered.detach())
+        reports["query"].append(query.detach())
+        reports["benefit"].append((error_before - error_after).detach())
+        reports["confidence_pixel"].append(confidence.detach())
         # What this round actually applied, over the valid region, per frame.
         # ``required`` is the correction that would land exactly on the target,
         # i.e. the search residual the window was centred on.

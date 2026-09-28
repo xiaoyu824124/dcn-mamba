@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import math
+from typing import Callable
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -376,6 +377,7 @@ class StructuralPriorRegistration(nn.Module):
     def forward(self, ir: torch.Tensor, vi: torch.Tensor, *,
                 init_flow: torch.Tensor | None = None,
                 local_centre: torch.Tensor | None = None,
+                refinement_gate: Callable[[torch.Tensor], torch.Tensor] | None = None,
                 return_features: bool = False) -> CoarseRegistrationOutput:
         """``init_flow`` is where the 1/4 stage starts.
 
@@ -385,6 +387,10 @@ class StructuralPriorRegistration(nn.Module):
         still reported, so the propagated start can be compared against it.
         ``local_centre`` is the older name for the same thing, kept because the
         truth-centred diagnostic uses it.
+
+        ``refinement_gate`` reweights the field each refinement round applies,
+        for the confidence-gate sweep; the loop is genuinely re-run, so a later
+        round starts from the gated field rather than from a filtered cache.
         """
         MINDGlobalRegistration._validate_inputs(ir, vi)
         if init_flow is not None and local_centre is not None:
@@ -432,7 +438,8 @@ class StructuralPriorRegistration(nn.Module):
                 # The loop is an alternative to the single-shot matcher, not an
                 # addition: both start from the same 1/4 features and the same
                 # coarse centre, so their round-by-round results are comparable.
-                refinement = self.iterative_refinement(fine_ir, fine_vi, centre_4)
+                refinement = self.iterative_refinement(
+                    fine_ir, fine_vi, centre_4, applied_gate=refinement_gate)
                 refined_4 = refinement.flows[-1]
             final_flow = upsample_feature_flow(refined_4, (height, width),
                                                (height / feature_hw[0],

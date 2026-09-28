@@ -13,9 +13,22 @@
 # natural, 21.83 -> 7.20 stress) while the error does not follow.  That term's
 # gradient is p - w against a sigma=0.75 soft target, so it pushes the candidate
 # distribution toward a broader calibration rather than toward a sharper peak; at
-# weight 1.0 it steers the later rounds.  Note also that refine_round*_epe_px is
-# averaged over covered queries only, so on the stress set it is not comparable
-# with coarse_epe_px, which covers every valid pixel.
+# weight 1.0 it steers the later rounds.
+#
+# Read every round together with its region, which the evaluator now reports:
+#
+#   refine_round{r}_coverage           share of valid pixels inside the window
+#   refine_round{r}_epe_allvalid_px    whole valid region (compare with coarse)
+#   refine_round{r}_epe_covered_px     inside the window only
+#   refine_round{r}_epe_outside_px     beyond the window, where no update can land
+#   refine_round{r}_epe_noupdate_px    the field this round started from
+#   refine_round{r}_epe_common_px      one fixed subset, covered at every round
+#   refine_round{r}_confidence_auc     P(a helped pixel outranks a hurt one)
+#   refine_round{r}_confidence_auc_above_half   share of frames that clear 0.5
+#   refine_round{r}_confidence_beneficial/_harmful, ..._gain_*_px
+#
+# `refine_round*_epe_px` is the older covered-only figure and is NOT comparable
+# with coarse_epe_px: on the stress set the window holds a small, easy subset.
 #
 # For training, merge on top of the same stack as before:
 #   --config res/configs/registration.yaml

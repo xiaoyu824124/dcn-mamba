@@ -6,7 +6,7 @@ import argparse
 import json
 import math
 from pathlib import Path
-from typing import Dict
+from typing import Callable, Dict
 
 import torch
 import torch.nn.functional as F
@@ -33,6 +33,156 @@ def _threshold_hits(predicted: torch.Tensor, target: torch.Tensor, valid: torch.
     denominator = valid.sum().clamp_min(1)
     return {f"pck_{threshold}px": float(((error <= threshold) * valid).sum() / denominator)
             for threshold in (1, 3, 5)}
+
+
+def _pool(store: Dict[str, list], name: str, value: float, count: float) -> None:
+    """Accumulate a masked mean together with its weight.
+
+    Pooling by pixel rather than by frame matters here: the refinement rounds
+    cover different fractions of a frame, and a per-frame mean of per-frame
+    means would weight a 2%-covered round the same as a fully covered one.
+    """
+    if count <= 0:
+        return
+    total = store.setdefault(name, [0.0, 0.0])
+    total[0] += float(value) * count
+    total[1] += count
+
+
+def _pooled(store: Dict[str, list]) -> Dict[str, float]:
+    return {name: total / max(count, 1.0) for name, (total, count) in store.items()}
+
+
+def _ranking_auc(scores: torch.Tensor, positive: torch.Tensor) -> float:
+    """P(a positive pixel scores above a negative one), ties counted at chance.
+
+    A mean confidence says nothing about whether the confidence can tell a
+    correction that helps from one that hurts, which is what a gate needs; the
+    rank statistic is the acceptance test for that.
+    """
+    scores = scores.reshape(-1).to(torch.float64)
+    positive = positive.reshape(-1)
+    if scores.numel() != positive.numel():
+        raise ValueError("scores and positive must have the same element count")
+    n_pos = int(positive.sum())
+    n_neg = int(scores.numel()) - n_pos
+    if n_pos == 0 or n_neg == 0:
+        return 0.5                       # one class missing: no evidence either way
+    order = torch.argsort(scores)
+    _, inverse, counts = torch.unique(scores[order], return_inverse=True,
+                                      return_counts=True)
+    starts = torch.cumsum(counts, dim=0) - counts
+    midrank = starts.to(torch.float64) + (counts.to(torch.float64) + 1.0) / 2.0
+    ranks = torch.empty(scores.numel(), dtype=torch.float64)
+    ranks[order] = midrank[inverse]
+    return float((ranks[positive].sum() - n_pos * (n_pos + 1) / 2.0) / (n_pos * n_neg))
+
+
+def _round_regions(reports: Dict[str, list], index: int, valid: torch.Tensor,
+                   size: tuple[int, int]) -> tuple[torch.Tensor, torch.Tensor]:
+    """Full-resolution covered and valid-query masks for one refinement round.
+
+    The masks live at feature resolution; nearest upsampling keeps the region
+    exactly the set of pixels whose own cell was in the window, so the numbers
+    stay comparable with the full-resolution ``epe_px``.
+    """
+    def upsample(mask: torch.Tensor) -> torch.Tensor:
+        nearest = F.interpolate(mask.unsqueeze(1).to(torch.float32), size=size,
+                                mode="nearest")
+        return (nearest > 0.5).to(valid.dtype)
+    covered = upsample(reports["covered"][index]) * valid
+    return covered, upsample(reports["query"][index]) * valid
+
+
+def refinement_gate_specs() -> tuple[tuple[str, Callable[[torch.Tensor], torch.Tensor]], ...]:
+    """The confidence gates the diagnostic compares, raw included.
+
+    ``raw`` must reproduce the ungated run exactly, so it doubles as a check
+    that the hook is inert when no gate is asked for.
+    """
+    def threshold(value: float) -> Callable[[torch.Tensor], torch.Tensor]:
+        return lambda confidence: confidence * (confidence >= value)
+    return (("raw", lambda confidence: confidence),
+            ("zero", lambda confidence: torch.zeros_like(confidence)),
+            ("scale0.25", lambda confidence: confidence * 0.25),
+            ("scale0.5", lambda confidence: confidence * 0.5),
+            ("scale0.75", lambda confidence: confidence * 0.75),
+            ("thr0.3", threshold(0.3)),
+            ("thr0.5", threshold(0.5)),
+            ("thr0.7", threshold(0.7)))
+
+
+def _select_gate_specs(names: str | None):
+    """Restrict the gate sweep to the named specs, in their canonical order.
+
+    The full sweep re-runs the whole loop eight times, so the selector exists to
+    keep an iteration short; the names are validated rather than ignored.
+    """
+    if not names:
+        return None
+    known = {name: spec for name, spec in refinement_gate_specs()}
+    requested = [part.strip() for part in names.split(",") if part.strip()]
+    unknown = [part for part in requested if part not in known]
+    if unknown:
+        raise ValueError(f"unknown gate specs {unknown}; known: {sorted(known)}")
+    return tuple((name, known[name]) for name in requested)
+
+
+def _batch_inputs(batch: Dict, moving_source: str,
+                  stress_translation: tuple[float, float] | None,
+                  device: torch.device):
+    ir = registration_moving_image(batch, moving_source).to(device)
+    vi = batch["vi"].to(device)
+    target, valid = batch["gt_flow"].to(device), batch["valid_mask"].to(device)
+    gt_h = batch["gt_h"].to(device)
+    if stress_translation is not None:
+        ir, target, valid, gt_h = translate_moving_for_stress(
+            ir, target, valid, gt_h, stress_translation)
+    return ir, vi, target, valid, gt_h
+
+
+def evaluate_refinement_gates(model, loader, device: torch.device, *,
+                              moving_source: str = "ir",
+                              stress_translation: tuple[float, float] | None = None,
+                              specs=None) -> Dict[str, float]:
+    """Re-run the whole loop once per confidence gate.
+
+    The gate has to act inside the loop: gating round one changes the field
+    round two starts from, so filtering the cached corrections afterwards is an
+    approximation, not the same experiment.
+    """
+    specs = refinement_gate_specs() if specs is None else specs
+    totals: Dict[str, list] = {}
+    model.eval()
+    for name, gate in specs:
+        print(f"  gate {name}", flush=True)
+        for step, batch in enumerate(loader, start=1):
+            ir, vi, target, valid, _ = _batch_inputs(
+                batch, moving_source, stress_translation, device)
+            with torch.no_grad():
+                output = model(ir, vi, refinement_gate=gate)
+                predicted = (output.final_flow if output.final_flow is not None
+                             else output.coarse_flow)
+                count = float(valid.sum())
+                _pool(totals, f"gate_{name}_epe_px",
+                      float(endpoint_error(predicted, target, valid)), count)
+                for key, value in _threshold_hits(predicted, target, valid).items():
+                    _pool(totals, f"gate_{name}_{key}", value, count)
+                reports = refinement_losses(output.refinement, target, valid)
+                feature_hw = output.refinement.flows[0].shape[-2:]
+                stride_hw = (target.shape[-2] / feature_hw[0],
+                             target.shape[-1] / feature_hw[1])
+                for index, flow in enumerate(output.refinement.flows, start=1):
+                    field = upsample_feature_flow(flow, target.shape[-2:], stride_hw)
+                    _pool(totals, f"gate_{name}_round{index}_epe_px",
+                          float(endpoint_error(field, target, valid)), count)
+                    covered, _ = _round_regions(reports, index - 1, valid,
+                                                target.shape[-2:])
+                    _pool(totals, f"gate_{name}_round{index}_covered_fraction",
+                          float(covered.sum()) / max(count, 1.0), count)
+            if step % 20 == 0:
+                print(f"    {step} frames", flush=True)
+    return _pooled(totals)
 
 
 def _registration_status(report: Dict[str, float], moving_source: str
@@ -106,12 +256,15 @@ def evaluate(model: torch.nn.Module, loader: DataLoader, device: torch.device,
              diagnose_local_centre: bool = False,
              diagnose_motion: bool = False,
              stress_translation: tuple[float, float] | None = None,
-             moving_source: str = "ir") -> Dict[str, float]:
+             moving_source: str = "ir",
+             gate_specs=None) -> Dict[str, float]:
     total_epe = total_coarse_epe = total_global_epe = total_baseline = total_valid = total_samples = 0.0
     total_corner_epe = total_cycle_epe = 0.0
     hit_sums = {f"pck_{threshold}px": 0.0 for threshold in (1, 3, 5)}
     diagnostic_sums: Dict[str, float] = {}
     gate_sums: Dict[str, float] = {}
+    region_sums: Dict[str, list] = {}
+    region_counts: Dict[str, float] = {"refine_rounds": 0.0}
     motion_rows: list[dict] = []
     coarse_grid_hw = None
     if stress_translation is not None and moving_source != "ir":
@@ -209,6 +362,85 @@ def evaluate(model: torch.nn.Module, loader: DataLoader, device: torch.device,
                                      float(alignment.mean()))):
                     diagnostic_sums[name] = (diagnostic_sums.get(name, 0.0)
                                              + value * float(predicted.shape[0]))
+            # Regions, so a round can be read without also having to ask which
+            # pixels it covered.  The window is centred on the pre-update field
+            # and moves every round, and after a large stress translation it can
+            # hold a small, easy subset: ``refine_round*_epe_px`` above is over
+            # that subset only and is not comparable with coarse_epe_px.
+            feature_hw = output.refinement.flows[0].shape[-2:]
+            stride_hw = (target.shape[-2] / feature_hw[0],
+                         target.shape[-1] / feature_hw[1])
+            frame_covered = []
+            for index, (flow, applied, covered_cell, benefit, confidence_pixel) in enumerate(
+                    zip(output.refinement.flows, output.refinement.applied,
+                        reports["covered"], reports["benefit"],
+                        reports["confidence_pixel"]), start=1):
+                covered, _ = _round_regions(reports, index - 1, valid, target.shape[-2:])
+                outside = valid * (1.0 - covered)
+                frame_covered.append(covered)
+                field = upsample_feature_flow(flow, target.shape[-2:], stride_hw)
+                incoming = upsample_feature_flow(flow - applied, target.shape[-2:],
+                                                 stride_hw)
+                for name, value, mask in (
+                        (f"refine_round{index}_epe_allvalid_px", field, valid),
+                        (f"refine_round{index}_epe_noupdate_px", incoming, valid),
+                        (f"refine_round{index}_epe_covered_px", field, covered),
+                        (f"refine_round{index}_epe_outside_px", field, outside)):
+                    _pool(region_sums, name, float(endpoint_error(value, target, mask)),
+                          float(mask.sum()))
+                for key, mask in ((f"refine_round{index}_covered_pixels", covered),
+                                  (f"refine_round{index}_outside_pixels", outside)):
+                    region_counts[key] = region_counts.get(key, 0.0) + float(mask.sum())
+                region_counts["refine_rounds"] = max(region_counts["refine_rounds"], index)
+                # Does the confidence rank the pixels this round helped above the
+                # ones it hurt?  A change in the mean confidence says nothing
+                # about that, so the ranking is what the gate has to pass.
+                aucs, above_half = [], []
+                for frame in range(covered_cell.shape[0]):
+                    mask = covered_cell[frame]
+                    if not bool(mask.any()):
+                        continue
+                    scores = confidence_pixel[frame][mask].to(torch.float64)
+                    gain = benefit[frame][mask] * stride_hw[0]
+                    helpful = gain > 0
+                    auc = _ranking_auc(scores, helpful)
+                    aucs.append(auc)
+                    above_half.append(float(auc > 0.5))
+                    _pool(region_sums, f"refine_round{index}_gain_all_px",
+                          float(gain.mean()), 1.0)
+                    if bool(helpful.any()):
+                        _pool(region_sums, f"refine_round{index}_confidence_beneficial",
+                              float(scores[helpful].mean()), 1.0)
+                        _pool(region_sums, f"refine_round{index}_gain_beneficial_px",
+                              float(gain[helpful].mean()), 1.0)
+                    if bool((~helpful).any()):
+                        _pool(region_sums, f"refine_round{index}_confidence_harmful",
+                              float(scores[~helpful].mean()), 1.0)
+                        _pool(region_sums, f"refine_round{index}_gain_harmful_px",
+                              float(gain[~helpful].mean()), 1.0)
+                if aucs:
+                    frames = float(len(aucs))
+                    for name, value in (
+                            (f"refine_round{index}_confidence_auc",
+                             sum(aucs) / frames),
+                            (f"refine_round{index}_confidence_auc_above_half",
+                             sum(above_half) / frames)):
+                        diagnostic_sums[name] = (diagnostic_sums.get(name, 0.0)
+                                                 + value * frames)
+            # One fixed region for every round: the cells that stayed inside the
+            # window at every round, so round-to-round differences cannot be a
+            # change of sample set.
+            common = torch.ones_like(valid)
+            for covered in frame_covered:
+                common = common * covered
+            region_counts["refine_common_pixels"] = (
+                region_counts.get("refine_common_pixels", 0.0) + float(common.sum()))
+            for index in range(1, len(frame_covered) + 1):
+                field = upsample_feature_flow(output.refinement.flows[index - 1],
+                                              target.shape[-2:], stride_hw)
+                _pool(region_sums, f"refine_round{index}_epe_common_px",
+                      float(endpoint_error(field, target, common)),
+                      float(common.sum()))
         if output.local_match is not None:
             for name, value in local_matching_diagnostics(output.local_match, target, valid).items():
                 diagnostic_sums[name] = diagnostic_sums.get(name, 0.0) + value * float(predicted.shape[0])
@@ -261,7 +493,7 @@ def evaluate(model: torch.nn.Module, loader: DataLoader, device: torch.device,
                                      float(required_norm.mean()) * stride)):
                     diagnostic_sums[name] = (diagnostic_sums.get(name, 0.0)
                                              + value * float(predicted.shape[0]))
-            if diagnose_confidence_gate:
+            if diagnose_confidence_gate and output.local_match is not None:
                 local = output.local_match
                 feature_hw = local.coarse_flow.shape[-2:]
                 stride = (target.shape[-2] / feature_hw[0], target.shape[-1] / feature_hw[1])
@@ -331,6 +563,35 @@ def evaluate(model: torch.nn.Module, loader: DataLoader, device: torch.device,
         report.update({name: value / max(total_valid, 1.0)
                        for name, value in gate_sums.items()})
     report.update({name: value / max(total_valid, 1.0) for name, value in hit_sums.items()})
+    # Regions: pooled by pixel, and every round's coverage next to its own
+    # error, so a round that only saw an easy 5% of the frame cannot be read as
+    # an improvement over the coarse field.
+    report.update(_pooled(region_sums))
+    rounds = int(region_counts.get("refine_rounds", 0.0))
+    if rounds:
+        report["refine_common_pixels"] = region_counts.get("refine_common_pixels", 0.0)
+        report["refine_common_coverage"] = (
+            report["refine_common_pixels"] / max(total_valid, 1.0))
+        for index in range(1, rounds + 1):
+            covered = region_counts[f"refine_round{index}_covered_pixels"]
+            outside = region_counts[f"refine_round{index}_outside_pixels"]
+            report[f"refine_round{index}_covered_pixels"] = covered
+            report[f"refine_round{index}_outside_pixels"] = outside
+            report[f"refine_round{index}_coverage"] = covered / max(total_valid, 1.0)
+            report[f"refine_round{index}_outside_coverage"] = (
+                outside / max(total_valid, 1.0))
+    if diagnose_confidence_gate and getattr(model, "iterative_refinement", None) is not None:
+        # A real re-run per gate: gating round one changes what round two starts
+        # from, so this cannot be done by filtering the cached corrections.
+        gates = evaluate_refinement_gates(
+            model, loader, device, moving_source=moving_source,
+            stress_translation=stress_translation, specs=gate_specs)
+        for name, _ in (refinement_gate_specs() if gate_specs is None else gate_specs):
+            key = f"gate_{name}_epe_px"
+            if key in gates:
+                gates[f"gate_{name}_relative_epe"] = (
+                    gates[key] / max(report["zero_flow_epe_px"], 1e-8))
+        report.update(gates)
     if diagnose_motion:
         report.update(summarize_motion_frames(motion_rows))
     if stress_translation is not None:
@@ -352,7 +613,11 @@ def main() -> None:
     parser.add_argument("--diagnose-local-mind", action="store_true",
                         help="compare 1/4 Encoder features with pooled raw MIND descriptors at the same coarse field")
     parser.add_argument("--diagnose-confidence-gate", action="store_true",
-                        help="evaluate top-confidence local corrections without changing the checkpoint")
+                        help="compare confidence gates; for the iterative loop this "
+                             "re-runs the whole loop once per gate (slow)")
+    parser.add_argument("--gate-specs", default=None, metavar="NAMES",
+                        help="comma-separated subset of raw,zero,scale0.25,scale0.5,"
+                             "scale0.75,thr0.3,thr0.5,thr0.7 for the gate sweep")
     parser.add_argument("--diagnose-local-centre", action="store_true",
                         help="re-run the 1/4 search with the ground truth as the window centre, "
                              "separating 1/4 feature discriminability from coarse-field error "
@@ -434,7 +699,8 @@ def main() -> None:
                           diagnose_motion=args.diagnose_motion,
                           stress_translation=(tuple(args.stress_translation)
                                               if args.stress_translation is not None else None),
-                          moving_source=args.moving_source)
+                          moving_source=args.moving_source,
+                          gate_specs=_select_gate_specs(args.gate_specs))
         report["moving_source"] = args.moving_source
         if args.overlay:
             report["evaluation_overlays"] = [str(path) for path in args.overlay]

@@ -170,6 +170,57 @@ class IterativeRefinementTest(unittest.TestCase):
                 for delta in output.residuals:
                     self.assertLessEqual(float(delta.abs().max()), 2.0 + 1e-5)
 
+    def test_an_applied_gate_reweights_the_field_inside_the_loop(self):
+        """The gate has to act per round, not on a cached correction.
+
+        A zero gate must leave every round at the field it received, and a
+        threshold gate must zero the step exactly where the confidence is below
+        the threshold.  A gate that is absent must be inert.
+        """
+        torch.manual_seed(17)
+        module = DiscrepancyGuidedRefinement(6, radius=2, iterations=3).eval()
+        with torch.no_grad():
+            module.update[-1].weight.normal_(0, 0.5)
+            module.update[-1].bias.normal_(0, 0.3)
+            module.confidence[-1].weight.normal_(0, 1.0)
+            module.confidence[-1].bias.normal_(0, 1.5)
+        features = torch.randn(1, 6, 8, 10)
+        coarse = torch.randn(1, 2, 8, 10) * 3.0
+        raw = module(features, features.clone(), coarse)
+        again = module(features, features.clone(), coarse, applied_gate=None)
+        for left, right in zip(raw.flows, again.flows):
+            self.assertTrue(torch.equal(left, right))
+        zeroed = module(features, features.clone(), coarse,
+                        applied_gate=torch.zeros_like)
+        for flow, applied in zip(zeroed.flows, zeroed.applied):
+            self.assertTrue(torch.equal(flow, coarse))
+            self.assertEqual(float(applied.abs().max()), 0.0)
+        threshold = 0.5
+        gated = module(features, features.clone(), coarse,
+                       applied_gate=lambda c: c * (c >= threshold))
+        for flow, applied, confidence in zip(gated.flows, gated.applied,
+                                             gated.confidence):
+            # Every round starts where the gated predecessor left it, so the
+            # zero-step region is exactly the set the confidence rejected.
+            self.assertTrue(torch.isfinite(flow).all())
+            silent = confidence[:, 0] < threshold
+            if bool(silent.any()):
+                both = applied.permute(1, 0, 2, 3)[:, silent]
+                self.assertEqual(float(both.abs().max()), 0.0)
+        # The ungated first round still moved, so the gate is not what moved it.
+        self.assertGreater(float(raw.applied[0].abs().max()), 0.0)
+
+    def test_ranking_auc_scores_separation(self):
+        from res.evaluate_vtmot import _ranking_auc
+        perfect = torch.tensor([0.9, 0.8, 0.2, 0.1])
+        labels = torch.tensor([True, True, False, False])
+        self.assertAlmostEqual(_ranking_auc(perfect, labels), 1.0, places=6)
+        self.assertAlmostEqual(_ranking_auc(-perfect, labels), 0.0, places=6)
+        # All ties, and a missing class, carry no evidence either way.
+        self.assertAlmostEqual(_ranking_auc(torch.ones(4), labels), 0.5, places=6)
+        self.assertAlmostEqual(_ranking_auc(perfect, torch.ones(4, dtype=torch.bool)),
+                               0.5, places=6)
+
     def test_overlay_builds_the_loop_and_keeps_the_coarse_field(self):
         torch.manual_seed(7)
         config = iterative_config(radius=2)
@@ -214,6 +265,24 @@ class IterativeRefinementTest(unittest.TestCase):
             self.assertIn(f"refine_round{index}_applied_std_px", report)
             self.assertIn(f"refine_round{index}_required_mean_norm_px", report)
             self.assertIn(f"refine_round{index}_applied_mean_alignment", report)
+            # Regions and the gate's acceptance test.
+            for suffix in ("epe_allvalid_px", "epe_noupdate_px", "epe_covered_px",
+                           "epe_outside_px", "epe_common_px", "coverage",
+                           "outside_coverage", "confidence_auc",
+                           "confidence_auc_above_half", "gain_all_px"):
+                self.assertIn(f"refine_round{index}_{suffix}", report)
+            self.assertLessEqual(report[f"refine_round{index}_coverage"], 1.0 + 1e-5)
+            self.assertGreaterEqual(report[f"refine_round{index}_coverage"], 0.0)
+            self.assertLessEqual(report[f"refine_round{index}_confidence_auc"], 1.0)
+            self.assertGreaterEqual(report[f"refine_round{index}_confidence_auc"], 0.0)
+            # A class with no pixels carries no mean, so those keys appear only
+            # when the round actually produced a pixel of that class.
+            improved = report[f"refine_round{index}_improved_fraction"]
+            self.assertEqual(
+                f"refine_round{index}_confidence_beneficial" in report, improved > 0)
+            self.assertEqual(
+                f"refine_round{index}_confidence_harmful" in report, improved < 1)
+            self.assertIn(f"refine_round{index}_epe_covered_px", report)
             self.assertGreaterEqual(
                 report[f"refine_round{index}_applied_std_px"], 0.0)
             self.assertGreaterEqual(
@@ -231,6 +300,13 @@ class IterativeRefinementTest(unittest.TestCase):
                 self.assertLessEqual(report[f"refine_round{index}_{suffix}"],
                                      bound + 1e-4)
         self.assertIn("coarse_epe_px", report)
+        # The regions must partition the valid region, and the fixed common
+        # subset must be no larger than any single round's covered region.
+        self.assertLessEqual(report["refine_common_coverage"],
+                             report["refine_round1_coverage"] + 1e-6)
+        self.assertAlmostEqual(report["refine_round1_coverage"]
+                               + report["refine_round1_outside_coverage"], 1.0,
+                               places=5)
         self.assertTrue(all(value == value                        # not NaN
                             for name, value in report.items()
                             if name.startswith("refine_round")))
