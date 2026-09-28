@@ -17,6 +17,7 @@ from .registration_net import (GLUCRFTRegistration, SpatialFrequencyRegistration
                                StructuralPriorRegistration,
                                DirectStructuralPriorRegistration)
 from .glu_crft_coarse import GlobalCostDecoder
+from .iterative_refinement import DiscrepancyGuidedRefinement
 from .spatial_frequency import SpatialFrequencyFusion
 from .structural_prior import StructuralPriorEncoder
 
@@ -62,8 +63,9 @@ def build_global_registration(config) -> (MINDGlobalRegistration |
         fine_config = config.get("fine_interaction")
         fine_interaction = None
         if fine_config is not None and bool(fine_config.get("enabled", False)):
-            if local_matcher is None:
-                raise ValueError("fine_interaction requires local_matcher.enabled=true")
+            if local_matcher is None and not bool(
+                    config.get("iterative_refinement", {}).get("enabled", False)):
+                raise ValueError("fine_interaction requires a 1/4 stage")
             fine_interaction = FineScaleInteraction(
                 encoder.shared.base_channels * 2, encoder.shared.out_channels,
                 **{key: value for key, value in
@@ -72,17 +74,27 @@ def build_global_registration(config) -> (MINDGlobalRegistration |
         cross_config = config.get("fine_cross_attention")
         fine_cross_attention = None
         if cross_config is not None and bool(cross_config.get("enabled", False)):
-            if local_matcher is None:
-                raise ValueError("fine_cross_attention requires local_matcher.enabled=true")
+            if local_matcher is None and not bool(
+                    config.get("iterative_refinement", {}).get("enabled", False)):
+                raise ValueError("fine_cross_attention requires a 1/4 stage")
             fine_cross_attention = FineCrossModalAttention(
                 encoder.shared.base_channels * 2,
                 **{key: value for key, value in
                    OmegaConf.to_container(cross_config, resolve=True).items()
                    if key != "enabled"})
+        iterative_config = config.get("iterative_refinement")
+        iterative_refinement = None
+        if iterative_config is not None and bool(iterative_config.get("enabled", False)):
+            iterative_refinement = DiscrepancyGuidedRefinement(
+                encoder.shared.base_channels * 2,
+                **{key: value for key, value in
+                   OmegaConf.to_container(iterative_config, resolve=True).items()
+                   if key != "enabled"})
         return StructuralPriorRegistration(
             encoder=encoder, matcher=matcher, coarse_transformer=transformer,
             local_matcher=local_matcher, fine_interaction=fine_interaction,
-            fine_cross_attention=fine_cross_attention)
+            fine_cross_attention=fine_cross_attention,
+            iterative_refinement=iterative_refinement)
     if str(config.get("architecture", "mind_global")) == "spatial_frequency":
         settings = OmegaConf.to_container(config.encoder, resolve=True)
         settings["in_channels"] = 1

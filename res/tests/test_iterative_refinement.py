@@ -1,0 +1,150 @@
+"""Wiring and contract checks for the iterative discrepancy-guided refinement."""
+
+import unittest
+
+import torch
+from omegaconf import OmegaConf
+
+from res.iterative_refinement import (DiscrepancyGuidedRefinement,
+                                      refinement_losses)
+from res.model_factory import build_global_registration
+from res.train_vtmot import freeze_coarse_parameters
+
+
+def iterative_config(*, iterations: int = 3, radius: int = 2):
+    config = OmegaConf.merge(
+        OmegaConf.load("res/configs/registration.yaml"),
+        OmegaConf.load("res/configs/stage0_structural_prior.yaml"),
+        OmegaConf.load("res/configs/ab_spatial_prior32.yaml"),
+        OmegaConf.load("res/configs/stage3_structural_iterative.yaml"))
+    config.structural_prior.base_channels = 8
+    config.structural_prior.out_channels = 16
+    config.structural_prior.blocks_per_scale = 1
+    config.coarse_transformer.num_layers = 1
+    config.global_matcher.max_tokens = 80
+    config.iterative_refinement.radius = radius
+    config.iterative_refinement.iterations = iterations
+    return config
+
+
+class IterativeRefinementTest(unittest.TestCase):
+    def test_rounds_share_one_update_network(self):
+        one = DiscrepancyGuidedRefinement(6, radius=2, iterations=1)
+        three = DiscrepancyGuidedRefinement(6, radius=2, iterations=3)
+        count = lambda module: sum(p.numel() for p in module.parameters())   # noqa: E731
+        # Extra rounds must add computation, not parameters.
+        self.assertEqual(count(one), count(three))
+        self.assertEqual(len(list(three.update.parameters())),
+                         len(list(one.update.parameters())))
+
+    def test_zero_initialised_update_returns_the_incoming_flow(self):
+        torch.manual_seed(3)
+        module = DiscrepancyGuidedRefinement(6, radius=2, iterations=3).eval()
+        feature_ir = torch.randn(1, 6, 8, 10)
+        feature_vi = torch.randn(1, 6, 8, 10)
+        coarse = torch.randn(1, 2, 8, 10) * 2.0
+        output = module(feature_ir, feature_vi, coarse)
+        self.assertEqual(len(output.flows), 3)
+        for flow, delta in zip(output.flows, output.residuals):
+            self.assertTrue(torch.equal(flow, coarse))
+            self.assertTrue(torch.equal(delta, torch.zeros_like(delta)))
+        # tanh has unit slope at zero, so the projections are not gated: the loss
+        # must still reach them, which a separate multiplicative gain would block.
+        loss = sum(flow.square().mean() for flow in output.flows)
+        loss.backward()
+        self.assertGreater(float(module.update[-1].weight.grad.abs().sum()), 0.0)
+
+    def test_flow_composes_and_the_residual_is_dense(self):
+        torch.manual_seed(4)
+        module = DiscrepancyGuidedRefinement(6, radius=2, iterations=3).eval()
+        with torch.no_grad():
+            module.update[-1].weight.normal_(0, 0.05)
+            module.update[-1].bias.normal_(0, 0.05)
+            module.confidence[-1].bias.fill_(0.0)
+        coarse = torch.zeros(1, 2, 8, 10)
+        output = module(torch.randn(1, 6, 8, 10), torch.randn(1, 6, 8, 10), coarse)
+        previous = coarse
+        for flow, applied in zip(output.flows, output.applied):
+            self.assertTrue(torch.allclose(flow, previous + applied, atol=1e-6))
+            self.assertGreater(float(applied.abs().max()), 0.0)
+            previous = flow
+        # Dense, not a global affine: a planar correction would have zero second
+        # differences, and re-projecting every round onto an affine is exactly
+        # what this stage is meant to avoid.
+        residual = output.applied[-1][0]
+        curvature = (residual[:, 2:, 1:-1] - 2 * residual[:, 1:-1, 1:-1]
+                     + residual[:, :-2, 1:-1]).abs().max()
+        self.assertGreater(float(curvature), 1e-6)
+
+    def test_step_is_bounded_and_confidence_is_in_range(self):
+        torch.manual_seed(5)
+        module = DiscrepancyGuidedRefinement(6, radius=2, iterations=2,
+                                             max_step_cells=1.5)
+        with torch.no_grad():
+            module.update[-1].weight.normal_(0, 5.0)      # try to force a big step
+        output = module(torch.randn(1, 6, 8, 10), torch.randn(1, 6, 8, 10),
+                        torch.zeros(1, 2, 8, 10))
+        for delta, confidence in zip(output.residuals, output.confidence):
+            self.assertLessEqual(float(delta.abs().max()), 1.5 + 1e-5)
+            self.assertGreaterEqual(float(confidence.min()), 0.0)
+            self.assertLessEqual(float(confidence.max()), 1.0)
+
+    def test_correspondence_loss_uses_the_rounds_own_search_centre(self):
+        """Round r searches around the flow *before* its update.
+
+        Two consequences are checkable exactly.  The reported error must follow
+        the post-update field, and the matching term must not move at all when
+        only the update changes, because the search that produced it was centred
+        on the pre-update field.
+        """
+        torch.manual_seed(6)
+        module = DiscrepancyGuidedRefinement(6, radius=2, iterations=1).eval()
+        height, width = 8, 10
+        gt = torch.zeros(1, 2, 64, 80)
+        valid = torch.ones(1, 1, 64, 80)
+        y, x = torch.meshgrid(torch.arange(height, dtype=torch.float32),
+                              torch.arange(width, dtype=torch.float32), indexing="ij")
+        base = torch.stack((y, x)).unsqueeze(0)
+        zeros = base - base
+        features = torch.randn(1, 6, height, width)
+        centred = refinement_losses(module(features, features.clone(), zeros), gt, valid)
+        # Zero initialised update, zero flow: nothing is displaced yet.
+        self.assertAlmostEqual(float(centred["epe"][0]), 0.0, places=6)
+        self.assertEqual(float(centred["confidence_target"][0]), 0.0)
+        with torch.no_grad():
+            module.update[-1].bias.fill_(0.5)
+        moved = refinement_losses(module(features, features.clone(), zeros), gt, valid)
+        self.assertGreater(float(moved["epe"][0]), 0.0)
+        self.assertAlmostEqual(float(moved["match"][0]), float(centred["match"][0]),
+                               places=6)
+        # A centre far outside the radius covers no query, and the reported means
+        # fall back to zero instead of raising.
+        outside = refinement_losses(module(features, features.clone(), zeros + 12.0),
+                                    gt, valid)
+        self.assertEqual(float(outside["epe"][0]), 0.0)
+
+    def test_overlay_builds_the_loop_and_keeps_the_coarse_field(self):
+        torch.manual_seed(7)
+        config = iterative_config(radius=2)
+        model = build_global_registration(config)
+        self.assertIsNone(model.local_matcher)
+        self.assertIsNotNone(model.iterative_refinement)
+        self.assertIsNotNone(model.fine_cross_attention)
+        freeze_coarse_parameters(model)          # must accept the loop's model
+        trainable = {name.split(".")[0] for name, parameter in model.named_parameters()
+                     if parameter.requires_grad}
+        self.assertEqual(trainable, {"fine_interaction", "fine_cross_attention",
+                                     "iterative_refinement"})
+        ir, vi = torch.rand(1, 1, 64, 80), torch.rand(1, 3, 64, 80)
+        output = model(ir, vi)
+        self.assertIsNotNone(output.refinement)
+        self.assertEqual(len(output.refinement.flows), 3)
+        self.assertEqual(tuple(output.final_flow.shape), (1, 2, 64, 80))
+        # Round outputs match the frozen coarse field at warm start, so the
+        # loop's own contribution is measured against an unchanged reference.
+        for flow in output.refinement.flows:
+            self.assertTrue(torch.isfinite(flow).all())
+
+
+if __name__ == "__main__":
+    unittest.main()

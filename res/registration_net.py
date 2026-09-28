@@ -17,6 +17,7 @@ from .global_matcher import GlobalMatchOutput, GlobalMatcher
 from .local_matcher import LocalMatchOutput, LocalMatcher
 from .mind import MINDDescriptor, paired_mind, rgb_to_gray
 from .glu_crft_coarse import GlobalCostDecoder, fit_affine_flow, standardize_image
+from .iterative_refinement import DiscrepancyGuidedRefinement, IterativeRefinementOutput
 from .spatial_frequency import SpatialFrequencyFusion
 from .structural_prior import StructuralPriorEncoder, structural_prior_input
 from .warp import upsample_feature_flow, warp
@@ -42,6 +43,7 @@ class CoarseRegistrationOutput:
     local_match: LocalMatchOutput | None = None
     global_flow: torch.Tensor | None = None
     coarse_local_match: LocalMatchOutput | None = None
+    refinement: IterativeRefinementOutput | None = None
 
 
 class MINDGlobalRegistration(nn.Module):
@@ -339,20 +341,27 @@ class StructuralPriorRegistration(nn.Module):
                  coarse_transformer: CoarseSACATransformer | None = None,
                  local_matcher: LocalMatcher | None = None,
                  fine_interaction: FineScaleInteraction | None = None,
-                 fine_cross_attention: FineCrossModalAttention | None = None) -> None:
+                 fine_cross_attention: FineCrossModalAttention | None = None,
+                 iterative_refinement: DiscrepancyGuidedRefinement | None = None) -> None:
         super().__init__()
         if not matcher.affine_projection:
             raise ValueError("structural-prior matcher must fit the coarse affine")
-        if fine_interaction is not None and local_matcher is None:
-            raise ValueError("fine_interaction requires an enabled local matcher")
-        if fine_cross_attention is not None and local_matcher is None:
-            raise ValueError("fine_cross_attention requires an enabled local matcher")
+        if iterative_refinement is not None and local_matcher is not None:
+            raise ValueError(
+                "iterative_refinement replaces the single-shot local matcher; enable "
+                "only one so the two can be compared directly")
+        has_fine_stage = local_matcher is not None or iterative_refinement is not None
+        if fine_interaction is not None and not has_fine_stage:
+            raise ValueError("fine_interaction requires a 1/4 stage")
+        if fine_cross_attention is not None and not has_fine_stage:
+            raise ValueError("fine_cross_attention requires a 1/4 stage")
         self.encoder = encoder
         self.matcher = matcher
         self.coarse_transformer = coarse_transformer
         self.local_matcher = local_matcher
         self.fine_interaction = fine_interaction
         self.fine_cross_attention = fine_cross_attention
+        self.iterative_refinement = iterative_refinement
         self.ir_feature_adapter = None
         self.mind = MINDDescriptor()
 
@@ -375,9 +384,10 @@ class StructuralPriorRegistration(nn.Module):
         coarse_aligned_ir = warp(ir, coarse_flow)
 
         local_match = None
+        refinement = None
         final_flow = None
         final_aligned_ir = None
-        if self.local_matcher is not None:
+        if self.local_matcher is not None or self.iterative_refinement is not None:
             fine_ir, fine_vi = features_ir["1/4"], features_vi["1/4"]
             if self.fine_interaction is not None:
                 fine_ir, fine_vi = self.fine_interaction(fine_ir, fine_vi,
@@ -394,8 +404,16 @@ class StructuralPriorRegistration(nn.Module):
                                      align_corners=False) / stride_4
             if self.fine_cross_attention is not None:
                 fine_ir, fine_vi = self.fine_cross_attention(fine_ir, fine_vi, centre_4)
-            local_match = self.local_matcher(fine_ir, fine_vi, centre_4)
-            final_flow = upsample_feature_flow(local_match.refined_flow, (height, width),
+            if self.local_matcher is not None:
+                local_match = self.local_matcher(fine_ir, fine_vi, centre_4)
+                refined_4 = local_match.refined_flow
+            else:
+                # The loop is an alternative to the single-shot matcher, not an
+                # addition: both start from the same 1/4 features and the same
+                # coarse centre, so their round-by-round results are comparable.
+                refinement = self.iterative_refinement(fine_ir, fine_vi, centre_4)
+                refined_4 = refinement.flows[-1]
+            final_flow = upsample_feature_flow(refined_4, (height, width),
                                                (height / feature_hw[0],
                                                 width / feature_hw[1]))
             final_aligned_ir = warp(ir, final_flow)
@@ -403,7 +421,8 @@ class StructuralPriorRegistration(nn.Module):
             coarse_aligned_ir=coarse_aligned_ir, coarse_flow=coarse_flow,
             confidence_1_8=match.confidence, affine_yx=match.affine_yx,
             match=match, final_aligned_ir=final_aligned_ir, final_flow=final_flow,
-            local_match=local_match, global_flow=coarse_flow)
+            local_match=local_match, global_flow=coarse_flow,
+            refinement=refinement)
 
 
 class DirectStructuralPriorRegistration(nn.Module):

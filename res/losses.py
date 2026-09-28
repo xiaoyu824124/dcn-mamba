@@ -14,6 +14,8 @@ from .affine import homography_to_normalised_affine_yx
 from .global_matcher import GlobalMatchOutput
 from .matching import appearance_window_loss, coarse_matching_loss
 from .local_matcher import LocalMatchOutput, local_matching_loss
+from .iterative_refinement import (IterativeRefinementOutput,
+                                   refinement_losses)
 
 
 @dataclass
@@ -32,6 +34,9 @@ class RegistrationLossOutput:
     coarse_flow: torch.Tensor | None = None
     global_flow: torch.Tensor | None = None
     coarse_local: torch.Tensor | None = None
+    refine: torch.Tensor | None = None
+    refine_match: torch.Tensor | None = None
+    refine_confidence: torch.Tensor | None = None
 
     def as_dict(self) -> Dict[str, torch.Tensor]:
         return {"loss": self.total, "loss_flow": self.flow, "loss_mind": self.mind,
@@ -40,7 +45,10 @@ class RegistrationLossOutput:
                 "loss_local": self.local, "loss_appearance": self.appearance,
                 "loss_coarse_flow": self.coarse_flow,
                 "loss_global_flow": self.global_flow,
-                "loss_coarse_local": self.coarse_local}
+                "loss_coarse_local": self.coarse_local,
+                "loss_refine": self.refine,
+                "loss_refine_match": self.refine_match,
+                "loss_refine_confidence": self.refine_confidence}
 
 
 class RegistrationLoss(nn.Module):
@@ -80,7 +88,8 @@ class RegistrationLoss(nn.Module):
         self.weights = {key: float(weights[key]) for key in self.REQUIRED_WEIGHTS}
         self.weights["local"] = float(weights.get("local", 0.0))
         self.weights["appearance"] = float(weights.get("appearance", 0.0))
-        for name in ("coarse_flow", "global_flow", "coarse_local"):
+        for name in ("coarse_flow", "global_flow", "coarse_local", "refine",
+                     "refine_match", "refine_confidence", "refine_smooth"):
             self.weights[name] = float(weights.get(name, 0.0))
         if self.weights["appearance"] < 0:
             raise ValueError("appearance weight must be non-negative")
@@ -134,7 +143,9 @@ class RegistrationLoss(nn.Module):
                 gt_h: Optional[torch.Tensor] = None,
                 match: Optional[GlobalMatchOutput] = None,
                 local_match: Optional[LocalMatchOutput] = None,
-                coarse_local_match: Optional[LocalMatchOutput] = None) -> RegistrationLossOutput:
+                coarse_local_match: Optional[LocalMatchOutput] = None,
+                refinement: Optional[IterativeRefinementOutput] = None
+                ) -> RegistrationLossOutput:
         if aligned_ir.ndim != 4 or aligned_ir.shape[1] != 1:
             raise ValueError("aligned_ir must be [B,1,H,W]")
         if visible.ndim != 4 or visible.shape[1] != 3:
@@ -218,6 +229,25 @@ class RegistrationLoss(nn.Module):
         loss_edge = F.l1_loss(self.edge_magnitude(aligned_ir),
                               self.edge_magnitude(visible))
         loss_smooth = self.edge_aware_smoothness(active_flow, visible)
+        # Every round of the iterative refinement is supervised: its flow error,
+        # its own correspondence distribution and the reliability of its
+        # correction.  The confidence target is the ground-truth judgement of
+        # whether that round actually reduced the error (see refinement_losses).
+        loss_refine = loss_refine_match = loss_refine_confidence = zero
+        loss_refine_smooth = zero
+        if refinement is not None and gt_flow is not None and (
+                self.weights["refine"] or self.weights["refine_match"]
+                or self.weights["refine_confidence"] or self.weights["refine_smooth"]):
+            reports = refinement_losses(
+                refinement, gt_flow, valid_mask,
+                smoothness_weight=self.weights["refine_smooth"],
+                charbonnier_eps=self.charbonnier_eps)
+            loss_refine = sum(reports["flow"]) / len(reports["flow"])
+            loss_refine_match = sum(reports["match"]) / len(reports["match"])
+            loss_refine_confidence = (sum(reports["confidence"])
+                                      / len(reports["confidence"]))
+            if reports["smooth"]:
+                loss_refine_smooth = sum(reports["smooth"]) / len(reports["smooth"])
         total = (self.weights["flow"] * loss_flow
                  + self.weights["coarse_flow"] * loss_coarse_flow
                  + self.weights["global_flow"] * loss_global_flow
@@ -228,8 +258,13 @@ class RegistrationLoss(nn.Module):
                  + self.weights["mind"] * loss_mind
                  + self.weights["edge"] * loss_edge
                  + self.weights["smooth"] * loss_smooth
-                 + self.weights["affine"] * loss_affine)
+                 + self.weights["affine"] * loss_affine
+                 + self.weights["refine"] * loss_refine
+                 + self.weights["refine_match"] * loss_refine_match
+                 + self.weights["refine_confidence"] * loss_refine_confidence
+                 + self.weights["refine_smooth"] * loss_refine_smooth)
         return RegistrationLossOutput(total, loss_flow, loss_mind, loss_edge, loss_smooth,
                                       loss_affine, loss_match, loss_local, loss_appearance,
                                       loss_coarse_flow, loss_global_flow,
-                                      loss_coarse_local)
+                                      loss_coarse_local, loss_refine, loss_refine_match,
+                                      loss_refine_confidence)

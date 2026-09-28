@@ -25,8 +25,10 @@ from .vtmot import VTMOTSingleFrameDataset, registration_moving_image
 
 def freeze_coarse_parameters(model: torch.nn.Module) -> None:
     """Hold the 1/8 field fixed while comparing alternative 1/4 refiners."""
-    if model.local_matcher is None:
-        raise ValueError("freeze_coarse requires an enabled local matcher")
+    if model.local_matcher is None and getattr(model, "iterative_refinement",
+                                              None) is None:
+        raise ValueError("freeze_coarse requires a 1/4 stage (local matcher or "
+                         "iterative refinement)")
     model.encoder.requires_grad_(False)
     model.matcher.requires_grad_(False)
     if model.coarse_transformer is not None:
@@ -331,7 +333,8 @@ def main() -> None:
                              predicted_affine_yx=output.affine_yx, gt_h=gt_h,
                              affine_feature_hw=tuple(output.confidence_1_8.shape[-2:]),
                              match=output.match, local_match=output.local_match,
-                             coarse_local_match=output.coarse_local_match)
+                             coarse_local_match=output.coarse_local_match,
+                             refinement=output.refinement)
         scaler.scale(losses.total).backward()
         scaler.unscale_(optimizer)
         torch.nn.utils.clip_grad_norm_(model.parameters(), float(train_config.grad_clip_norm))

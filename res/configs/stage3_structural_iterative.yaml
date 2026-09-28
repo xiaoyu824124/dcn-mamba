@@ -1,0 +1,68 @@
+# Stage 3: replace the single-shot 1/4 matcher with the iterative
+# discrepancy-guided loop -- three shared-weight rounds, local correlation as the
+# candidate evidence, and a supervised confidence gate on every correction.
+#
+# Merge on top of the same stack as before:
+#   --config res/configs/registration.yaml
+#   --overlay res/configs/stage0_structural_prior.yaml
+#   --overlay res/configs/ab_spatial_prior32.yaml
+#   --overlay res/configs/stage3_structural_iterative.yaml
+#
+# The 1/8 branch stays frozen (freeze_coarse), so the coarse field is bit-identical
+# to the 600-step checkpoint and every change in the final flow comes from the
+# loop.  The loop replaces the local matcher rather than stacking on it: both
+# start from the same 1/4 features and the same coarse centre, so their
+# round-by-round results are directly comparable.
+local_matcher:
+  enabled: false
+
+fine_interaction:
+  enabled: true
+  gain_init: 1.0
+
+fine_cross_attention:
+  enabled: true
+  gain_init: 1.0
+  window_size: 5
+  hidden_channels: 16
+
+iterative_refinement:
+  enabled: true
+  # +/-32 image pixels at 1/4, matching the measured search coverage: the truth
+  # sits inside +/-16 px for 100% of valid queries, so the extra radius is head
+  # room for the stress set rather than a default that costs nothing.
+  radius: 8
+  # Three rounds with shared parameters.  Compare rounds before adding more: the
+  # figure's loop is single-frame optimisation, not temporal.
+  iterations: 3
+  evidence_channels: 16
+  hidden_channels: 32
+  candidate_chunk: 9
+  temperature: 0.07
+  # At most 16 image pixels of correction per round, so the loop refines instead
+  # of jumping, and a wrong early estimate can still be walked back.
+  max_step_cells: 4.0
+
+loss:
+  weights:
+    local: 0.0
+    # Per-round flow error, per-round correspondence distribution, and the
+    # confidence head.  The confidence target comes from the ground truth: did
+    # this round's correction actually reduce the error?
+    refine: 1.0
+    refine_match: 1.0
+    refine_confidence: 0.5
+    refine_smooth: 0.05
+
+vtmot_data:
+  # Validation must use the same 80 frames the stage is judged on.
+  eval_frame_stride: 10
+
+vtmot_train:
+  freeze_coarse: true
+  # No freeze_local_refinement: that flag holds the single-shot matcher's head,
+  # which this configuration does not build.
+  #
+  # selection_metric stays at its default (relative_epe) because the loop changes
+  # the final field, so relative EPE is no longer constant here.
+  lr: 3.0e-4
