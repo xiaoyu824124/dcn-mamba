@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -15,15 +17,24 @@ class FineCrossModalAttention(nn.Module):
     IR features stay on their original grid so LocalMatcher can continue to
     sample them at ``p + coarse(p) + offset``. The zero residual gain makes
     warm-start predictions identical to the old model at step zero.
+
+    Like :class:`~res.fine_interaction.FineScaleInteraction`, the gain also gates
+    the gradient: ``gain * correction`` has zero derivative with respect to every
+    projection while the gain is zero, so a stage that trains this module must
+    start from a non-zero gain or only the scalar moves.  ``gain_init`` exists for
+    that; the default of zero preserves the warm-start property.
     """
 
     def __init__(self, channels: int, hidden_channels: int = 16,
-                 window_size: int = 5, temperature: float = 0.2) -> None:
+                 window_size: int = 5, temperature: float = 0.2,
+                 gain_init: float = 0.0) -> None:
         super().__init__()
         if channels < 1 or hidden_channels < 1 or window_size < 1 or window_size % 2 != 1:
             raise ValueError("channels must be positive and window_size must be odd")
         if temperature <= 0:
             raise ValueError("temperature must be positive")
+        if not math.isfinite(float(gain_init)):
+            raise ValueError("gain_init must be finite")
         self.channels = int(channels)
         self.hidden_channels = int(hidden_channels)
         self.window_size = int(window_size)
@@ -32,7 +43,7 @@ class FineCrossModalAttention(nn.Module):
         self.key = nn.Conv2d(channels, hidden_channels, 1, bias=False)
         self.value = nn.Conv2d(channels, hidden_channels, 1, bias=False)
         self.output = nn.Conv2d(hidden_channels, channels, 1, bias=False)
-        self.gain = nn.Parameter(torch.zeros(()))
+        self.gain = nn.Parameter(torch.tensor(float(gain_init)))
 
     def forward(self, fine_ir: torch.Tensor, fine_vi: torch.Tensor,
                 coarse_flow: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:

@@ -249,12 +249,20 @@ def main() -> None:
     OmegaConf.save(config, output_dir / "config.yaml")
     metrics_file = output_dir / "metrics.jsonl"
     device_name = torch.cuda.get_device_name(device) if device.type == "cuda" else "CPU"
+    # Which validation metric decides ``best.pt``.  The default keeps the
+    # historical behaviour.  A stage whose final field is frozen -- the 1/4 local
+    # stage holds the residual head at zero, so relative EPE is constant there --
+    # must select on the diagnostic it is actually training instead, otherwise
+    # best.pt never leaves step 0.
+    selection_metric = str(train_config.get("selection_metric", "relative_epe"))
+    if not selection_metric:
+        raise ValueError("vtmot_train.selection_metric must name a validation key")
     print(f"device={device} ({device_name}) run={args.run} steps={steps} train={len(train_dataset)} "
           f"eval={len(eval_dataset)} crop={crop_hw} batch={batch_size} workers={num_workers} "
           f"lr={learning_rate:g} moving_source={moving_source} freeze_coarse={freeze_coarse} "
           f"freeze_local_refinement={freeze_local_refinement} "
           f"freeze_fine_interaction={freeze_fine_interaction} "
-          f"ir_adapter_only={ir_adapter_only} "
+          f"ir_adapter_only={ir_adapter_only} selection_metric={selection_metric} "
           f"large_translation={OmegaConf.to_container(large_translation, resolve=True) if large_translation is not None else None}")
     best_ratio = float("inf")
     if args.resume is not None:
@@ -262,6 +270,7 @@ def main() -> None:
         # Old checkpoints lack best_ratio.  Recover it from the existing log so
         # a worse first validation after resume cannot replace best.pt.
         history_path = args.resume.parent / "metrics.jsonl"
+        history_key = f"val_{selection_metric}"
         if best_ratio == float("inf") and history_path.is_file():
             for line in history_path.read_text(encoding="utf-8").splitlines():
                 try:
@@ -269,25 +278,25 @@ def main() -> None:
                 except json.JSONDecodeError:
                     continue
                 if (int(previous.get("step", 0)) <= start_step
-                        and "val_relative_epe" in previous):
-                    best_ratio = min(best_ratio, float(previous["val_relative_epe"]))
+                        and history_key in previous):
+                    best_ratio = min(best_ratio, float(previous[history_key]))
         if best_ratio == float("inf"):
             best_ratio = float(evaluate(model, eval_loader, device,
-                                        moving_source=moving_source)["relative_epe"])
-        print(f"resume: step={start_step} prior best relative EPE={best_ratio:.4f}")
+                                        moving_source=moving_source)[selection_metric])
+        print(f"resume: step={start_step} prior best {selection_metric}={best_ratio:.4f}")
     elif args.init is not None:
         # A fine-tuning run must not discard a better warm-start checkpoint
         # merely because every subsequent validation becomes worse.
         initial_validation = evaluate(model, eval_loader, device,
                                       moving_source=moving_source)
-        best_ratio = float(initial_validation["relative_epe"])
+        best_ratio = float(initial_validation[selection_metric])
         _save(output_dir / "best.pt", 0, model, optimizer, config, best_ratio)
         with metrics_file.open("a", encoding="utf-8") as file:
             file.write(json.dumps({"step": 0, **{f"val_{name}": value
                                                 for name, value in initial_validation.items()}}) + "\n")
         print(f"init eval epe={initial_validation['epe_px']:.3f} "
               f"coarse={initial_validation['coarse_epe_px']:.3f} "
-              f"ratio={best_ratio:.4f}; saved step-0 best.pt")
+              f"{selection_metric}={best_ratio:.4f}; saved step-0 best.pt")
     # num_workers=0 draws random crops on the main process. Restore its RNG
     # after model construction, which otherwise differs across architectures.
     torch.manual_seed(int(train_config.seed))
@@ -372,8 +381,12 @@ def main() -> None:
                 print("  local soft_epe={local_soft_epe_px:.3f}px "
                       "argmax_epe={local_argmax_epe_px:.1f}px "
                       "oracle_epe={local_oracle_epe_px:.3f}px".format(**validation))
-            if validation["relative_epe"] < best_ratio:
-                best_ratio = validation["relative_epe"]
+            if selection_metric not in validation:
+                raise ValueError(
+                    f"selection_metric {selection_metric!r} is missing from the "
+                    f"validation report; available keys: {sorted(validation)}")
+            if validation[selection_metric] < best_ratio:
+                best_ratio = validation[selection_metric]
                 _save(output_dir / "best.pt", step, model, optimizer, config,
                       best_ratio)
             model.train()
@@ -384,7 +397,7 @@ def main() -> None:
                   best_ratio)
         if device.type == "cuda":
             torch.cuda.reset_peak_memory_stats()
-    print(f"completed: best relative EPE={best_ratio:.4f}; output={output_dir.resolve()}")
+    print(f"completed: best {selection_metric}={best_ratio:.4f}; output={output_dir.resolve()}")
 
 
 if __name__ == "__main__":

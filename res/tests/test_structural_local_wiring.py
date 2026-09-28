@@ -162,7 +162,7 @@ class StructuralLocalWiringTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "different shape"):
             load_registration_state(model, resized)
 
-    def test_step3_overlay_trains_only_the_fine_interaction(self):
+    def test_step3_overlay_trains_only_the_fine_stage_adapters(self):
         from res.local_matcher import local_matching_loss
         from res.train_vtmot import (freeze_coarse_parameters,
                                      freeze_local_refinement_parameters)
@@ -183,19 +183,20 @@ class StructuralLocalWiringTest(unittest.TestCase):
         # so dropping this overlay would silently change the coarse field.
         self.assertEqual(model.matcher.spatial_prior_sigma, 4.0)
         self.assertEqual(model.local_matcher.radius, 4)
-        # The overlay must let the adapter act fully and the softmax can only form
+        # The overlay must let each adapter act fully and the softmax can only form
         # a peak at a temperature matched to the 1/4 features' cosine contrast,
         # otherwise the projections this stage exists to train stay ineffective.
         self.assertAlmostEqual(float(model.fine_interaction.gain), 1.0, places=6)
+        self.assertAlmostEqual(float(model.fine_cross_attention.gain), 1.0, places=6)
         self.assertAlmostEqual(float(model.local_matcher.temperature), 0.01, places=6)
 
         freeze_coarse_parameters(model)
         freeze_local_refinement_parameters(model)
+        adapters = ("fine_interaction.", "fine_cross_attention.")
         trainable = sorted(name for name, parameter in model.named_parameters()
                            if parameter.requires_grad)
         self.assertTrue(trainable)
-        self.assertTrue(all(name.startswith("fine_interaction.") for name in trainable),
-                        trainable)
+        self.assertTrue(all(name.startswith(adapters) for name in trainable), trainable)
         self.assertFalse(any(parameter.requires_grad
                              for parameter in model.local_matcher.refinement.parameters()))
 
@@ -207,7 +208,7 @@ class StructuralLocalWiringTest(unittest.TestCase):
         # branch is not gated, so the projections receive gradient at the first
         # step instead of waiting for the scalar to grow.
         for name, parameter in model.named_parameters():
-            if name.startswith("fine_interaction."):
+            if name.startswith(adapters):
                 self.assertIsNotNone(parameter.grad, name)
                 self.assertGreater(float(parameter.grad.abs().sum()), 0.0, name)
         self.assertIsNone(model.encoder.shared.stage_8[0][0].weight.grad)
@@ -236,6 +237,40 @@ class StructuralLocalWiringTest(unittest.TestCase):
         self.assertGreater(float(fine.grad.abs().sum()), 0.0)
         with self.assertRaisesRegex(ValueError, "gain_init must be finite"):
             FineScaleInteraction(4, 6, gain_init=float("nan"))
+        # FineCrossModalAttention carries its own zero-initialised gain and needs
+        # the same treatment, so it must gate its projections identically.
+        from res.fine_cross_attention import FineCrossModalAttention
+        attention = FineCrossModalAttention(4, hidden_channels=3, window_size=3)
+        self.assertEqual(float(attention.gain), 0.0)
+        shifted = torch.randn(1, 4, 8, 10, requires_grad=True)
+        flow = torch.zeros(1, 2, 8, 10)
+        ir_out, vi_out = attention(shifted, shifted, flow)
+        self.assertTrue(torch.equal(ir_out, shifted))
+        self.assertTrue(torch.equal(vi_out, shifted))
+        vi_out.square().mean().backward()
+        for name in ("query", "key", "value", "output"):
+            self.assertEqual(float(getattr(attention, name).weight.grad.abs().sum()),
+                             0.0, name)
+        self.assertGreater(float(attention.gain.grad.abs()), 0.0)
+        with self.assertRaisesRegex(ValueError, "gain_init must be finite"):
+            FineCrossModalAttention(4, gain_init=float("nan"))
+
+    def test_step3_selection_metric_exists_in_the_validation_report(self):
+        """best.pt selection reads the overlay's metric, so the validation report
+        must carry that key or the run fails only after the first interval."""
+        overlay = OmegaConf.load("res/configs/stage2_structural_local_train.yaml")
+        metric = str(overlay.vtmot_train.selection_metric)
+        self.assertEqual(metric, "local_argmax_epe_px")
+        # Validation must run on the same 80 frames as the reporting command.
+        self.assertEqual(int(overlay.vtmot_data.eval_frame_stride), 10)
+        torch.manual_seed(12)
+        model = build_global_registration(structural_config(local_enabled=True))
+        batch = {"ir": torch.rand(1, 1, 64, 80), "vi": torch.rand(1, 3, 64, 80),
+                 "gt_flow": torch.zeros(1, 2, 64, 80),
+                 "valid_mask": torch.ones(1, 1, 64, 80),
+                 "gt_h": torch.eye(3).unsqueeze(0)}
+        report = evaluate(model.eval(), [batch], torch.device("cpu"))
+        self.assertIn(metric, report)
 
     def test_evaluator_reports_truth_centred_local_diagnostics(self):
         torch.manual_seed(8)

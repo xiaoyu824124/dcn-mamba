@@ -59,13 +59,34 @@ fine_interaction:
   # to the frozen stage_4 output, so start at 1.0 and let the adapter act fully.
   gain_init: 1.0
 
+fine_cross_attention:
+  enabled: true
+  # This is the only cross-modal coupling in the 1/4 stage.  FineScaleInteraction
+  # adapts each modality independently with shared weights, so IR never sees VI;
+  # here VI queries attend to a 5x5 window of coarse-aligned IR features and the
+  # result corrects the VI features.  It carries its own zero-initialised residual
+  # gain, so it needs the same gain_init treatment.
+  gain_init: 1.0
+  window_size: 5
+  hidden_channels: 16
+
 loss:
   weights:
     local: 1.0
 
+vtmot_data:
+  # Training-time validation must use the same 80 frames as the reporting
+  # command, otherwise the selection signal is five times noisier than the number
+  # this stage is actually judged on.
+  eval_frame_stride: 10
+
 vtmot_train:
   freeze_coarse: true
   freeze_local_refinement: true
+  # A frozen final field makes relative EPE constant, so best.pt would stay at
+  # step 0 and every evaluation of it would describe the warm start rather than
+  # the trained model.
+  selection_metric: local_argmax_epe_px
   # About 49k parameters are trainable and batch size is one, so 300 steps at
   # 1e-4 left the trend buried in batch-to-batch noise (train_epe ranged 2.2 to
   # 13.2).  Raise the rate and use --run full for 3000 steps.
