@@ -141,7 +141,7 @@ class StructuralLocalWiringTest(unittest.TestCase):
         self.assertEqual(report["local_window_coverage"], 1.0)
         self.assertGreaterEqual(report["local_window_coverage"],
                                 plain_report["local_window_coverage"])
-        with self.assertRaisesRegex(ValueError, "local_centre must be"):
+        with self.assertRaisesRegex(ValueError, "must be an image-grid"):
             model(ir, vi, local_centre=torch.zeros(1, 2, 32, 40))
 
     def test_legacy_checkpoint_loads_and_unknown_keys_are_rejected(self):

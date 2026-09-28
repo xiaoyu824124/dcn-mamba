@@ -44,6 +44,14 @@ class CoarseRegistrationOutput:
     global_flow: torch.Tensor | None = None
     coarse_local_match: LocalMatchOutput | None = None
     refinement: IterativeRefinementOutput | None = None
+    # --- temporal interfaces (see res/history.py) -------------------------
+    # Multi-scale features, kept so a keyframe can hand them to later frames.
+    ir_features: dict[str, torch.Tensor] | None = None
+    vi_features: dict[str, torch.Tensor] | None = None
+    # Per-pixel reliability and usable region, which decide what may enter the
+    # history cache.  ``reliability`` is zero wherever ``reliable_mask`` is zero.
+    reliability: torch.Tensor | None = None
+    reliable_mask: torch.Tensor | None = None
 
 
 class MINDGlobalRegistration(nn.Module):
@@ -366,9 +374,21 @@ class StructuralPriorRegistration(nn.Module):
         self.mind = MINDDescriptor()
 
     def forward(self, ir: torch.Tensor, vi: torch.Tensor, *,
-                local_centre: torch.Tensor | None = None
-                ) -> CoarseRegistrationOutput:
+                init_flow: torch.Tensor | None = None,
+                local_centre: torch.Tensor | None = None,
+                return_features: bool = False) -> CoarseRegistrationOutput:
+        """``init_flow`` is where the 1/4 stage starts.
+
+        It defaults to this frame's own coarse field.  A video caller passes the
+        field propagated from a keyframe instead, which is why the parameter
+        exists separately from ``coarse_flow``: the coarse route still runs and is
+        still reported, so the propagated start can be compared against it.
+        ``local_centre`` is the older name for the same thing, kept because the
+        truth-centred diagnostic uses it.
+        """
         MINDGlobalRegistration._validate_inputs(ir, vi)
+        if init_flow is not None and local_centre is not None:
+            raise ValueError("pass either init_flow or local_centre, not both")
         gray_ir = standardize_image(ir)
         gray_vi = standardize_image(rgb_to_gray(vi))
         features_ir, features_vi = self.encoder.encode_scales(gray_ir, gray_vi)
@@ -395,10 +415,11 @@ class StructuralPriorRegistration(nn.Module):
             feature_hw = fine_ir.shape[-2:]
             stride_4 = coarse_flow.new_tensor((height / feature_hw[0],
                                                width / feature_hw[1])).view(1, 2, 1, 1)
-            centre = coarse_flow if local_centre is None else local_centre
+            start_flow = init_flow if init_flow is not None else local_centre
+            centre = coarse_flow if start_flow is None else start_flow
             if centre.shape != coarse_flow.shape:
                 raise ValueError(
-                    "local_centre must be an image-grid [B,2,H,W] flow like coarse_flow, "
+                    "init_flow must be an image-grid [B,2,H,W] flow like coarse_flow, "
                     f"got {tuple(centre.shape)}")
             centre_4 = F.interpolate(centre, size=feature_hw, mode="bilinear",
                                      align_corners=False) / stride_4
@@ -417,12 +438,39 @@ class StructuralPriorRegistration(nn.Module):
                                                (height / feature_hw[0],
                                                 width / feature_hw[1]))
             final_aligned_ir = warp(ir, final_flow)
+        # --- temporal interfaces: what may enter the history cache ---------
+        # Validity is the set of pixels whose source coordinate still lands
+        # inside the moving image; reliability is the finest confidence this
+        # pipeline can offer, zeroed outside that region.
+        reference_flow = final_flow if final_flow is not None else coarse_flow
+        base = torch.stack(torch.meshgrid(
+            torch.arange(height, device=ir.device, dtype=reference_flow.dtype),
+            torch.arange(width, device=ir.device, dtype=reference_flow.dtype),
+            indexing="ij"), dim=0).unsqueeze(0)
+        source = base + reference_flow
+        reliable_mask = ((source[:, 0] >= 0) & (source[:, 0] <= height - 1)
+                         & (source[:, 1] >= 0) & (source[:, 1] <= width - 1)
+                         ).unsqueeze(1).to(reference_flow.dtype)
+        if refinement is not None:
+            raw = refinement.confidence[-1]
+        elif local_match is not None:
+            raw = local_match.probability.amax(dim=1, keepdim=True)
+        else:
+            raw = match.confidence
+        # A confidence is not a displacement, so it is resized without the
+        # stride scaling that upsample_feature_flow applies.
+        raw = F.interpolate(raw, size=(height, width), mode="bilinear",
+                            align_corners=False)
+        reliability = raw.clamp(0.0, 1.0) * reliable_mask
         return CoarseRegistrationOutput(
             coarse_aligned_ir=coarse_aligned_ir, coarse_flow=coarse_flow,
             confidence_1_8=match.confidence, affine_yx=match.affine_yx,
             match=match, final_aligned_ir=final_aligned_ir, final_flow=final_flow,
             local_match=local_match, global_flow=coarse_flow,
-            refinement=refinement)
+            refinement=refinement,
+            ir_features=(dict(features_ir) if return_features else None),
+            vi_features=(dict(features_vi) if return_features else None),
+            reliability=reliability, reliable_mask=reliable_mask)
 
 
 class DirectStructuralPriorRegistration(nn.Module):
