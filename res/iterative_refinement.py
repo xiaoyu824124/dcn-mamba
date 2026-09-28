@@ -184,8 +184,18 @@ class DiscrepancyGuidedRefinement(nn.Module):
             update_input = torch.cat((discrepancy, evidence, soft_offset, top1_offset,
                                       peak - mean, entropy, flow,
                                       confidence_previous), dim=1)
+            # A flow-magnitude loss has a degenerate optimum: a constant
+            # correction already reaches the mean displacement error, and the
+            # first probe of this loop found exactly that -- started from the
+            # ground truth, one round moved 2.02 px away and a second 3.58 px,
+            # while the aggregate error barely improved.  Removing the spatial
+            # mean of the raw update makes that solution unreachable: a constant
+            # output becomes exactly zero, whereas removing the mean *after* the
+            # tanh would let a round exceed its step bound.
+            raw_update = self.update(update_input)
+            raw_update = raw_update - raw_update.mean(dim=(-2, -1), keepdim=True)
             delta = self.max_step_cells * torch.tanh(
-                self.update(update_input) / self.max_step_cells)
+                raw_update / self.max_step_cells)
             confidence = torch.sigmoid(self.confidence(update_input))
             applied = confidence * delta
             flow = flow + applied

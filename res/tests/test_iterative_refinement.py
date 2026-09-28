@@ -112,8 +112,12 @@ class IterativeRefinementTest(unittest.TestCase):
         # Zero initialised update, zero flow: nothing is displaced yet.
         self.assertAlmostEqual(float(centred["epe"][0]), 0.0, places=6)
         self.assertEqual(float(centred["confidence_target"][0]), 0.0)
+        # A constant head output now produces no correction at all -- that is the
+        # point of removing the spatial mean -- so the update has to be given
+        # spatial variation before the field can move.
         with torch.no_grad():
-            module.update[-1].bias.fill_(0.5)
+            for parameter in module.update.parameters():
+                parameter.normal_(0, 1.0)
         moved = refinement_losses(module(features, features.clone(), zeros), gt, valid)
         self.assertGreater(float(moved["epe"][0]), 0.0)
         self.assertAlmostEqual(float(moved["match"][0]), float(centred["match"][0]),
@@ -167,6 +171,40 @@ class IterativeRefinementTest(unittest.TestCase):
                             for name, value in report.items()
                             if name.startswith("refine_round")))
 
+
+    def test_a_constant_update_is_impossible(self):
+        """The loop must not be able to answer with a constant correction.
+
+        A flow-magnitude loss has a degenerate optimum -- a constant field
+        already reaches the mean displacement error -- and the first probe of
+        this loop showed exactly that: started from the ground truth, one round
+        moved 2.02 px away and a second 3.58 px, while the aggregate error barely
+        improved.  A head whose output is constant everywhere must therefore
+        produce no correction at all.
+        """
+        module = DiscrepancyGuidedRefinement(6, radius=2, iterations=1)
+        with torch.no_grad():
+            for parameter in module.update.parameters():
+                parameter.zero_()
+            # The only shape the degenerate solution can take: the same value at
+            # every position.
+            module.update[-1].bias.fill_(1.0)
+            module.confidence[-1].bias.fill_(2.0)        # confidence close to one
+        incoming = torch.zeros(1, 2, 8, 10)
+        output = module(torch.randn(1, 6, 8, 10), torch.randn(1, 6, 8, 10), incoming)
+        self.assertEqual(float(output.residuals[0].abs().max()), 0.0)
+        self.assertTrue(torch.equal(output.flows[0], incoming))
+        # A spatially varying head is still free to move, and each round's step
+        # stays inside its bound.  A constant bias can no longer do it: with only
+        # the last layer's bias set, every earlier layer still outputs zero, so
+        # the head's output is constant and the correction is zero by design.
+        with torch.no_grad():
+            for parameter in module.update.parameters():
+                parameter.normal_(0, 1.0)
+        moved = module(torch.randn(1, 6, 8, 10), torch.randn(1, 6, 8, 10), incoming)
+        self.assertGreater(float(moved.residuals[0].abs().max()), 0.0)
+        self.assertLessEqual(float(moved.residuals[0].abs().max()),
+                             module.max_step_cells + 1e-5)
 
     def test_second_attempt_overlay_retunes_the_loop(self):
         """The first run showed round three does not beat round one and that the
