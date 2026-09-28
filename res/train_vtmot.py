@@ -9,6 +9,7 @@ import argparse
 import json
 import math
 import random
+import sys
 from pathlib import Path
 
 import torch
@@ -63,11 +64,20 @@ def freeze_except_ir_adapter_parameters(model: torch.nn.Module) -> None:
 
 
 def _save(path: Path, step: int, model: torch.nn.Module,
-          optimizer: torch.optim.Optimizer, config, best_ratio: float) -> None:
+          optimizer: torch.optim.Optimizer, config, best_ratio: float,
+          provenance: dict | None = None) -> None:
+    """Write a checkpoint, recording how it was produced as well.
+
+    A warm start is not recoverable from the weights: ``--init`` was previously
+    written nowhere, so a run could not be reproduced from its own checkpoint.
+    The command line and the two starting paths go in alongside the config, and
+    are ignored by every existing reader.
+    """
     torch.save({"step": step, "model": model.state_dict(),
                 "optimizer": optimizer.state_dict(),
                 "best_ratio": best_ratio,
-                "config": OmegaConf.to_container(config, resolve=True)}, path)
+                "config": OmegaConf.to_container(config, resolve=True),
+                "provenance": dict(provenance or {})}, path)
 
 
 def sample_large_translation(settings, *, seed: int, step: int
@@ -185,6 +195,11 @@ def main() -> None:
     args = parser.parse_args()
     if args.init is not None and args.resume is not None:
         raise ValueError("choose at most one of --init and --resume")
+    # Written into every checkpoint: the weights alone cannot say which warm
+    # start they came from, which is exactly what a controlled comparison needs.
+    provenance = {"argv": sys.argv[1:],
+                  "init": str(args.init) if args.init is not None else None,
+                  "resume": str(args.resume) if args.resume is not None else None}
     config = OmegaConf.merge(OmegaConf.load(args.config),
                              *(OmegaConf.load(path) for path in args.overlay))
     data_config, train_config = config.vtmot_data, config.vtmot_train
@@ -387,7 +402,8 @@ def main() -> None:
         initial_validation = evaluate(model, eval_loader, device,
                                       moving_source=moving_source)
         best_ratio = float(initial_validation[selection_metric])
-        _save(output_dir / "best.pt", 0, model, optimizer, config, best_ratio)
+        _save(output_dir / "best.pt", 0, model, optimizer, config, best_ratio,
+              provenance)
         with metrics_file.open("a", encoding="utf-8") as file:
             file.write(json.dumps({"step": 0, **{f"val_{name}": value
                                                 for name, value in initial_validation.items()}}) + "\n")
@@ -506,13 +522,13 @@ def main() -> None:
             if validation[selection_metric] < best_ratio:
                 best_ratio = validation[selection_metric]
                 _save(output_dir / "best.pt", step, model, optimizer, config,
-                      best_ratio)
+                      best_ratio, provenance)
             model.train()
         with metrics_file.open("a", encoding="utf-8") as file:
             file.write(json.dumps(record) + "\n")
         if step % int(train_config.checkpoint_every) == 0 or step == steps:
             _save(output_dir / "last.pt", step, model, optimizer, config,
-                  best_ratio)
+                  best_ratio, provenance)
         if device.type == "cuda":
             torch.cuda.reset_peak_memory_stats()
     print(f"completed: best {selection_metric}={best_ratio:.4f}; output={output_dir.resolve()}")
