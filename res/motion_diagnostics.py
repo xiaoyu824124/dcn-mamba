@@ -17,9 +17,10 @@ MATCH_MOTION_EDGES = (0.0, 8.0, 16.0, 32.0, math.inf)
 
 def translate_moving_for_stress(
         moving: torch.Tensor, gt_flow: torch.Tensor, valid: torch.Tensor,
-        gt_h: torch.Tensor, extra_dy_dx: tuple[float, float]
+        gt_h: torch.Tensor, extra_dy_dx: tuple[float, float],
+        *, padding_mode: str = "zeros"
         ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Add a known fixed-to-moving translation with zero-padded borders.
+    """Add a known fixed-to-moving translation with controlled border fill.
 
     The new moving image is ``moving'(q)=moving(q-extra)``. Its GT map is
     therefore ``flow'(p)=flow(p)+extra``. The returned validity mask also
@@ -36,7 +37,9 @@ def translate_moving_for_stress(
     if abs(dy) >= height or abs(dx) >= width:
         raise ValueError("stress translation must be smaller than the image")
     delta = gt_flow.new_tensor((dy, dx)).view(1, 2, 1, 1).expand_as(gt_flow)
-    shifted_moving = warp(moving, -delta)
+    if padding_mode not in ("zeros", "border", "reflection"):
+        raise ValueError("padding_mode must be zeros, border or reflection")
+    shifted_moving = warp(moving, -delta, padding_mode=padding_mode)
     stressed_flow = gt_flow + delta
     y = torch.arange(height, device=gt_flow.device, dtype=gt_flow.dtype).view(1, height, 1)
     x = torch.arange(width, device=gt_flow.device, dtype=gt_flow.dtype).view(1, 1, width)

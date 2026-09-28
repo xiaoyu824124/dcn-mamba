@@ -19,6 +19,7 @@ from .losses import RegistrationLoss
 from .matching import matching_diagnostics
 from .metrics import endpoint_error
 from .model_factory import build_global_registration
+from .motion_diagnostics import translate_moving_for_stress
 from .vtmot import VTMOTSingleFrameDataset, registration_moving_image
 
 
@@ -64,6 +65,28 @@ def _save(path: Path, step: int, model: torch.nn.Module,
                 "optimizer": optimizer.state_dict(),
                 "best_ratio": best_ratio,
                 "config": OmegaConf.to_container(config, resolve=True)}, path)
+
+
+def sample_large_translation(settings, *, seed: int, step: int
+                             ) -> tuple[int, int] | None:
+    """Draw a reproducible one-axis displacement independent of loader RNG."""
+    probability = float(settings.get("probability", 0.0))
+    minimum = int(settings.get("min_abs_px", 16))
+    maximum = int(settings.get("max_abs_px", 64))
+    padding_mode = str(settings.get("padding_mode", "reflection"))
+    if not 0 <= probability <= 1:
+        raise ValueError("large_translation probability must be in [0,1]")
+    if minimum < 1 or maximum < minimum:
+        raise ValueError("large_translation requires 1 <= min_abs_px <= max_abs_px")
+    if padding_mode not in ("zeros", "border", "reflection"):
+        raise ValueError("large_translation padding_mode must be zeros, border or reflection")
+    if step < 0:
+        raise ValueError("step must be non-negative")
+    rng = random.Random((int(seed) + 1) * 1000003 + int(step))
+    if rng.random() >= probability:
+        return None
+    magnitude = rng.randint(minimum, maximum) * (1 if rng.randrange(2) else -1)
+    return (magnitude, 0) if rng.randrange(2) else (0, magnitude)
 
 
 def main() -> None:
@@ -123,6 +146,13 @@ def main() -> None:
     num_workers = int(args.num_workers if args.num_workers is not None else train_config.num_workers)
     if batch_size < 1 or num_workers < 0:
         raise ValueError("batch size must be positive and num-workers must be non-negative")
+    large_translation = train_config.get("large_translation")
+    if large_translation is not None:
+        if moving_source != "ir" or batch_size != 1:
+            raise ValueError("large_translation requires moving_source=ir and batch-size=1")
+        sample_large_translation(large_translation, seed=int(train_config.seed), step=0)
+        if int(large_translation.get("max_abs_px", 64)) >= min(crop_hw):
+            raise ValueError("large_translation max_abs_px must be smaller than the crop")
     train_dataset = VTMOTSingleFrameDataset(
         args.data_root, split="train", split_file=args.split_file, target_hw=target_hw,
         crop_hw=crop_hw, random_crop=True, frame_stride=int(data_config.train_frame_stride),
@@ -174,6 +204,12 @@ def main() -> None:
         if saved_source != moving_source:
             raise ValueError(f"resume moving source is {saved_source}, but this run uses "
                              f"{moving_source}; pass the original overlay or use --init")
+        saved_translation = checkpoint.get("config", {}).get("vtmot_train", {}).get(
+            "large_translation")
+        current_translation = (OmegaConf.to_container(large_translation, resolve=True)
+                               if large_translation is not None else None)
+        if saved_translation != current_translation:
+            raise ValueError("resume large_translation settings differ from checkpoint")
         model.load_state_dict(checkpoint["model"], strict=True)
         optimizer.load_state_dict(checkpoint["optimizer"])
         start_step = int(checkpoint["step"])
@@ -218,7 +254,8 @@ def main() -> None:
           f"lr={learning_rate:g} moving_source={moving_source} freeze_coarse={freeze_coarse} "
           f"freeze_local_refinement={freeze_local_refinement} "
           f"freeze_fine_interaction={freeze_fine_interaction} "
-          f"ir_adapter_only={ir_adapter_only}")
+          f"ir_adapter_only={ir_adapter_only} "
+          f"large_translation={OmegaConf.to_container(large_translation, resolve=True) if large_translation is not None else None}")
     best_ratio = float("inf")
     if args.resume is not None:
         best_ratio = float(checkpoint.get("best_ratio", float("inf")))
@@ -266,6 +303,14 @@ def main() -> None:
         vi = batch["vi"].to(device, non_blocking=True)
         target, valid = batch["gt_flow"].to(device, non_blocking=True), batch["valid_mask"].to(device, non_blocking=True)
         gt_h = batch["gt_h"].to(device, non_blocking=True)
+        extra_translation = None
+        if large_translation is not None:
+            extra_translation = sample_large_translation(
+                large_translation, seed=int(train_config.seed), step=step)
+            if extra_translation is not None:
+                ir, target, valid, gt_h = translate_moving_for_stress(
+                    ir, target, valid, gt_h, extra_translation,
+                    padding_mode=str(large_translation.get("padding_mode", "reflection")))
         optimizer.zero_grad(set_to_none=True)
         with torch.autocast(device_type=device.type, enabled=amp):
             output = model(ir, vi)
@@ -297,11 +342,17 @@ def main() -> None:
                   "peak_mem_mib": (torch.cuda.max_memory_allocated() / 2 ** 20
                                    if device.type == "cuda" else 0.0),
                   "affine": float(losses.affine.detach())}
+        if large_translation is not None:
+            record["extra_translation_dy_dx"] = list(extra_translation or (0, 0))
+            record["augmented_valid_fraction"] = float(valid.float().mean())
         if step == 1 or step % int(train_config.log_every) == 0:
             print("step={step:5d} loss={train_loss:.5f} train_epe={train_epe:.3f} "
                   "match={match:.4f} appearance={appearance:.4f} "
                   "local={local:.4f} coarse_local={coarse_local:.4f} "
                   "global_flow={global_flow:.4f} affine={affine:.4f}".format(**record))
+            if large_translation is not None:
+                print(f"  train shift={record['extra_translation_dy_dx']} "
+                      f"valid={record['augmented_valid_fraction']:.3f}")
             # Localisation view of the same batch: does the correct key rank first?
             record.update(matching_diagnostics(output.match.matching_probability,
                                                tuple(output.match.coarse_flow.shape[-2:]),

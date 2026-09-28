@@ -6,11 +6,44 @@ import torch
 from omegaconf import OmegaConf
 
 from res.evaluate_vtmot import evaluate
+from res.losses import RegistrationLoss
 from res.model_factory import build_global_registration
+from res.motion_diagnostics import translate_moving_for_stress
 from res.structural_prior import phase_congruency_prior
 
 
 class StructuralPriorTest(unittest.TestCase):
+    def test_large_shift_overlay_keeps_supervised_backward_finite(self):
+        config = OmegaConf.merge(
+            OmegaConf.load("res/configs/registration.yaml"),
+            OmegaConf.load("res/configs/stage0_structural_prior.yaml"),
+            OmegaConf.load("res/configs/ab_spatial_prior32.yaml"),
+            OmegaConf.load("res/configs/ab_large_translation_train.yaml"))
+        config.structural_prior.base_channels = 8
+        config.structural_prior.out_channels = 16
+        config.structural_prior.blocks_per_scale = 1
+        config.coarse_transformer.num_layers = 1
+        config.global_matcher.max_tokens = 80
+        model = build_global_registration(config)
+        ir = torch.rand(1, 1, 64, 80)
+        vi = torch.rand(1, 3, 64, 80)
+        gt = torch.zeros(1, 2, 64, 80)
+        valid = torch.ones(1, 1, 64, 80)
+        gt_h = torch.eye(3).unsqueeze(0)
+        ir, gt, valid, gt_h = translate_moving_for_stress(
+            ir, gt, valid, gt_h, (0, 24), padding_mode="reflection")
+        output = model(ir, vi)
+        loss = RegistrationLoss(config.loss.weights)(
+            aligned_ir=output.coarse_aligned_ir, visible=vi,
+            coarse_flow=output.coarse_flow, gt_flow=gt, valid_mask=valid,
+            predicted_affine_yx=output.affine_yx, gt_h=gt_h,
+            affine_feature_hw=tuple(output.confidence_1_8.shape[-2:]),
+            match=output.match)
+        self.assertTrue(torch.isfinite(loss.total))
+        loss.total.backward()
+        self.assertGreater(float(model.encoder.ir_shallow[0][0].weight.grad.abs().sum()),
+                           0.0)
+
     def test_phase_congruency_is_finite_and_contrast_sign_invariant(self):
         torch.manual_seed(8)
         image = torch.rand(1, 1, 64, 80) * 2 - 1

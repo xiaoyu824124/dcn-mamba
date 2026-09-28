@@ -1,0 +1,15 @@
+# Warm-start the structural-prior coarse model with GT-consistent IR shifts.
+# Compare natural eval and held-out +/-48 px stress eval before adding fine stages.
+# Image-edge loss has no validity mask, so disable it when shifting creates
+# synthetic borders; flow, match and affine supervision remain active.
+loss:
+  weights:
+    edge: 0.0
+
+vtmot_train:
+  lr: 5.0e-5
+  large_translation:
+    probability: 0.75
+    min_abs_px: 16
+    max_abs_px: 64
+    padding_mode: reflection

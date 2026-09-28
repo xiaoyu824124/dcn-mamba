@@ -875,3 +875,30 @@ python -B -m res.evaluate_vtmot --device cuda --split eval --frame-stride 10 --c
 压力测试是诊断，不代表真实大位移数据集的最终成绩。必须在同一平移方向、
 相同有效区域下比较模型 EPE 和 `>=32px` 位移组，不能直接拿压力测试 EPE
 与未平移的 6–7 px 结果比较。
+
+### 用已知大平移训练 1/8 粗匹配
+
+现有自然 eval 的有效位移低于 32 px；±48 px 压力测试表明原权重在远距离
+对应上仍依赖位置先验。以下实验只训练现有 `structural_prior` 的编码器、
+SA–CA、匹配器和 6-DoF 读出，不启用 1/4、DCN 或时序模块。
+每一步有 75% 概率给 IR 额外施加单轴 16–64 px 随机整数平移，正负与
+水平/垂直方向均随机。真值流场、仿射矩阵和有效掩码同步更新；其余 25%
+保留原样。训练平移使用反射填充，评测压力测试仍使用零填充，以检查模型
+是否只记住训练中的边界样式。平移可能减少有效区域，因此边缘结构损失
+在这组训练中关闭，流场、匹配和仿射真值监督仍开启。
+
+在服务器仓库根目录运行；每次训练输出目录要全新：
+
+```bat
+python -B -m res.train_vtmot --device cuda --steps 1 --num-workers 0 --init res_runs/structural_learned_full/last.pt --overlay res/configs/stage0_structural_prior.yaml --overlay res/configs/ab_spatial_prior32.yaml --overlay res/configs/ab_large_translation_train.yaml --output-dir res_runs/structural_large_shift_smoke
+python -B -m res.train_vtmot --device cuda --run pilot --num-workers 0 --init res_runs/structural_learned_full/last.pt --overlay res/configs/stage0_structural_prior.yaml --overlay res/configs/ab_spatial_prior32.yaml --overlay res/configs/ab_large_translation_train.yaml --output-dir res_runs/structural_large_shift_pilot
+python -B -m res.evaluate_vtmot --device cuda --split eval --frame-stride 10 --checkpoint res_runs/structural_large_shift_pilot/last.pt --diagnose-motion --output res_runs/structural_large_shift_pilot/natural_stride10.json
+python -B -m res.evaluate_vtmot --device cuda --split eval --frame-stride 10 --checkpoint res_runs/structural_large_shift_pilot/last.pt --stress-translation 0 48 --diagnose-motion --output res_runs/structural_large_shift_pilot/dx48_stride10.json
+python -B -m res.evaluate_vtmot --device cuda --split eval --frame-stride 10 --checkpoint res_runs/structural_large_shift_pilot/last.pt --stress-translation 0 -48 --diagnose-motion --output res_runs/structural_large_shift_pilot/dxminus48_stride10.json
+```
+
+先比较自然 80 帧的 6.92 px 基线与 ±48 px 的 36.61/33.88 px 基线。
+同时看 `match_epe_argmax_px`、`global_window2_coverage` 和 PCK@3；
+仅让大位移 EPE 下降但自然 EPE 明显变差，不能作为改善的证据。
+`best.pt` 仍按未平移的 16 帧自然验证集选择；这组消融要另外评测
+`last.pt`，防止第 0 步权重被保留为 best 而掩盖训练效果。

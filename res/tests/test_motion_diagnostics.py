@@ -31,6 +31,11 @@ class MotionDiagnosticsTest(unittest.TestCase):
         stressed_aligned = warp(shifted, new_flow)
         self.assertTrue(torch.allclose(original_aligned * new_valid,
                                        stressed_aligned * new_valid, atol=1e-5))
+        reflected, _, reflected_valid, _ = translate_moving_for_stress(
+            source, flow, valid, h, (2, -1), padding_mode="reflection")
+        self.assertTrue(torch.equal(reflected_valid, new_valid))
+        self.assertTrue(torch.allclose(warp(reflected, new_flow) * new_valid,
+                                       original_aligned * new_valid, atol=1e-5))
 
     def test_pixel_bins_and_match_distribution(self):
         target = torch.zeros(1, 2, 16, 16)
