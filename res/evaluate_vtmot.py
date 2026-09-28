@@ -18,6 +18,7 @@ from .model_factory import build_global_registration
 from .affine import affine_corner_errors
 from .matching import matching_diagnostics, windowed_diagnostics
 from .local_matcher import local_matching_diagnostics
+from .iterative_refinement import refinement_losses
 from .checkpoint import load_registration_state
 from .mind import paired_mind
 from .motion_diagnostics import (frame_motion_diagnostics,
@@ -178,6 +179,22 @@ def evaluate(model: torch.nn.Module, loader: DataLoader, device: torch.device,
                 diagnostic_sums["coarse_" + name] = (
                     diagnostic_sums.get("coarse_" + name, 0.0)
                     + value * float(predicted.shape[0]))
+        if output.refinement is not None:
+            # Per-round numbers, because the exit condition for this stage is
+            # that the third round beats the first, and an average over rounds
+            # cannot show that.  ``epe_px`` is comparable with coarse_epe_px.
+            with torch.no_grad():
+                reports = refinement_losses(output.refinement, target, valid)
+            stride = target.shape[-2] / output.refinement.flows[0].shape[-2]
+            for index, (epe, match, target_rate) in enumerate(
+                    zip(reports["epe"], reports["match"],
+                        reports["confidence_target"]), start=1):
+                for name, value in ((f"refine_round{index}_epe_px", float(epe) * stride),
+                                    (f"refine_round{index}_match", float(match)),
+                                    (f"refine_round{index}_improved_fraction",
+                                     float(target_rate))):
+                    diagnostic_sums[name] = (diagnostic_sums.get(name, 0.0)
+                                             + value * float(predicted.shape[0]))
         if output.local_match is not None:
             for name, value in local_matching_diagnostics(output.local_match, target, valid).items():
                 diagnostic_sums[name] = diagnostic_sums.get(name, 0.0) + value * float(predicted.shape[0])

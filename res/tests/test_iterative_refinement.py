@@ -146,5 +146,26 @@ class IterativeRefinementTest(unittest.TestCase):
             self.assertTrue(torch.isfinite(flow).all())
 
 
+    def test_evaluator_reports_per_round_metrics(self):
+        """The stage's exit condition is "round three beats round one", so the
+        report must carry per-round numbers next to the coarse baseline."""
+        from res.evaluate_vtmot import evaluate
+        torch.manual_seed(14)
+        model = build_global_registration(iterative_config(radius=2))
+        batch = {"ir": torch.rand(1, 1, 64, 80), "vi": torch.rand(1, 3, 64, 80),
+                 "gt_flow": torch.zeros(1, 2, 64, 80),
+                 "valid_mask": torch.ones(1, 1, 64, 80),
+                 "gt_h": torch.eye(3).unsqueeze(0)}
+        report = evaluate(model.eval(), [batch], torch.device("cpu"))
+        for index in (1, 2, 3):
+            self.assertIn(f"refine_round{index}_epe_px", report)
+            self.assertIn(f"refine_round{index}_match", report)
+            self.assertIn(f"refine_round{index}_improved_fraction", report)
+        self.assertIn("coarse_epe_px", report)
+        self.assertTrue(all(value == value                        # not NaN
+                            for name, value in report.items()
+                            if name.startswith("refine_round")))
+
+
 if __name__ == "__main__":
     unittest.main()
